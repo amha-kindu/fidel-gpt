@@ -76,7 +76,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
             decoder_input: torch.Tensor = batch[0].to(DEVICE)
             label: torch.Tensor         = batch[1].to(DEVICE)
             
-            # (N_BATCHES, SEQ_LEN, SEQ_LEN)
+            # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
             decoder_mask: torch.Tensor  = batch[2].to(DEVICE)
 
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
@@ -200,6 +200,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, help="Number of warmup steps")
     parser.add_argument("--save-every", type=int, help="Number of weight updates between checkpoints")
     parser.add_argument("--validate-every", type=int, help="Number of weight updates between validations")
+    parser.add_argument("--vt-ratio", type=float, help="The ratio between the number of samples to validate the model on and the number of samples it has seen, since the last validation")
     parser.add_argument("--init-lr", type=float, help="Initial learning rate")
     parser.add_argument("--min-lr", type=float, help="Minimum learning rate")
     parser.add_argument("--lr-scheduler", type=str, choices=[LRScheduler.WARMUP_CONSTANT.value, LRScheduler.WARMUP_LINEAR.value, LRScheduler.WARMUP_COSINE.value, LRScheduler.INVERSE_SQRT.value], help="Learning rate scheduler(default: warmup_linear)")

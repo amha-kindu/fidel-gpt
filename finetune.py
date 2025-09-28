@@ -74,7 +74,7 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
             decoder_input: torch.Tensor = batch[0].to(DEVICE)
             label: torch.Tensor         = batch[1].to(DEVICE)
             
-            # (N_BATCHES, SEQ_LEN, SEQ_LEN)
+            # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
             decoder_mask: torch.Tensor  = batch[2].to(DEVICE)
             
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):

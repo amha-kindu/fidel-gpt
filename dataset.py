@@ -92,7 +92,7 @@ class TextDataset(NLPDataset):
     def __getitem__(self, index) -> dict:
         input, output = self.samples[index]
         
-        # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (1, SEQ_LEN) --> (1, SEQ_LEN) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
+        # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
         mask = (input != self.pad_token) & get_casual_mask(self.max_len)
         
         return input, output, mask
