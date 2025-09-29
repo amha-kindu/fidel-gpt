@@ -218,6 +218,8 @@ if __name__ == "__main__":
     parser.add_argument("--tb-log-dir", type=str, help="Initial learning rate")
     parser.add_argument("--epochs", type=int, help="Number of epochs to train the model")
     parser.add_argument("--seq-len", type=int, help="Sequence length of the input")
+    parser.add_argument("--metric-dim", type=int, help="Dimensionality of the metric layer")
+    parser.add_argument("--metric-epsilon", type=float, help="Epsilon value for the metric layer")
     parser.add_argument("--embed-dim", type=int, help="Dimensionality of the model")
     parser.add_argument("--n-blocks", type=int, help="Number of decoder blocks")
     parser.add_argument("--heads", type=int, help="Number of attention heads")

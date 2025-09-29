@@ -51,6 +51,61 @@ class PositionEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.position_encodings[:, :x.shape[1], :].requires_grad_(False)
 
+    
+class CholeskyFactor(nn.Module):
+    """
+        Given an input x ∈ R^{...xnxn}, it learns to fit a lower-triangular matrix L with positive diagonals that can be used to construct a symmetric positive-definite matrix
+        M = L @ L.T
+    """
+    
+    def __init__(self, metric_dim: int, input_dim: int, epsilon: float, dropout: float):
+        super().__init__()
+        self.epsilon = epsilon
+        self.input_dim = input_dim
+        self.metric_dim = metric_dim
+        self.dropout = nn.Dropout(dropout)
+        
+        # Number of params for a lower-triangular matrix (including diagonal)
+        n_params = input_dim * (input_dim + 1) // 2
+        
+        self.gelu = nn.GELU()
+        self.linear1 = nn.Linear(input_dim, metric_dim, bias=False)
+        self.linear2 = nn.Linear(metric_dim, n_params, bias=False)
+        
+        tri_rows, tri_cols = torch.tril_indices(self.input_dim, self.input_dim)
+        self.register_buffer("I", torch.eye(self.input_dim), persistent=False)
+        self.register_buffer("tri_rows", tri_rows, persistent=False)
+        self.register_buffer("tri_cols", tri_cols, persistent=False)
+        self.register_buffer("diag_idx", torch.arange(self.input_dim), persistent=False)
+    
+    # Input shape: x -> (..., input_dim)
+    # Output shape: (..., input_dim, input_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (..., input_dim) @ (input_dim, metric_dim) --> (..., metric_dim)
+        # (..., metric_dim) @ (metric_dim, n_params) --> (..., n_params)
+        result: torch.Tensor = self.linear2(
+            self.dropout(self.gelu(self.linear1(x)))
+        )
+        
+        # (..., input_dim, input_dim)
+        L = result.new_zeros(*result.shape[:-1],self.input_dim, self.input_dim)
+        
+        # Fill lower-triangular entries
+        L[..., self.tri_rows, self.tri_cols] = result
+        
+        # Make diagonal strictly positive
+        diagonals = L[..., self.diag_idx, self.diag_idx]
+        
+        # Apply safe softplus to avoid numerical instabilities
+        with torch.autocast(device_type=DEVICE.type, enabled=False):
+            diag_pos = F.softplus(diagonals.float()) # FP32 math
+        L[..., self.diag_idx, self.diag_idx] = diag_pos.to(x.dtype)
+        
+        # Apply epsilon for numerical stability
+        L = L + self.epsilon * self.I
+        
+        return L
+
 
 class MultiHeadAttentionBlock(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -65,6 +120,9 @@ class MultiHeadAttentionBlock(nn.Module):
         self.Wk: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        
+        self.epsilon = config.epsilon
+        self.cholesky_factor = CholeskyFactor(config)
     
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -94,6 +152,13 @@ class MultiHeadAttentionBlock(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
+                
+        # (N_BATCHES, HEADS, SEQ_LEN, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head, d_head)
+        L = self.cholesky_factor(query)
+        
+        # [d_head]∑(N_BATCHES, HEADS, SEQ_LEN, d_head) . (N_BATCHES, HEADS, SEQ_LEN, d_head, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
+        key_tilde = torch.einsum("bhsd,bhsdd->bhsd", key, L)
+        query_tilde = torch.einsum("bhsd,bhsdd->bhsd", query, L)
         
         attn_bias = None
         if mask is not None:
@@ -101,7 +166,7 @@ class MultiHeadAttentionBlock(nn.Module):
             attn_bias.masked_fill_(mask.logical_not(), -1e4)
         
         output = F.scaled_dot_product_attention(
-            query, key, value,
+            query_tilde, key_tilde, value,
             attn_mask=attn_bias,
             dropout_p=self.dropout.p if self.training else 0.0,
             is_causal=(mask is None),

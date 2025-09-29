@@ -106,6 +106,8 @@ class ModelConfig(Config):
         self.heads: int = kwargs.get("heads", 8)
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
+        self.metric_dim: int = kwargs.get("metric_dim", 128)
+        self.epsilon: float = kwargs.get("metric_epsilon", 1e-02)
 
 
 class ModelWithLoRAConfig(ModelConfig):
