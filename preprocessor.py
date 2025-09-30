@@ -17,6 +17,9 @@ class AmharicPreprocessor(PreprocessingPipeline):
         # self.non_amharic_chars = re.compile(r'[^\u1200-\u137F0-9\s\'\"!@#$%*()_\-+=[\]{}|\\:;?./]')
         self.tab_placeholder = "→"
         self.newline_placeholder = "Г"
+        
+        self.tab_pattern = re.compile(r'\t')
+        self.newline_pattern = re.compile(r'\n')
         self.normalization_patterns = [
             (re.compile('[ሃኅኃሐሓኻ]'), 'ሀ'),
             (re.compile('[ሑኁዅ]'), 'ሁ'),
@@ -75,14 +78,14 @@ class AmharicPreprocessor(PreprocessingPipeline):
         # Remove leading and trailing spaces
         text = text.strip()
         
-        text = text.replace('\t', self.tab_placeholder)
-        text = text.replace('\n', self.newline_placeholder)
+        text = self.tab_pattern.sub(self.tab_placeholder, text)
+        text = self.newline_pattern.sub(self.newline_placeholder, text)
 
         # Remove non-amharic character except for arabic numerals and some punctuations
         # text = self.non_amharic_chars.sub('', text)
 
         # Character level mismatch
-        text = self.normalize_char_level_missmatch(text)
+        # text = self.normalize_char_level_missmatch(text)
 
         return text
 
