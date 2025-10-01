@@ -4,12 +4,14 @@ import argparse
 import traceback
 from typing import Iterator
 import sentencepiece as spm
+from torch.nn.attention import SDPBackend
 
 from config import *
 from lora import LoRAdapter
 from model import GPTmodel
 from dataset import Conversation
 from inference import GptInferenceEngine
+from utils import init_sdp_backend
 
 
 class ChatBot(GptInferenceEngine):
@@ -82,7 +84,12 @@ if __name__ == '__main__':
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuned checkpoint")
     parser.add_argument("--checkpoint", type=str, required=True, help="File path to load saved checkpoint")
     parser.add_argument("--tokenizer", type=str, required=True, help="File path to load SentencePiece tokenizer")
+    parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
+    args = parser.parse_args()
+    
+    init_sdp_backend(args.sdp_kernel)
+    
     args = parser.parse_args()
     
     assert args.lora_checkpoint or args.finetuned_checkpoint, "At least one of --lora-checkpoint or --finetuned-checkpoint must be specified"

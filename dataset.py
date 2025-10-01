@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 
 from config import *
 from preprocessor import AmharicPreprocessor
-from utils import Conversation, get_casual_mask
+from utils import Conversation, get_causal_mask
 
 
 class NLPDataset(Dataset):
@@ -93,7 +93,7 @@ class TextDataset(NLPDataset):
         input, output = self.samples[index]
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_casual_mask(self.max_len)
+        mask = (input == self.pad_token) | get_causal_mask(self.max_len)
         
         return input, output, mask
     
@@ -157,7 +157,7 @@ class TextStreamDataset(NLPDataset):
         )
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_casual_mask(self.max_len)
+        mask = (input == self.pad_token) | get_causal_mask(self.max_len)
         
         return input, output, mask
 
@@ -211,7 +211,7 @@ class FineTuningDataset(NLPDataset):
         input, output = self.samples[index]
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_casual_mask(self.max_len)
+        mask = (input == self.pad_token) | get_causal_mask(self.max_len)
         
         return input, output, mask
     

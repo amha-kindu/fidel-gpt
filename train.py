@@ -7,6 +7,8 @@ from tqdm import tqdm
 import sentencepiece as spm
 from datetime import datetime
 import torch.distributed as dist
+from torch.nn.attention import SDPBackend
+
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler, RandomSampler
 
@@ -15,7 +17,7 @@ from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import TextStreamDataset, TextDataset, NLPDataset
-from utils import EarlyStopping, log_gradients, log_confidence_metrics, save_checkpoint, validate
+from utils import EarlyStopping, init_sdp_backend, log_gradients, log_confidence_metrics, save_checkpoint, validate
 
 
 def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, val_dataset: NLPDataset, is_distributed: bool = False, training_state: TrainingState | None = None) -> None:
@@ -227,8 +229,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
     parser.add_argument("--dl-workers", type=int, help="Number of subprocesses to use for data loading")
     parser.add_argument("--stream", default=False, action="store_true", help="Stream data from disk")
+    parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
+    
+    init_sdp_backend(args.sdp_kernel)
     
     if args.is_distributed:
         assert torch.cuda.device_count() > 1, "Must have more than one CUDA supporting GPUs to initiate distributed training"

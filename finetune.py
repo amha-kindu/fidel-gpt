@@ -6,13 +6,14 @@ import torch.nn as nn
 from tqdm import tqdm
 import sentencepiece as spm
 from datetime import datetime
+from torch.nn.attention import SDPBackend
 
 from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import MultiTaskDataset, TemperatureSampler, FineTuningDataset
-from utils import EarlyStopping, log_confidence_metrics, log_gradients, save_checkpoint, set_trainable_params, validate
+from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, save_checkpoint, set_trainable_params, validate
 
 
 def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTaskDataset, val_dataset: MultiTaskDataset, training_state: TrainingState | None = None) -> None:
@@ -213,8 +214,11 @@ if __name__ == "__main__":
     parser.add_argument("--lora-targets", type=str, help="Path to a json file containing layers to apply LoRA on")
     parser.add_argument("--lora-checkpoint", default="", type=str, help="Path to LoRA adapters")
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuning checkpoint")
+    parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
+    
+    init_sdp_backend(args.sdp_kernel)
     
     if args.lora:
         assert args.lora_targets, "If you want to use LoRA, please provide a path to the LoRA targets"

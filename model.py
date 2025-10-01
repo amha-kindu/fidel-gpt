@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend
 
 from config import *
 from lora import LoRAdapter
@@ -73,17 +72,15 @@ class MultiHeadAttentionBlock(nn.Module):
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
         self,
-        key: torch.Tensor,
-        query: torch.Tensor,
-        value: torch.Tensor,
+        x: torch.Tensor,
         mask: torch.Tensor,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
-        key: torch.Tensor = self.Wk(key)
-        query: torch.Tensor = self.Wq(query)
-        value: torch.Tensor = self.Wv(value)
+        key: torch.Tensor = self.Wk(x)
+        query: torch.Tensor = self.Wq(x)
+        value: torch.Tensor = self.Wv(x)
                 
         if use_cache:
             if kv_cache is not None:
@@ -100,17 +97,13 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
         
-        with torch.nn.attention.sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-            # Step 1: attn_scores = (query @ key.transpose(2, 3)) / math.sqrt(self.d_head)
-            # Step 2: attn_scores.masked_fill_(mask == False, -1e09)
-            # Step 3: attn_probs = F.softmax(attn_scores, dim=-1)
-            # Step 4: output = (attn_probs @ value)
-            output = F.scaled_dot_product_attention(
-                query, key, value,
-                attn_mask=mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=(mask is None)
-            )
+        mask.masked_fill_(mask, -1e04)
+        output = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=(mask is None),
+        )
 
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
         output = output.transpose(1, 2)
@@ -154,7 +147,7 @@ class DecoderBlock(nn.Module):
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
-        x_update, kv_cache = self.masked_multihead_attention(x, x, x, mask, use_cache, kv_cache)
+        x_update, kv_cache = self.masked_multihead_attention(x, mask, use_cache, kv_cache)
         x = x + self.dropout(self.norm1(x_update))
         x = x + self.dropout(self.norm2(self.feed_forward(x)))
         return x, kv_cache

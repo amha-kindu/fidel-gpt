@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from config import *
 from model import GPTmodel
 from cache import SlidingKVCache
-from utils import get_casual_mask
+from utils import get_causal_mask
 from preprocessor import AmharicPreprocessor
 
 
@@ -94,7 +94,7 @@ class GptInferenceEngine:
                 dtype=torch.int64
             ).to(DEVICE)
             
-            decoder_mask = get_casual_mask(decoder_input.size(1)).to(DEVICE)
+            decoder_mask = get_causal_mask(decoder_input.size(1)).to(DEVICE)
                         
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (1, SEQ_LEN, VOCAB_SIZE)

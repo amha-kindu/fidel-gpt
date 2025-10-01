@@ -36,19 +36,50 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 return True
         return False
+    
+
+def init_sdp_backend(name: str | None) -> None:
+    if name is None:
+        return
+    
+    from torch.backends.cuda import (
+        enable_math_sdp,
+        enable_mem_efficient_sdp,
+        enable_flash_sdp,
+    )
+
+    name = name.upper()
+    if name == "MATH":
+        enable_math_sdp(True)
+        enable_mem_efficient_sdp(False)
+        enable_flash_sdp(False)
+    elif name == "EFFICIENT_ATTENTION":
+        enable_math_sdp(False)
+        enable_mem_efficient_sdp(True)
+        enable_flash_sdp(False)
+    elif name == "FLASH_ATTENTION":
+        enable_math_sdp(False)
+        enable_mem_efficient_sdp(False)
+        enable_flash_sdp(True)
+    else:
+        raise ValueError("Use one of: MATH, EFFICIENT_ATTENTION, FLASH_ATTENTION")
+
 
 @torch.no_grad() 
-def get_casual_mask(size: int) -> torch.Tensor:
-    # Lower triangular matrix
+def get_causal_mask(size: int) -> torch.Tensor:
+    """
+        Strictly upper triangular matrix, where True denotes a masked position (no attention).
+            mask[i, j] = True if i < j, else False.
+    """
     # [[
-    #   [True, False, ... , False],
-    #   [True, True,  ... , False],
-    #   [True, True,  ... , False],
-    #   [True, True,  ... , True ]
+    #     [False, True,  True,  True,  True],
+    #     [False, False, True,  True,  True],
+    #     [False, False, False, True,  True],
+    #     [False, False, False, False, True],
+    #     [False, False, False, False, False]
     # ]]
-    # 1 x size x size
-    idx = torch.arange(size, dtype=torch.int)
-    return (idx[None, :, None] >= idx[None, None, :]) # mask[i, j] = True if i ≥ j, else False.
+    
+    return torch.ones(1, size, size, dtype=torch.bool).triu(diagonal=1)
 
 def _non_blocking():
     def decorator(func):
