@@ -97,7 +97,6 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
         
-        mask.masked_fill_(mask, -1e04)
         output = F.scaled_dot_product_attention(
             query, key, value,
             attn_mask=mask,

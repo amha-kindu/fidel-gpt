@@ -68,18 +68,18 @@ def init_sdp_backend(name: str | None) -> None:
 @torch.no_grad() 
 def get_causal_mask(size: int) -> torch.Tensor:
     """
-        Strictly upper triangular matrix, where True denotes a masked position (no attention).
-            mask[i, j] = True if i < j, else False.
+        Strictly upper triangular matrix, where False denotes a masked position (no attention).
+            mask[i, j] = False if i < j, else True.
     """
     # [[
-    #     [False, True,  True,  True,  True],
-    #     [False, False, True,  True,  True],
-    #     [False, False, False, True,  True],
-    #     [False, False, False, False, True],
-    #     [False, False, False, False, False]
+    #     [True, False, False, False, False],
+    #     [True, True,  False, False, False],
+    #     [True, True,  True,  False, False],
+    #     [True, True,  True,  True,  False],
+    #     [True, True,  True,  True,  True ]
     # ]]
     
-    return torch.ones(1, size, size, dtype=torch.bool).triu(diagonal=1)
+    return torch.ones(1, size, size, dtype=torch.bool).tril(diagonal=0)
 
 def _non_blocking():
     def decorator(func):
