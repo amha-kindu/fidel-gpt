@@ -97,9 +97,14 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
         
+        attn_bias = None
+        if mask is not None:
+            attn_bias = torch.zeros_like(mask, dtype=query.dtype)
+            attn_bias.masked_fill_(mask.logical_not(), -1e4)
+        
         output = F.scaled_dot_product_attention(
             query, key, value,
-            attn_mask=mask,
+            attn_mask=attn_bias,
             dropout_p=self.dropout.p if self.training else 0.0,
             is_causal=(mask is None),
         )
