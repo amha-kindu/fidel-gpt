@@ -68,11 +68,10 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
     for epoch in range(initial_epoch, config.epochs):
         data_loader = tqdm(data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
-        for i, batch in enumerate(data_loader):
-            model.train()
-            
-            if is_distributed:
-                train_sampler.set_epoch(epoch)
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
+        
+        for i, batch in enumerate(data_loader):            
             
             # (N_BATCHES, SEQ_LEN)
             decoder_input: torch.Tensor = batch[0].to(DEVICE)
@@ -94,16 +93,12 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     label.view(-1)
                 )
             
-            loss_tensor = batch_loss.detach().clone()
-            if is_distributed:
-                torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
-            accum_loss += loss_tensor.item() / WORLD_SIZE
-
-            accum_grad = (i + 1) % config.grad_accum_steps != 0 and i + 1 != config.batches_per_epoch
-
+            accum_loss += batch_loss.detach().item() / config.grad_accum_steps
+            update_weights = ((i + 1) % config.grad_accum_steps) == 0
+            
             if MIXED_PRECISION_ENABLED:
                 scaler.scale(batch_loss).backward()
-                if not accum_grad:
+                if update_weights:
                     scaler.unscale_(optimizer)
                     log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
@@ -113,35 +108,36 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     optimizer.zero_grad()
             else:
                 batch_loss.backward()
-                if not accum_grad:
+                if update_weights:
                     log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
 
-            if not accum_grad:
-                accum_steps = config.grad_accum_steps if (i + 1) % config.grad_accum_steps == 0 else (i + 1) % config.grad_accum_steps
+            if update_weights:
                 if training_loss == 0:
-                    training_loss = (accum_loss / accum_steps)
+                    training_loss = accum_loss
                 else:
-                    training_loss = config.ema_alpha * training_loss + (1 - config.ema_alpha) * (accum_loss / accum_steps)
+                    training_loss = config.ema_alpha * training_loss + (1 - config.ema_alpha) * accum_loss
                 accum_loss = 0.0
                 
-                if global_step % config.validate_every == 0:
+                tb_logger.log_scalars("Loss", {"Training": training_loss}, global_step)
+                tb_logger.log_scalar("Learning Rate", scheduler.get_last_lr()[0], global_step)
+                
+                if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
+                    model.eval()
                     val_loss = validate(
                         model=model.module if is_distributed else model,
                         data_loader=val_loader,
                         loss_func=loss_func
                     )
-                    if is_distributed:
-                        torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.SUM)
-                    avg_val_loss = val_loss.item() / WORLD_SIZE
+                    model.train()
                     
                     if validation_loss == 0:
-                        validation_loss = avg_val_loss
+                        validation_loss = val_loss
                     else:
-                        validation_loss = config.ema_alpha * validation_loss + (1 - config.ema_alpha) * avg_val_loss
+                        validation_loss = config.ema_alpha * validation_loss + (1 - config.ema_alpha) * val_loss
                     
                     if early_stopping(validation_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
@@ -150,7 +146,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                             dist.destroy_process_group()
                             exit(-1)
                         else:
-                            break                        
+                            break                     
                 
                 if global_step % config.validate_every == 0:
                     tb_logger.log_scalars("Loss", {"Validation": validation_loss}, global_step)

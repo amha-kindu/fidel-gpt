@@ -65,6 +65,30 @@ class MultiHeadAttentionBlock(nn.Module):
         self.Wk: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        
+    @staticmethod
+    def sdpa(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        dropout: nn.Dropout=None, 
+        mask: torch.Tensor=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attention_scores = scale * (query @ key.transpose(-2, -1))
+        
+        if mask is not None:
+            if mask.dtype == torch.bool:
+                attention_scores.masked_fill_(mask == 0, -6e04)
+            else:
+                attention_scores = attention_scores + mask
+        
+        attention_scores = attention_scores.softmax(dim=-1)
+        if dropout is not None:
+            attention_scores = dropout(attention_scores)
+        
+        return attention_scores @ value
+     
     
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -106,6 +130,13 @@ class MultiHeadAttentionBlock(nn.Module):
             dropout_p=self.dropout.p if self.training else 0.0,
             is_causal=(mask is None),
         )
+        
+        # output: torch.Tensor = self.sdpa(
+        #     query, key, value,
+        #     scale=1 / math.sqrt(self.d_head),
+        #     dropout=self.dropout,
+        #     mask=attn_bias
+        # )
 
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
         output = output.transpose(1, 2)
@@ -232,7 +263,7 @@ class GPTmodel(nn.Module):
     ):
         model = GPTmodel(config)
                 
-        lora_weights = {k: v for k, v in weights.items() if k in LoRAdapter.get_lora_param_names(config.lora_targets)}
+        lora_weights = {k: v for k, v in weights.items() if isinstance(config, ModelWithLoRAConfig) and k in LoRAdapter.get_lora_param_names(config.lora_targets)}
         base_weights = {k: v for k, v in weights.items() if k not in lora_weights}
 
         if weights:

@@ -89,35 +89,33 @@ def _non_blocking():
     return decorator
 
 @_non_blocking()
-@torch.no_grad()
 def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, global_step: int, log_interval: int = 10):
-    if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval == 0:
-        probs = torch.softmax(logits, dim=-1)
-        
-        # Entropy (measures uncertainty; lower is better)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-4), dim=-1).mean().cpu().item()
-        tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
+    with torch.no_grad():
+        if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval == 0:
+            probs = torch.softmax(logits, dim=-1)
+            
+            # Entropy (measures uncertainty; lower is better)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-4), dim=-1).mean().cpu().item()
+            tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
 
 @_non_blocking()
-@torch.no_grad()
 def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int, log_interval: int = 10):
-    if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval != 0:
-        grad_vector = torch.empty(0, device=DEVICE)
-        for name, grad in grads.items():
-            if grad is not None:
-                grad_vector = torch.cat([grad_vector, grad.view(-1)])
-                param_grad_norm = torch.linalg.vector_norm(grad.view(-1)).item()
-                tb_logger.log_scalar(f"GradNorm/{name}", param_grad_norm, global_step)
-                
-        grad_norm = torch.linalg.vector_norm(grad_vector).item()
-        tb_logger.log_scalar(f"GradNorm/Overall", grad_norm, global_step)
+    with torch.no_grad():
+        if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval != 0:
+            grad_vector = torch.empty(0, device=DEVICE)
+            for name, grad in grads.items():
+                if grad is not None:
+                    grad_vector = torch.cat([grad_vector, grad.view(-1)])
+                    param_grad_norm = torch.linalg.vector_norm(grad.view(-1)).item()
+                    tb_logger.log_scalar(f"GradNorm/{name}", param_grad_norm, global_step)
+                    
+            grad_norm = torch.linalg.vector_norm(grad_vector).item()
+            tb_logger.log_scalar(f"GradNorm/Global", grad_norm, global_step)
 
 
 @torch.no_grad()
 def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntropyLoss):
-    model.eval()
-
-    val_loss = torch.tensor(0, dtype=torch.float32, device=DEVICE)
+    val_loss = 0.0
     for batch in data_loader:
         # (N_BATCHES, SEQ_LEN)
         decoder_input: torch.Tensor = batch[0].to(DEVICE)
@@ -138,7 +136,7 @@ def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntrop
                 label.view(-1)
             ) 
 
-        val_loss += loss
+        val_loss += loss.item()
 
     return val_loss / len(data_loader)
 

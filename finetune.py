@@ -69,8 +69,6 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
     for epoch in range(initial_epoch, config.epochs):
         data_loader = tqdm(data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
         for i, batch in enumerate(data_loader):
-            model.train()
-            
             # (N_BATCHES, SEQ_LEN)
             decoder_input: torch.Tensor = batch[0].to(DEVICE)
             label: torch.Tensor         = batch[1].to(DEVICE)
@@ -91,13 +89,12 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                     label.view(-1)
                 )
             
-            accum_loss += batch_loss.item()
-
-            accum_grad = (i + 1) % config.grad_accum_steps != 0 and i + 1 != config.batches_per_epoch
+            accum_loss += batch_loss.detach().item() / config.grad_accum_steps
+            update_weights = ((i + 1) % config.grad_accum_steps) == 0
 
             if MIXED_PRECISION_ENABLED:
                 scaler.scale(batch_loss).backward()
-                if not accum_grad:
+                if update_weights:
                     scaler.unscale_(optimizer)
                     log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
@@ -107,44 +104,44 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                     optimizer.zero_grad()
             else:
                 batch_loss.backward()
-                if not accum_grad:
+                if update_weights:
                     log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
 
-            if not accum_grad:
-                accum_steps = config.grad_accum_steps if (i + 1) % config.grad_accum_steps == 0 else (i + 1) % config.grad_accum_steps
+            if update_weights:
                 if training_loss == 0:
-                    training_loss = (accum_loss / accum_steps)
+                    training_loss = accum_loss
                 else:
-                    training_loss = config.ema_alpha * training_loss + (1 - config.ema_alpha) * (accum_loss / accum_steps)
+                    training_loss = config.ema_alpha * training_loss + (1 - config.ema_alpha) * accum_loss
                 accum_loss = 0.0
                 
-                if global_step % config.validate_every == 0:
+                tb_logger.log_scalars("Loss", {"Training": training_loss}, global_step)
+                tb_logger.log_scalar("Learning Rate", scheduler.get_last_lr()[0], global_step)
+                
+                if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
+                    model.eval()
                     val_loss = validate(
                         model=model,
                         data_loader=val_data_loader,
                         loss_func=loss_func
                     )
-                    avg_val_loss = val_loss.item()
+                    model.train()
                     
                     if validation_loss == 0:
-                        validation_loss = avg_val_loss
+                        validation_loss = val_loss
                     else:
-                        validation_loss = config.ema_alpha * validation_loss + (1 - config.ema_alpha) * avg_val_loss
+                        validation_loss = config.ema_alpha * validation_loss + (1 - config.ema_alpha) * val_loss
                     
                     if early_stopping(validation_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
-                        break
+                        break                     
                 
                 if global_step % config.validate_every == 0:
                     tb_logger.log_scalars("Loss", {"Validation": validation_loss}, global_step)
                     tb_logger.log_scalar('Loss Gap', validation_loss - training_loss, global_step)
-                
-                tb_logger.log_scalars("Loss", {"Training": training_loss}, global_step)
-                tb_logger.log_scalar("Learning Rate", scheduler.get_last_lr()[0], global_step)
                 
                 data_loader.set_postfix({
                     "train_loss": f"{training_loss:6.3f}",
@@ -303,7 +300,7 @@ if __name__ == "__main__":
     
     model = GPTmodel.build(model_config, weights).to(DEVICE)
     
-    trainable_params = model_config.lora_targets
+    trainable_params = model_config.lora_targets if args.lora else None
     if args.trainable_params:
         assert os.path.exists(args.trainable_params), f"File {args.trainable_params} does not exist"
         with open(args.trainable_params, 'r') as f:
@@ -320,7 +317,7 @@ if __name__ == "__main__":
         if args.lora:
             LOGGER.info("Using LoRA for finetuning")
         LOGGER.info(f"Using training config: {training_config}")
-        LOGGER.info(f"Model size: {sum(p.numel() for p in model.parameters()) * 4 / (1024 ** 2):.2f}MB")
+        LOGGER.info(f"Unfrozen Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     finetune(training_config, model, finetune_dataset, val_dataset, training_state)
