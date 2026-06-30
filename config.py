@@ -106,6 +106,7 @@ class ModelConfig(Config):
         self.heads: int = kwargs.get("heads", 8)
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
+        self.post_norm: bool = kwargs.get("post_norm", False)
 
 
 class ModelWithLoRAConfig(ModelConfig):
@@ -139,7 +140,7 @@ class TrainingConfig(Config):
         self.es_min_delta: float = kwargs.get("es_min_delta", 0.01)
         self.es_patience: float = kwargs.get("es_patience", 10000)
         self.tb_log_dir: str = kwargs.get("tb_log_dir", "logs")
-        self.checkpoint: str = kwargs.get("checkpoint", "amharic-gpt")
+        self.checkpoint: str = kwargs.get("checkpoint", "amharic-gpt.pt")
         self.max_checkpoints_to_keep: int = kwargs.get("max_checkpoints_to_keep", 5)
         self.warmup_steps: int = kwargs.get("warmup_steps", 1000)
         self.save_every: int = kwargs.get("save_every", 1000)
@@ -158,7 +159,7 @@ class TrainingConfig(Config):
             raise FileNotFoundError(f"File '{self.validation_data}' does not exist")
         
 class TrainingState:
-    def __init__(self, epoch: int, global_step: int, training_loss: float, validation_loss: float, best_val_loss: float, optimizer_state: dict, lr_scheduler_state: dict):
+    def __init__(self, epoch: int, global_step: int, training_loss: float, validation_loss: float, best_val_loss: float, optimizer_state: dict, lr_scheduler_state: dict, scaler_state: dict | None = None):
         self.epoch = epoch
         self.global_step = global_step
         self.training_loss = training_loss
@@ -166,6 +167,7 @@ class TrainingState:
         self.best_val_loss = best_val_loss
         self.optimizer_state = optimizer_state
         self.lr_scheduler_state = lr_scheduler_state
+        self.scaler_state = scaler_state
 
 
 class InferenceConfig(Config):

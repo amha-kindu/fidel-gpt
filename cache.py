@@ -12,14 +12,14 @@ class SlidingKVCache:
         if self.keys is None:
             self.keys, self.values = new_keys, new_values
         else:
-            self.keys = torch.cat([self.keys, new_keys], dim=2)
-            self.values = torch.cat([self.values, new_values], dim=2)
-
-        # If over limit, left-trim
-        extra = self.keys.size(2) - self.size
+            self.keys = torch.cat([self.keys, new_keys], dim=1)
+            self.values = torch.cat([self.values, new_values], dim=1)
+        extra = self.keys.size(1) - self.size
         if extra > 0:
             self.keys = self.keys[..., extra:, :]
             self.values = self.values[..., extra:, :]
 
-    def get(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def get(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.keys is None:
+            return None
         return self.keys, self.values

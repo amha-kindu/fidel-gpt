@@ -21,17 +21,15 @@ class SentenceIterator(Iterator):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         try:
-                            # Parse each line as a separate JSON object
-                            yield json.loads(line.strip())
+                            item = json.loads(line.strip())
+                            if item is not None:
+                                yield item
                         except json.JSONDecodeError as e:
                             print(f"Error decoding JSON line: {e}")
                             continue
 
     def __next__(self):
-        item = next(self.generator)
-        if item is not None:
-            return item
-        raise StopIteration
+        return next(self.generator)
 
 
 if __name__ == "__main__":
@@ -43,8 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_MODEL_CONFIG.vocab_size, help="Vocabulary size to use")
 
     args = parser.parse_args()
-    config = TrainingConfig(**args.__dict__)
-    
+
     datasets = args.data.split(',')
     for dataset in datasets:
         if not os.path.exists(dataset):

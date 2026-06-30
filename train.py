@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import argparse
+import contextlib
 import torch.nn as nn
 from tqdm import tqdm
 import sentencepiece as spm
@@ -27,10 +28,11 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     tb_logger.log_text("ModelConfig", f"```json\n{json.dumps(model.config.__dict__, indent=2)}\n```", step=0)
     tb_logger.log_text("Environment", f"```json\n{json.dumps(ENV, indent=2)}\n```", step=0)
 
+    base_model = model
     if is_distributed:
         model = DistributedDataParallel(model, device_ids=[LOCAL_RANK])
-    
-    scaler = torch.GradScaler(device=DEVICE.type) if MIXED_PRECISION_ENABLED else None
+
+    scaler = torch.GradScaler(init_scale=config.grad_scaler_init, device=DEVICE.type) if MIXED_PRECISION_ENABLED else None
 
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
@@ -41,14 +43,15 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
         betas=(config.beta1, config.beta2),
         eps=config.epsilon
     )
-    
-    scheduler = get_lr_scheduler(optimizer, config, model.config.embed_dim)
+
+    scheduler = get_lr_scheduler(optimizer, config, base_model.config.embed_dim)
     
     accum_loss = 0
     global_step = 0
     initial_epoch = 0
     training_loss = 0
     validation_loss = 0
+    should_early_stop = False
     if training_state:
         global_step = training_state.global_step + 1
         initial_epoch = int(training_state.global_step / config.steps_per_epoch)
@@ -57,28 +60,30 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
         early_stopping.best_loss = training_state.best_val_loss
         optimizer.load_state_dict(training_state.optimizer_state)
         scheduler.load_state_dict(training_state.lr_scheduler_state)
+        if scaler and getattr(training_state, 'scaler_state', None):
+            scaler.load_state_dict(training_state.scaler_state)
 
     loss_func = nn.CrossEntropyLoss(ignore_index=train_dataset.ignore_index, label_smoothing=config.label_smoothing).to(DEVICE)
     
     train_sampler = DistributedSampler(train_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=True, drop_last=True) if is_distributed else None
-    data_loader = train_dataset.get_loader(config.batch_size, sampler=train_sampler)
-    
+    raw_data_loader = train_dataset.get_loader(config.batch_size, sampler=train_sampler)
+
     val_sampler = RandomSampler(val_dataset, replacement=True, num_samples=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps))
     val_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
 
     for epoch in range(initial_epoch, config.epochs):
-        data_loader = tqdm(data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
         if is_distributed:
             train_sampler.set_epoch(epoch)
-        
-        for i, batch in enumerate(data_loader):            
+        data_loader = tqdm(raw_data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
+
+        for i, batch in enumerate(data_loader):
             
             # (N_BATCHES, SEQ_LEN)
-            decoder_input: torch.Tensor = batch[0].to(DEVICE)
-            label: torch.Tensor         = batch[1].to(DEVICE)
-            
+            decoder_input: torch.Tensor = batch[0].to(DEVICE, non_blocking=True)
+            label: torch.Tensor         = batch[1].to(DEVICE, non_blocking=True)
+
             # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
-            decoder_mask: torch.Tensor  = batch[2].to(DEVICE)
+            decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
 
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -87,7 +92,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 # Compute the cross-entropy loss
                 batch_loss: torch.Tensor = loss_func(
                     # (N_BATCHES, SEQ_LEN, VOCAB_SIZE) --> (N_BATCHES * SEQ_LEN, VOCAB_SIZE)
-                    logits.view(-1, model.config.vocab_size),
+                    logits.view(-1, base_model.config.vocab_size),
 
                     # (N_BATCHES, SEQ_LEN) --> (N_BATCHES * SEQ_LEN, )
                     label.view(-1)
@@ -96,20 +101,27 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
             accum_loss += batch_loss.detach().item() / config.grad_accum_steps
             update_weights = ((i + 1) % config.grad_accum_steps) == 0
             
+            scaled_loss = batch_loss / config.grad_accum_steps
+            # Skip gradient sync on accumulation steps; only sync on the last step.
+            sync_ctx = model.no_sync() if is_distributed and not update_weights else contextlib.nullcontext()
             if MIXED_PRECISION_ENABLED:
-                scaler.scale(batch_loss).backward()
+                with sync_ctx:
+                    scaler.scale(scaled_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
-                    log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
+                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                    log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
             else:
-                batch_loss.backward()
+                with sync_ctx:
+                    scaled_loss.backward()
                 if update_weights:
-                    log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
+                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                    log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
@@ -128,7 +140,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
                     model.eval()
                     val_loss = validate(
-                        model=model.module if is_distributed else model,
+                        model=base_model,
                         data_loader=val_loader,
                         loss_func=loss_func
                     )
@@ -141,30 +153,32 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     
                     if early_stopping(validation_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
-                        if is_distributed:
-                            dist.barrier()
-                            dist.destroy_process_group()
-                            exit(-1)
-                        else:
-                            break                     
-                
+                        should_early_stop = True
+
+                if is_distributed and global_step % config.validate_every == 0:
+                    stop_tensor = torch.tensor(int(should_early_stop), device=DEVICE)
+                    dist.broadcast(stop_tensor, src=COORDINATOR_RANK)
+                    should_early_stop = bool(stop_tensor.item())
+
+                if should_early_stop:
+                    break
+
                 if global_step % config.validate_every == 0:
                     tb_logger.log_scalars("Loss", {"Validation": validation_loss}, global_step)
                     tb_logger.log_scalar('Loss Gap', validation_loss - training_loss, global_step)
-                
-                tb_logger.log_scalars("Loss", {"Training": training_loss}, global_step)
-                tb_logger.log_scalar("Learning Rate", scheduler.get_last_lr()[0], global_step)
-                
+
                 data_loader.set_postfix({
                     "train_loss": f"{training_loss:6.3f}",
                     "val_loss": f"{validation_loss:6.3f}"
                 })
                 
-                log_confidence_metrics(tb_logger, logits.detach(), global_step)
+                log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
                 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
+                    weights_snapshot = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
                     save_checkpoint(
-                        model=model.module if is_distributed else model,
+                        weights=weights_snapshot,
+                        model_config=base_model.config,
                         global_step=global_step,
                         config=config,
                         training_state=TrainingState(
@@ -174,11 +188,20 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                             validation_loss=validation_loss,
                             best_val_loss=early_stopping.best_loss,
                             optimizer_state=optimizer.state_dict(),
-                            lr_scheduler_state=scheduler.state_dict()
+                            lr_scheduler_state=scheduler.state_dict(),
+                            scaler_state=scaler.state_dict() if scaler else None,
                         )
                     )
 
                 global_step += 1
+
+        # Discard gradients from any partial accumulation window at the epoch boundary.
+        if len(data_loader) > 0 and (i + 1) % config.grad_accum_steps != 0:
+            optimizer.zero_grad()
+        accum_loss = 0.0
+
+        if should_early_stop:
+            break
 
     if is_distributed:
         dist.barrier()
@@ -220,6 +243,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab-size", type=int, help="Vocabulary size to use")
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
+    parser.add_argument("--post-norm", action="store_true", help="Apply layer normalization after each residual block (post-norm Transformer style)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
@@ -233,28 +257,28 @@ if __name__ == "__main__":
     
     if args.is_distributed:
         assert torch.cuda.device_count() > 1, "Must have more than one CUDA supporting GPUs to initiate distributed training"
-        assert args.dist_backend in ["nccl", "gloo" "mpi", "ucc"], "Distributed backend must be one of the following: nccl, gloo, mpi or ucc"
+        assert args.dist_backend in ["nccl", "gloo", "mpi", "ucc"], "Distributed backend must be one of the following: nccl, gloo, mpi or ucc"
 
         dist.init_process_group(backend=args.dist_backend)
 
     if args.embed_dim and args.heads:
         assert args.embed_dim % args.heads == 0, "embed_dim must be divisible by heads"
 
-    model_config: ModelConfig = DEFAULT_MODEL_CONFIG
+    model_config = ModelConfig()
     model_config.update(**args.__dict__)
-    
-    training_config: TrainingConfig = DEFAULT_TRAINING_CONFIG
+
+    training_config = TrainingConfig()
     training_config.update(**args.__dict__)
 
     training_state, weights = None, {}
     if args.init_weights:
-        if not os.path.exists(args.init_weights):
+        if not os.path.isfile(args.init_weights):
             raise FileNotFoundError(f"File {args.init_weights} does not exist")
         LOGGER.info(f"Loading initial weights from '{args.init_weights}'...")
-        checkpoint = torch.load(args.init_weights, map_location=DEVICE, weights_only=True)
+        checkpoint = torch.load(args.init_weights, map_location=DEVICE, weights_only=False)
         weights = checkpoint['weights']
     elif args.resume:
-        if not os.path.exists(args.checkpoint):
+        if not os.path.isfile(args.checkpoint):
             raise FileNotFoundError(f"File {args.checkpoint} does not exist")
         LOGGER.info(f"Loading checkpoint from '{args.checkpoint}'...")
         checkpoint: dict = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)

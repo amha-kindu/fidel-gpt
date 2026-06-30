@@ -18,7 +18,7 @@ class ChatBot(GptInferenceEngine):
     def __init__(self, model: GPTmodel, tokenizer: spm.SentencePieceProcessor, system_prompt: str = "", config: InferenceConfig = DEFAULT_INFERENCE_CONFIG) -> None:
         super().__init__(model, tokenizer, config)
         self.user_input = []
-        self.conv = Conversation(system_prompt)
+        self.conv = Conversation(type="", system_text=system_prompt)
         self.bot_token = self.tokenizer.PieceToId("[BOT]")
         self.user_token = self.tokenizer.PieceToId("[USER]")
         self.system_token = self.tokenizer.PieceToId("[SYSTEM]")
@@ -46,7 +46,7 @@ class ChatBot(GptInferenceEngine):
         ]
         for exchange in reversed(self.conv.exchanges):
             # Discard tokens of the earlier exchanges if input_ids gets too long(exceeds max_len)
-            if len(input_ids) + len(exchanges) + len(exchange["input"]) + len(exchange["output"]) + 2 > self.max_len:
+            if len(input_ids) + len(exchanges) + len(exchange["input"]) + len(exchange["output"]) + 3 > self.max_len:
                 break
             
             if exchange["input"] and exchange["output"]:
@@ -76,9 +76,9 @@ if __name__ == '__main__':
     parser.add_argument("--temperature", type=float, help="Sampling temperature (t=1.0 for normal sampling, 0<t<1.0 for less random, t>1.0 for more random sampling)")
     parser.add_argument("--repetition-penalty", type=float, help="Repetition penalty strength")
     parser.add_argument("--presence-penalty", type=float, help="Presence penalty strength")
-    parser.add_argument("--frequency-penalty", type=float, help="Frequency penalty strength")
+    parser.add_argument("--freq-penalty", type=float, help="Frequency penalty strength")
     parser.add_argument("--no-repeat-ngram-size", type=int, help="No repeat n-gram size")
-    parser.add_argument("--repeat-window", type=int, help="Repeat window size")
+    parser.add_argument("--rep-window", type=int, help="Repeat window size")
     parser.add_argument("--kv-cache-size", type=int, help="KV cache size")
     parser.add_argument("--lora-checkpoint", default="", type=str, help="Path to LoRA adapters")
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuned checkpoint")
@@ -87,17 +87,15 @@ if __name__ == '__main__':
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
-    
+
     init_sdp_backend(args.sdp_kernel)
-    
-    args = parser.parse_args()
-    
+
     assert args.lora_checkpoint or args.finetuned_checkpoint, "At least one of --lora-checkpoint or --finetuned-checkpoint must be specified"
 
-    if not os.path.exists(args.checkpoint) and not os.path.isfile(args.checkpoint):
+    if not os.path.isfile(args.checkpoint):
         raise FileNotFoundError(f"File {args.checkpoint} does not exist")
-    
-    if not os.path.exists(args.tokenizer) and not os.path.isfile(args.tokenizer):
+
+    if not os.path.isfile(args.tokenizer):
         raise FileNotFoundError(f"File {args.tokenizer} does not exist")
     
     LOGGER.info(f"Loading checkpoint from {args.checkpoint}...")
@@ -105,7 +103,7 @@ if __name__ == '__main__':
 
     model_config: ModelConfig = checkpoint["model_config"]
     
-    inference_config: InferenceConfig = DEFAULT_INFERENCE_CONFIG
+    inference_config = InferenceConfig()
     inference_config.update(**args.__dict__)
     
     if args.lora_checkpoint:

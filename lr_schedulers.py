@@ -26,6 +26,11 @@ def get_lr_scheduler(optimizer: Optimizer, config: TrainingConfig, embed_dim: in
         base_lr = optimizer.param_groups[0]['lr']
         scale = (config.init_lr) / base_lr * (embed_dim * config.warmup_steps) ** 0.5
         return InverseSqrtLR(optimizer, config.warmup_steps, embed_dim, config.min_lr, scale)
+    else:
+        raise ValueError(
+            f"Unknown lr_scheduler {config.lr_scheduler!r}. "
+            f"Valid options: {[e.value for e in LRScheduler]}"
+        )
 
 
 def _with_floor(step: int, warmup_steps: int, lrs: List[float], min_lr: float) -> List[float]:
@@ -57,8 +62,8 @@ class WarmupCosineLR(_LRScheduler):
             warm_frac = t / max(1, self.warmup_steps)
             lrs = [base * warm_frac for base in self.base_lrs]
             return _with_floor(t, self.warmup_steps, lrs, self.min_lr)
-        # cosine phase
-        progress = (t - self.warmup_steps) / max(1, (self.total_steps - self.warmup_steps))
+        # cosine phase — clamp progress so lr stays at min_lr past total_steps
+        progress = min(1.0, (t - self.warmup_steps) / max(1, (self.total_steps - self.warmup_steps)))
         cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
         lrs = [self.min_lr + (base - self.min_lr) * cos_factor for base in self.base_lrs]
         return _with_floor(t, self.warmup_steps, lrs, self.min_lr)

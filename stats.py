@@ -21,7 +21,7 @@ def analyze_token_lengths(file_path, tokenizer, max_len, max_samples=None):
         for line in tqdm(lines, desc="Processing samples"):
             try:
                 data = json.loads(line)
-                text = data.get('text', '')  # Adjust based on your JSONL structure
+                text = data if isinstance(data, str) else data.get('text', '')
                 
                 if not text.strip():
                     empty_samples += 1

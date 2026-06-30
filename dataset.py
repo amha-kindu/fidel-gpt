@@ -26,6 +26,7 @@ class NLPDataset(Dataset):
         self.preprocessor = AmharicPreprocessor()
 
         self.pad_token = self.tokenizer.pad_id()
+        self._causal_mask = get_causal_mask(max_len)
 
     def get_loader(self, batch_size: int, sampler: Sampler=None) -> DataLoader:
         return DataLoader(
@@ -34,7 +35,7 @@ class NLPDataset(Dataset):
             shuffle=(sampler is None),      # Sampler itself will handle shuffling if provided
             sampler=sampler,
             num_workers=self.workers,       # Number of subprocesses to use for data loading
-            pin_memory=True,                # pre-allocate batches in page-locked memory so that GPU transfers are faster and can be asynchronous
+            pin_memory=torch.cuda.is_available(),  # pre-allocate batches in page-locked memory so that GPU transfers are faster and can be asynchronous
             drop_last=True,                 # drop the last incomplete(does not have the size 'batch_size') batch
         )
     
@@ -79,9 +80,8 @@ class TextDataset(NLPDataset):
             LOGGER.info(f"\033[93mLoading data from {file_name}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
             for line in f:
                 text = json.loads(line.strip())
-                preprocessed_text = self.preprocessor.execute(text)
-                if preprocessed_text:
-                    self.samples.append(self.get_io_tensors(preprocessed_text))
+                if text and self.preprocessor.execute(text):
+                    self.samples.append(self.get_io_tensors(text))
                     if self.samples and len(self.samples) % 100000 == 0:
                         LOGGER.info(f"\033[93mLoaded {len(self.samples)} samples from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
         LOGGER.info(f"\033[92mDone! Loaded {len(self.samples)} samples from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
@@ -93,7 +93,7 @@ class TextDataset(NLPDataset):
         input, output = self.samples[index]
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_causal_mask(self.max_len)
+        mask = (input != self.pad_token) & self._causal_mask
         
         return input, output, mask
     
@@ -111,32 +111,39 @@ class TextStreamDataset(NLPDataset):
                 meta_data = json.load(f)
             self.tokens = meta_data['tokens']
         
-        if meta_data.get('mtime', None) != os.path.getmtime(file_path):
-            assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
-            with open(file_path, 'rb', buffering=1024 * 1024) as fin, open(index_path, 'wb') as fout:
-                LOGGER.info(f"\033[93mRegistering offsets from {file_name}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-                count = 0
-                while True:
-                    pos = fin.tell()
-                    line = fin.readline()
-                    if not line:    break
-                    
-                    preprocessed_line = self.preprocessor.execute(json.loads(line.strip()))
-                    self.tokens += len(self.tokenizer.Encode(preprocessed_line, out_type=int))
-                    
-                    fout.write(struct.pack('<Q', pos))
-                    count += 1
-                    if count % 1_000_000 == 0:
-                        LOGGER.info(f"\033[93mRegistered {count} offsets from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-                    
-                with open(meta_path, 'w') as f:
-                    json.dump({ "mtime": os.path.getmtime(file_path), "tokens": self.tokens, "samples": count }, f, indent=2)
-            
-            LOGGER.info(f"\033[92mDone! Registered {count} offsets from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-        else:
-            LOGGER.info(f"\033[93mUsing existing index for {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-        
-        # Read-only memmap of uint64 offsets of each sample        
+        if GLOBAL_RANK == COORDINATOR_RANK:
+            if meta_data.get('mtime', None) != os.path.getmtime(file_path) or not os.path.exists(index_path):
+                assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
+                with open(file_path, 'rb', buffering=1024 * 1024) as fin, open(index_path, 'wb') as fout:
+                    LOGGER.info(f"\033[93mRegistering offsets from {file_name}...\033[0m")
+                    count = 0
+                    while True:
+                        pos = fin.tell()
+                        line = fin.readline()
+                        if not line:    break
+
+                        preprocessed_line = self.preprocessor.execute(json.loads(line.strip()))
+                        self.tokens += len(self.tokenizer.Encode(preprocessed_line, out_type=int))
+
+                        fout.write(struct.pack('<Q', pos))
+                        count += 1
+                        if count % 1_000_000 == 0:
+                            LOGGER.info(f"\033[93mRegistered {count} offsets from {file_name}\033[0m")
+
+                    with open(meta_path, 'w') as f:
+                        json.dump({ "mtime": os.path.getmtime(file_path), "tokens": self.tokens, "samples": count }, f, indent=2)
+
+                LOGGER.info(f"\033[92mDone! Registered {count} offsets from {file_name}\033[0m")
+            else:
+                LOGGER.info(f"\033[93mUsing existing index for {file_name}\033[0m")
+
+        # Coordinator must finish writing the index before any rank mmaps it.
+        if WORLD_SIZE > 1:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
+
+        # Read-only memmap of uint64 offsets of each sample
         self.offsets = np.memmap(index_path, dtype=np.uint64, mode='r')
         if GLOBAL_RANK == COORDINATOR_RANK:
             index_file = os.path.basename(index_path)
@@ -148,7 +155,7 @@ class TextStreamDataset(NLPDataset):
         
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         offset = int(self.offsets[index])
-        with open(self.file_path, 'rb', buffering=1024 * 1024) as f:
+        with open(self.file_path, 'rb') as f:
             f.seek(offset)
             line = f.readline()       
         
@@ -157,7 +164,7 @@ class TextStreamDataset(NLPDataset):
         )
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_causal_mask(self.max_len)
+        mask = (input != self.pad_token) & self._causal_mask
         
         return input, output, mask
 
@@ -172,7 +179,6 @@ class FineTuningDataset(NLPDataset):
 
         skips = 0
         self.samples = []
-        self.file = open(file_path, 'r', encoding='utf-8')
         file_name = os.path.basename(file_path)
         with open(file_path, 'r', encoding='utf-8') as f:
             LOGGER.info(f"\033[93mLoading data from {file_name}{'/' + intent if intent else ''}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
@@ -211,7 +217,7 @@ class FineTuningDataset(NLPDataset):
         input, output = self.samples[index]
         
         # (SEQ_LEN,) != (1,) --> (SEQ_LEN,) --> (SEQ_LEN,) & (1, SEQ_LEN, SEQ_LEN) --> (1, SEQ_LEN, SEQ_LEN)
-        mask = (input != self.pad_token) & get_causal_mask(self.max_len)
+        mask = (input != self.pad_token) & self._causal_mask
         
         return input, output, mask
     
@@ -311,7 +317,7 @@ class MultiTaskDataset(Dataset):
             shuffle=(sampler is None),      # Sampler itself will handle shuffling if provided
             sampler=sampler,
             num_workers=self.workers,       # Number of subprocesses to use for data loading
-            pin_memory=True,                # pre-allocate batches in page-locked memory so that GPU transfers are faster and can be asynchronous
+            pin_memory=torch.cuda.is_available(),  # pre-allocate batches in page-locked memory so that GPU transfers are faster and can be asynchronous
             drop_last=True,                 # drop the last incomplete(does not have the size 'batch_size') batch
         )
     
@@ -330,7 +336,7 @@ class TemperatureSampler(Sampler[int]):
         self.lengths = torch.tensor(self.mt.lengths, dtype=torch.float)
         self.offsets = torch.tensor(self.mt.offsets, dtype=torch.long)
         
-        weights = (self.lengths.clamp(min=1.0)) ** alpha # probs ∝ n^alpha
+        weights = self.lengths ** alpha # probs ∝ n^alpha
         self.task_probs = (weights / weights.sum()).tolist()
 
     def __len__(self):

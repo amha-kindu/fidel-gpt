@@ -48,8 +48,8 @@ class PositionEncoder(nn.Module):
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.position_encodings[:, :x.shape[1], :].requires_grad_(False)
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        return x + self.position_encodings[:, offset:offset + x.shape[1], :].requires_grad_(False)
 
 
 class MultiHeadAttentionBlock(nn.Module):
@@ -103,32 +103,34 @@ class MultiHeadAttentionBlock(nn.Module):
         key: torch.Tensor = self.Wk(x)
         query: torch.Tensor = self.Wq(x)
         value: torch.Tensor = self.Wv(x)
-                
-        if use_cache:
-            if kv_cache is not None:
-                # (N_BATCHES, CACHE_SIZE, EMBED_DIM)
-                key_past, value_past = kv_cache
-                
-                # (N_BATCHES, CACHE_SIZE + SEQ_LEN, EMBED_DIM)
-                key = torch.cat([key_past, key], dim=1)
-                value = torch.cat([value_past, value], dim=1)
-            kv_cache = key, value
+
+        # Cache accumulates past tokens; the model only returns the new KV pairs.
+        # Concatenation of past+new is the cache's responsibility.
+        new_kv = (key, value) if use_cache else None
+        if use_cache and kv_cache is not None:
+            key_past, value_past = kv_cache
+            key = torch.cat([key_past, key], dim=1)
+            value = torch.cat([value_past, value], dim=1)
 
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, HEADS, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
         
+        # During decode (single new token against full KV cache), Q is shorter than K.
+        # The cache already enforces causal ordering, so no mask is needed.
+        in_decode_phase = query.size(2) < key.size(2)
+
         attn_bias = None
-        if mask is not None:
+        if mask is not None and not in_decode_phase:
             attn_bias = torch.zeros_like(mask, dtype=query.dtype)
             attn_bias.masked_fill_(mask.logical_not(), -1e4)
-        
+
         output = F.scaled_dot_product_attention(
             query, key, value,
             attn_mask=attn_bias,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=(mask is None),
+            is_causal=(mask is None) and not in_decode_phase,
         )
         
         # output: torch.Tensor = self.sdpa(
@@ -144,7 +146,7 @@ class MultiHeadAttentionBlock(nn.Module):
         # (N_BATCHES, SEQ_LEN, HEADS, d_head) -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
         output = output.contiguous().view(*x.shape[:-1], -1)
         
-        return self.Wo(output), kv_cache
+        return self.Wo(output), new_kv
     
 
 class FeedForwardBlock(nn.Module):
@@ -166,13 +168,14 @@ class FeedForwardBlock(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.post_norm = config.post_norm
         self.dropout = nn.Dropout(config.dropout)
         self.norm1 = nn.LayerNorm(config.embed_dim)
         self.norm2 = nn.LayerNorm(config.embed_dim)
-        
+
         self.feed_forward = FeedForwardBlock(config)
         self.masked_multihead_attention = MultiHeadAttentionBlock(config)
-    
+
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
@@ -182,16 +185,15 @@ class DecoderBlock(nn.Module):
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
-        # Post-Norm
-        # x_update, kv_cache = self.masked_multihead_attention(x, mask, use_cache, kv_cache)
-        # x = x + self.dropout(self.norm1(x_update))
-        # x = x + self.dropout(self.norm2(self.feed_forward(x)))
-        
-        # Pre-Norm
-        x_update, kv_cache = self.masked_multihead_attention(self.norm1(x), mask, use_cache, kv_cache)
-        x = x + self.dropout(x_update)
-        x = x + self.dropout(self.feed_forward(self.norm2(x)))
-        return x, kv_cache
+        if self.post_norm:
+            x_update, new_kv = self.masked_multihead_attention(x, mask, use_cache, kv_cache)
+            x = self.norm1(x + self.dropout(x_update))
+            x = self.norm2(x + self.dropout(self.feed_forward(x)))
+        else:
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), mask, use_cache, kv_cache)
+            x = x + self.dropout(x_update)
+            x = x + self.dropout(self.feed_forward(self.norm2(x)))
+        return x, new_kv
 
 
 class Projection(nn.Module):
@@ -214,12 +216,13 @@ class GPTmodel(nn.Module):
         self.projection = Projection(config)
         self.position_encoder = PositionEncoder(config)
         self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
+        self.norm_f = nn.LayerNorm(config.embed_dim)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    def _embed_and_encode_position(self, x: torch.Tensor) -> torch.Tensor:
+    def _embed_and_encode_position(self, x: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
         x = self.embedding(x)
-        return self.position_encoder(x)
+        return self.position_encoder(x, position_offset)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -233,25 +236,26 @@ class GPTmodel(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor,
         use_cache: bool = False,
-        kv_caches: list[SlidingKVCache] = []
+        kv_caches: list[SlidingKVCache] | None = None,
     ) -> torch.Tensor:
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv_cache = decoder(x, mask, use_cache, kv_cache)
+            x, new_kv = decoder(x, mask, use_cache, kv_cache)
             if use_cache:
-                kv_caches[i].append(new_kv_cache[0], new_kv_cache[1])
-        return x
+                kv_caches[i].append(new_kv[0], new_kv[1])
+        return self.norm_f(x) if not self.config.post_norm else x
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
     def forward(
         self,
-        x: torch.Tensor, 
+        x: torch.Tensor,
         mask: torch.Tensor,
         use_cache: bool = False,
-        kv_caches: list[SlidingKVCache] = []
+        kv_caches: list[SlidingKVCache] | None = None,
+        position_offset: int = 0,
     ) -> torch.Tensor:
-        x = self._embed_and_encode_position(x)
+        x = self._embed_and_encode_position(x, position_offset)
         x = self._decode(x, mask, use_cache, kv_caches)
         return self._project(x)
     
@@ -259,10 +263,11 @@ class GPTmodel(nn.Module):
     @staticmethod
     def build(
         config: ModelConfig | ModelWithLoRAConfig,
-        weights: dict = {}
+        weights: dict | None = None,
     ):
         model = GPTmodel(config)
-                
+        weights = weights or {}
+
         lora_weights = {k: v for k, v in weights.items() if isinstance(config, ModelWithLoRAConfig) and k in LoRAdapter.get_lora_param_names(config.lora_targets)}
         base_weights = {k: v for k, v in weights.items() if k not in lora_weights}
 

@@ -41,6 +41,7 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
     initial_epoch = 0
     training_loss = 0
     validation_loss = 0
+    should_early_stop = False
     if training_state:
         global_step = training_state.global_step + 1
         initial_epoch = int(training_state.global_step / config.steps_per_epoch)
@@ -49,32 +50,34 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
         early_stopping.best_loss = training_state.best_val_loss
         optimizer.load_state_dict(training_state.optimizer_state)
         scheduler.load_state_dict(training_state.lr_scheduler_state)
+        if scaler and getattr(training_state, 'scaler_state', None):
+            scaler.load_state_dict(training_state.scaler_state)
 
     loss_func = nn.CrossEntropyLoss(ignore_index=finetune_dataset.ignore_index, label_smoothing=config.label_smoothing).to(DEVICE)
         
     train_sampler = TemperatureSampler(
         finetune_dataset,
-        alpha=training_config.sampler_alpha,
+        alpha=config.sampler_alpha,
         iter_size=config.batch_size * config.batches_per_epoch,
     )
-    data_loader = finetune_dataset.get_loader(config.batch_size, sampler=train_sampler)    
-    
+    raw_data_loader = finetune_dataset.get_loader(config.batch_size, sampler=train_sampler)
+
     val_sampler = TemperatureSampler(
         val_dataset,
-        alpha=training_config.sampler_alpha,
+        alpha=config.sampler_alpha,
         iter_size=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
     )
     val_data_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
-
+    
     for epoch in range(initial_epoch, config.epochs):
-        data_loader = tqdm(data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
+        data_loader = tqdm(raw_data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
         for i, batch in enumerate(data_loader):
             # (N_BATCHES, SEQ_LEN)
-            decoder_input: torch.Tensor = batch[0].to(DEVICE)
-            label: torch.Tensor         = batch[1].to(DEVICE)
-            
+            decoder_input: torch.Tensor = batch[0].to(DEVICE, non_blocking=True)
+            label: torch.Tensor         = batch[1].to(DEVICE, non_blocking=True)
+
             # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
-            decoder_mask: torch.Tensor  = batch[2].to(DEVICE)
+            decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
             
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -92,20 +95,23 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
             accum_loss += batch_loss.detach().item() / config.grad_accum_steps
             update_weights = ((i + 1) % config.grad_accum_steps) == 0
 
+            scaled_loss = batch_loss / config.grad_accum_steps
             if MIXED_PRECISION_ENABLED:
-                scaler.scale(batch_loss).backward()
+                scaler.scale(scaled_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
-                    log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
+                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                    log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
             else:
-                batch_loss.backward()
+                scaled_loss.backward()
                 if update_weights:
-                    log_gradients(tb_logger, {name: param.grad for name, param in model.named_parameters()}, global_step)
+                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                    log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
@@ -137,7 +143,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                     
                     if early_stopping(validation_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
-                        break                     
+                        should_early_stop = True
+                        break
                 
                 if global_step % config.validate_every == 0:
                     tb_logger.log_scalars("Loss", {"Validation": validation_loss}, global_step)
@@ -148,11 +155,15 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                     "val_loss": f"{validation_loss:6.3f}"
                 })
                 
-                log_confidence_metrics(tb_logger, logits.detach(), global_step)
+                log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
                 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
+                    # Snapshot trainable weights to CPU synchronously so the async
+                    # thread-pool write cannot race with optimizer.step() next batch.
+                    weights_snapshot = {k: v.detach().cpu() for k, v in model.named_parameters() if v.requires_grad}
                     save_checkpoint(
-                        model=model,
+                        weights=weights_snapshot,
+                        model_config=model.config,
                         global_step=global_step,
                         config=config,
                         training_state=TrainingState(
@@ -162,12 +173,21 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                             validation_loss=validation_loss,
                             best_val_loss=early_stopping.best_loss,
                             optimizer_state=optimizer.state_dict(),
-                            lr_scheduler_state=scheduler.state_dict()
+                            lr_scheduler_state=scheduler.state_dict(),
+                            scaler_state=scaler.state_dict() if scaler else None,
                         )
                     )
 
                 global_step += 1
-    
+
+        # Discard gradients from any partial accumulation window at the epoch boundary.
+        if len(data_loader) > 0 and (i + 1) % config.grad_accum_steps != 0:
+            optimizer.zero_grad()
+        accum_loss = 0.0
+
+        if should_early_stop:
+            break
+
     tb_logger.close()
 
 
@@ -220,13 +240,13 @@ if __name__ == "__main__":
     if args.lora:
         assert args.lora_targets, "If you want to use LoRA, please provide a path to the LoRA targets"
 
-    if not os.path.exists(args.checkpoint):
+    if not os.path.isfile(args.checkpoint):
         raise FileNotFoundError(f"File {args.checkpoint} does not exist")
     LOGGER.info(f"Loading checkpoint from '{args.checkpoint}'...")
     pretraining_checkpoint: dict = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     weights: dict = pretraining_checkpoint["weights"]
     
-    training_config = DEFAULT_TRAINING_CONFIG
+    training_config = TrainingConfig()
     training_config.update(**args.__dict__, finetuning=True)
     
     model_config: ModelConfig = pretraining_checkpoint["model_config"]
@@ -247,12 +267,12 @@ if __name__ == "__main__":
     training_state = None
     if args.resume:
         if args.lora_checkpoint:
-            if not os.path.exists(args.lora_checkpoint):
+            if not os.path.isfile(args.lora_checkpoint):
                 raise FileNotFoundError(f"File {args.lora_checkpoint} does not exist")
             LOGGER.info(f"Loading lora checkpoint from '{args.lora_checkpoint}'...")
             checkpoint: dict = torch.load(args.lora_checkpoint, map_location=DEVICE, weights_only=False)
         else:
-            if not os.path.exists(args.finetuned_checkpoint):
+            if not os.path.isfile(args.finetuned_checkpoint):
                 raise FileNotFoundError(f"File {args.finetuned_checkpoint} does not exist")
             LOGGER.info(f"Loading finetuning checkpoint from '{args.finetuned_checkpoint}'...")
             checkpoint: dict = torch.load(args.finetuned_checkpoint, map_location=DEVICE, weights_only=False)
@@ -280,21 +300,25 @@ if __name__ == "__main__":
         "masakhanews", "masakhaner", "xlsum_summarization",
         "xlsum_reverse_summarization", "amharic_title_generation",
     ]
+    train_datasets = {
+        intent: FineTuningDataset(intent, training_config.training_data, tokenizer, model_config.seq_len)
+        for intent in intents
+    }
     finetune_dataset = MultiTaskDataset(
-        datasets={
-            intent: FineTuningDataset(intent, training_config.training_data, tokenizer, model_config.seq_len) for intent in intents
-        },
+        datasets={k: v for k, v in train_datasets.items() if len(v) > 0},
         workers=training_config.dl_workers
     )
     samples = len(finetune_dataset)
-    
+
     training_config.batches_per_epoch = int(samples / (training_config.batch_size * WORLD_SIZE))
     training_config.steps_per_epoch = int(training_config.batches_per_epoch / training_config.grad_accum_steps)
-    
+
+    val_datasets = {
+        intent: FineTuningDataset(intent, training_config.validation_data, tokenizer, model_config.seq_len)
+        for intent in intents
+    }
     val_dataset = MultiTaskDataset(
-        datasets={
-            intent: FineTuningDataset(intent, training_config.validation_data, tokenizer, model_config.seq_len) for intent in intents
-        },
+        datasets={k: v for k, v in val_datasets.items() if len(v) > 0},
         workers=training_config.dl_workers,
     )
     

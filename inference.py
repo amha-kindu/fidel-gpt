@@ -88,17 +88,26 @@ class GptInferenceEngine:
 
     @torch.no_grad()
     def complete(self, token_ids: list[int]) -> Iterator[int]:
+        for cache in self.kv_caches:
+            cache.keys = None
+            cache.values = None
         while token_ids and len(token_ids) < self.max_len:
-            decoder_input = torch.tensor(
-                [token_ids],
-                dtype=torch.int64
-            ).to(DEVICE)
-            
-            decoder_mask = get_causal_mask(decoder_input.size(1)).to(DEVICE)
-                        
+            cache_warm = self.use_kv_cache and self.kv_caches[0].keys is not None
+            if cache_warm:
+                # Decode phase: only feed the last token; KV cache supplies the history.
+                # Use the token's absolute position so the PE is correct.
+                decoder_input = torch.tensor([[token_ids[-1]]], dtype=torch.int64).to(DEVICE)
+                decoder_mask = None
+                position_offset = len(token_ids) - 1
+            else:
+                # Prefill phase (or no cache): feed the full sequence from position 0.
+                decoder_input = torch.tensor([token_ids], dtype=torch.int64).to(DEVICE)
+                decoder_mask = get_causal_mask(decoder_input.size(1)).to(DEVICE)
+                position_offset = 0
+
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (1, SEQ_LEN, VOCAB_SIZE)
-                logits: torch.Tensor = self.model(decoder_input, decoder_mask, self.use_kv_cache, self.kv_caches)
+                logits: torch.Tensor = self.model(decoder_input, decoder_mask, self.use_kv_cache, self.kv_caches, position_offset)
 
             # (VOCAB_SIZE,)
             # Take logits for the last position and apply temperature scaling
@@ -127,7 +136,7 @@ class GptInferenceEngine:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=0)
                 sorted_probs = F.softmax(sorted_logits, dim=0)
                 cprobs = torch.cumsum(sorted_probs, dim=0)
-                mask = cprobs <= self.top_p
+                mask = (cprobs - sorted_probs) <= self.top_p
                 mask[0] = True  # ensure at least one token
                 logits = torch.full_like(logits, float('-inf'))\
                     .scatter(dim=0, index=sorted_idx[mask], src=sorted_logits)
@@ -155,19 +164,19 @@ if __name__ == '__main__':
     parser.add_argument("--temperature", type=float, default=DEFAULT_INFERENCE_CONFIG.temperature, help="Sampling temperature (t=1.0 for normal sampling, 0<t<1.0 for less random, t>1.0 for more random sampling)")
     parser.add_argument("--repetition-penalty", type=float, default=DEFAULT_INFERENCE_CONFIG.repetition_penalty, help="Repetition penalty strength")
     parser.add_argument("--presence-penalty", type=float, default=DEFAULT_INFERENCE_CONFIG.presence_penalty, help="Presence penalty strength")
-    parser.add_argument("--frequency-penalty", type=float, default=DEFAULT_INFERENCE_CONFIG.freq_penalty, help="Frequency penalty strength")
+    parser.add_argument("--freq-penalty", type=float, default=DEFAULT_INFERENCE_CONFIG.freq_penalty, help="Frequency penalty strength")
     parser.add_argument("--no-repeat-ngram-size", type=int, default=DEFAULT_INFERENCE_CONFIG.no_repeat_ngram_size, help="No repeat n-gram size")
-    parser.add_argument("--repeat-window", type=int, default=DEFAULT_INFERENCE_CONFIG.rep_window, help="Repeat window size")
+    parser.add_argument("--rep-window", type=int, default=DEFAULT_INFERENCE_CONFIG.rep_window, help="Repeat window size")
     parser.add_argument("--kv-cache-size", type=int, default=DEFAULT_INFERENCE_CONFIG.kv_cache_size, help="KV cache size")
     parser.add_argument("--checkpoint", type=str, required=True, help="File path to load saved checkpoint")
     parser.add_argument("--tokenizer", type=str, required=True, help="File path to load SentencePiece tokenizer")
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.checkpoint) and not os.path.isfile(args.checkpoint):
+    if not os.path.isfile(args.checkpoint):
         raise FileNotFoundError(f"File {args.checkpoint} does not exist")
-    
-    if not os.path.exists(args.tokenizer) and not os.path.isfile(args.tokenizer):
+
+    if not os.path.isfile(args.tokenizer):
         raise FileNotFoundError(f"File {args.tokenizer} does not exist")
     
     LOGGER.info(f"Loading checkpoint from {args.checkpoint}...")
