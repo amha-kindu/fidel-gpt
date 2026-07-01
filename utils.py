@@ -105,20 +105,56 @@ def _non_blocking():
 def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, global_step: int):
     with torch.no_grad():
         # Cast to fp32: under fp16 autocast, 1e-9 underflows to 0.0 making clamp a no-op.
-        probs = torch.softmax(logits.float(), dim=-1)
+        logits_f = logits.float()
+        probs = torch.softmax(logits_f, dim=-1)
         entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-9)), dim=-1).mean().item()
+        max_prob = probs.max(dim=-1).values.mean().item()
+        logit_std = logits_f.std(dim=-1).mean().item()
         tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
+        tb_logger.log_scalar("Confidence/MaxProb", max_prob, global_step)
+        tb_logger.log_scalar("Confidence/LogitStd", logit_std, global_step)
 
 @_non_blocking()
 def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int):
     with torch.no_grad():
-        global_norm_sq = 0.0
+        global_sq = 0.0
+        component_sq: dict[str, float] = {}
         for name, grad in grads.items():
-            if grad is not None:
-                param_norm = torch.linalg.vector_norm(grad.view(-1)).item()
-                global_norm_sq += param_norm ** 2
-                tb_logger.log_scalar(f"GradNorm/{name}", param_norm, global_step)
-        tb_logger.log_scalar(f"GradNorm/Global", global_norm_sq ** 0.5, global_step)
+            if grad is None:
+                continue
+            norm_sq = torch.linalg.vector_norm(grad.float().view(-1)).item() ** 2
+            global_sq += norm_sq
+            if name.startswith("embedding"):
+                key = "Embedding"
+            elif name.startswith("decoders."):
+                key = f"Layer{name.split('.')[1]}"
+            elif name.startswith("projection"):
+                key = "Projection"
+            else:
+                key = "NormF"
+            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
+        
+        tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
+        for key, sq in component_sq.items():
+            tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
+
+@_non_blocking()
+def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tensor], global_step: int):
+    with torch.no_grad():
+        component_sq: dict[str, float] = {}
+        for name, param in weights.items():
+            norm_sq = torch.linalg.vector_norm(param.float().view(-1)).item() ** 2
+            if name.startswith("embedding"):
+                key = "Embedding"
+            elif name.startswith("decoders."):
+                key = f"Layer{name.split('.')[1]}"
+            elif name.startswith("projection"):
+                key = "Projection"
+            else:
+                key = "NormF"
+            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
+        for key, sq in component_sq.items():
+            tb_logger.log_scalar(f"WeightNorm/{key}", sq ** 0.5, global_step)
 
 
 @torch.no_grad()
