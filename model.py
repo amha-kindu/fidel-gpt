@@ -49,7 +49,7 @@ class PositionEncoder(nn.Module):
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        return x + self.position_encodings[:, offset:offset + x.shape[1], :].requires_grad_(False)
+        return x + self.position_encodings[:, offset:offset + x.shape[1], :]
 
 
 class MultiHeadAttentionBlock(nn.Module):
@@ -60,36 +60,12 @@ class MultiHeadAttentionBlock(nn.Module):
         self.heads = config.heads
         self.d_head: int = config.embed_dim // config.heads
 
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout_p: float = config.dropout
         self.Wq: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wk: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
-    @staticmethod
-    def sdpa(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        scale: float,
-        dropout: nn.Dropout=None, 
-        mask: torch.Tensor=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        attention_scores = scale * (query @ key.transpose(-2, -1))
-        
-        if mask is not None:
-            if mask.dtype == torch.bool:
-                attention_scores.masked_fill_(mask == 0, -6e04)
-            else:
-                attention_scores = attention_scores + mask
-        
-        attention_scores = attention_scores.softmax(dim=-1)
-        if dropout is not None:
-            attention_scores = dropout(attention_scores)
-        
-        return attention_scores @ value
-     
-    
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
@@ -129,16 +105,9 @@ class MultiHeadAttentionBlock(nn.Module):
         output = F.scaled_dot_product_attention(
             query, key, value,
             attn_mask=attn_bias,
-            dropout_p=self.dropout.p if self.training else 0.0,
+            dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=(mask is None) and not in_decode_phase,
         )
-        
-        # output: torch.Tensor = self.sdpa(
-        #     query, key, value,
-        #     scale=1 / math.sqrt(self.d_head),
-        #     dropout=self.dropout,
-        #     mask=attn_bias
-        # )
 
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
         output = output.transpose(1, 2)
@@ -199,7 +168,7 @@ class DecoderBlock(nn.Module):
 class Projection(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.linear = nn.Linear(config.embed_dim, config.vocab_size)
+        self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -217,6 +186,10 @@ class GPTmodel(nn.Module):
         self.position_encoder = PositionEncoder(config)
         self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
+        if config.tie_weights:
+            # Tie input embedding and output projection weights (standard for decoder-only LMs).
+            # Both are (vocab_size, embed_dim), sharing one tensor halves that parameter block.
+            self.projection.linear.weight = self.embedding.embedding.weight
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -286,7 +259,11 @@ class GPTmodel(nn.Module):
                     nn.init.zeros_(m.bias)
             
             model.apply(init_weights)
-            
+            if config.tie_weights:
+                # apply() is children-first: Embedding gets normal(0, 0.02) then Projection
+                # overwrites the shared tensor with xavier. Restore normal init.
+                nn.init.normal_(model.embedding.embedding.weight, mean=0.0, std=0.02)
+
         if isinstance(config, ModelWithLoRAConfig):
             LoRAdapter.apply_lora(model, config.lora_targets, config.lora_rank, config.lora_alpha, config.lora_dropout)
             

@@ -109,8 +109,9 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     scaler.scale(scaled_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
-                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
-                    log_gradients(tb_logger, grad_snapshot, global_step)
+                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                        grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                        log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     scaler.step(optimizer)
                     scaler.update()
@@ -120,8 +121,9 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 with sync_ctx:
                     scaled_loss.backward()
                 if update_weights:
-                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
-                    log_gradients(tb_logger, grad_snapshot, global_step)
+                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                        grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                        log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
@@ -172,7 +174,8 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     "val_loss": f"{validation_loss:6.3f}"
                 })
                 
-                log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
+                if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                    log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
                 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
                     weights_snapshot = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
@@ -244,6 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--post-norm", action="store_true", help="Apply layer normalization after each residual block (post-norm Transformer style)")
+    parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=None, help="Tie embedding and projection weights (default: enabled)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
@@ -324,7 +328,7 @@ if __name__ == "__main__":
         LOGGER.info(f"Using training config: {numerical_configs}")
         LOGGER.info(f"Initiating training with {'mixed-precision' if MIXED_PRECISION_ENABLED else 'single-precision'}...")
         LOGGER.info(f"Using model config: {model_config}")
-        LOGGER.info(f"Model size: {sum(p.numel() for p in model.parameters()) * 4 / (1024 ** 2):.2f}MB")
+        LOGGER.info(f"Model size: {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     train(training_config, model, train_dataset, val_dataset, args.is_distributed, training_state)

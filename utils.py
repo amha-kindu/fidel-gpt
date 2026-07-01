@@ -102,26 +102,23 @@ def _non_blocking():
     return decorator
 
 @_non_blocking()
-def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, global_step: int, log_interval: int = 10):
+def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, global_step: int):
     with torch.no_grad():
-        if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval == 0:
-            probs = torch.softmax(logits, dim=-1)
-            
-            # Entropy (measures uncertainty; lower is better)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-4), dim=-1).mean().cpu().item()
-            tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
+        # Cast to fp32: under fp16 autocast, 1e-9 underflows to 0.0 making clamp a no-op.
+        probs = torch.softmax(logits.float(), dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-9)), dim=-1).mean().item()
+        tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
 
 @_non_blocking()
-def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int, log_interval: int = 10):
+def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int):
     with torch.no_grad():
-        if GLOBAL_RANK == COORDINATOR_RANK and global_step % log_interval == 0:
-            global_norm_sq = 0.0
-            for name, grad in grads.items():
-                if grad is not None:
-                    param_norm = torch.linalg.vector_norm(grad.view(-1)).item()
-                    global_norm_sq += param_norm ** 2
-                    tb_logger.log_scalar(f"GradNorm/{name}", param_norm, global_step)
-            tb_logger.log_scalar(f"GradNorm/Global", global_norm_sq ** 0.5, global_step)
+        global_norm_sq = 0.0
+        for name, grad in grads.items():
+            if grad is not None:
+                param_norm = torch.linalg.vector_norm(grad.view(-1)).item()
+                global_norm_sq += param_norm ** 2
+                tb_logger.log_scalar(f"GradNorm/{name}", param_norm, global_step)
+        tb_logger.log_scalar(f"GradNorm/Global", global_norm_sq ** 0.5, global_step)
 
 
 @torch.no_grad()

@@ -29,7 +29,7 @@ class GptInferenceEngine:
         
         self.top_k = config.top_k
         self.top_p = config.top_p
-        self.temperature = min(config.temperature, config.max_temp) + 1e-5
+        self.temperature = max(min(config.temperature, config.max_temp), 1e-5)
 
         self.pad_token = self.tokenizer.PieceToId("[PAD]")
         self.unk_token = self.tokenizer.PieceToId("[UNK]")
@@ -192,7 +192,7 @@ if __name__ == '__main__':
     LOGGER.info(f"Device: {DEVICE}")
     LOGGER.info(f"Total Parameters: {total_params}")
     LOGGER.info(f"Trainable Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    LOGGER.info(f"Model Size(MB): {total_params * 4 / (1024 ** 2):.2f}MB")
+    LOGGER.info(f"Model Size(MB): {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
     LOGGER.info(f"Initiating inference with {'mixed-precision' if MIXED_PRECISION_ENABLED else 'single-precision'}...")
     
     tokenizer = spm.SentencePieceProcessor()
@@ -206,7 +206,7 @@ if __name__ == '__main__':
             break
 
         try:
-            LOGGER.info(f"Response: {user_input}", extra={"partial": True})
+            LOGGER.info("Response: ", extra={"partial": True})
             tokens = inference_engine.get_tokens(user_input)
             for token_id in inference_engine.complete(tokens):
                 token: str = tokenizer.IdToPiece(token_id)

@@ -137,7 +137,7 @@ if __name__ == '__main__':
     total_params = sum(p.numel() for p in model.parameters())
     LOGGER.info(f"Device: {DEVICE}")
     LOGGER.info(f"Total Parameters: {total_params}")
-    LOGGER.info(f"Model Size(MB): {total_params * 4 / (1024 ** 2):.2f}MB")
+    LOGGER.info(f"Model Size(MB): {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
     LOGGER.info(f"Initiating inference with {'mixed-precision' if MIXED_PRECISION_ENABLED else 'single-precision'}...")
     
     tokenizer = spm.SentencePieceProcessor()

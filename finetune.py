@@ -100,8 +100,9 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                 scaler.scale(scaled_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
-                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
-                    log_gradients(tb_logger, grad_snapshot, global_step)
+                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                        grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                        log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     scaler.step(optimizer)
                     scaler.update()
@@ -110,8 +111,9 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
             else:
                 scaled_loss.backward()
                 if update_weights:
-                    grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
-                    log_gradients(tb_logger, grad_snapshot, global_step)
+                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                        grad_snapshot = {name: param.grad.detach().cpu() for name, param in model.named_parameters() if param.grad is not None}
+                        log_gradients(tb_logger, grad_snapshot, global_step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
@@ -155,7 +157,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                     "val_loss": f"{validation_loss:6.3f}"
                 })
                 
-                log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
+                if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
+                    log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
                 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
                     # Snapshot trainable weights to CPU synchronously so the async
@@ -341,7 +344,7 @@ if __name__ == "__main__":
         if args.lora:
             LOGGER.info("Using LoRA for finetuning")
         LOGGER.info(f"Using training config: {training_config}")
-        LOGGER.info(f"Unfrozen Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2):.2f}MB")
+        LOGGER.info(f"Unfrozen Model size: {sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad) / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     finetune(training_config, model, finetune_dataset, val_dataset, training_state)

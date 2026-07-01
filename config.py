@@ -69,7 +69,8 @@ def get_git_commit():
         return "unknown"
 
 ENV = {
-    "python": sys.platform,
+    "python": sys.version,
+    "platform": sys.platform,
     "torch": torch.__version__,
     "cuda_available": torch.cuda.is_available(),
     "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
@@ -107,6 +108,7 @@ class ModelConfig(Config):
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
         self.post_norm: bool = kwargs.get("post_norm", False)
+        self.tie_weights: bool = kwargs.get("tie_weights", True)
 
 
 class ModelWithLoRAConfig(ModelConfig):

@@ -4,10 +4,13 @@ import ijson
 import torch
 import struct
 import random
+import threading
 import numpy as np
 import sentencepiece as spm
 from bisect import bisect_left
 from torch.utils.data import Dataset, DataLoader, Sampler
+
+_tls = threading.local()  # per-thread file handle cache: _tls.handles = {path: file}
 
 from config import *
 from preprocessor import AmharicPreprocessor
@@ -155,10 +158,16 @@ class TextStreamDataset(NLPDataset):
         
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         offset = int(self.offsets[index])
-        with open(self.file_path, 'rb') as f:
-            f.seek(offset)
-            line = f.readline()       
-        
+        # One open handle per (thread, path) so interleaving train/val datasets doesn't thrash.
+        if not hasattr(_tls, 'handles'):
+            _tls.handles = {}
+        f = _tls.handles.get(self.file_path)
+        if f is None:
+            f = open(self.file_path, 'rb')
+            _tls.handles[self.file_path] = f
+        f.seek(offset)
+        line = f.readline()
+
         input, output = self.get_io_tensors(
             text=json.loads(line.strip())
         )
