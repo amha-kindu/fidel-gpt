@@ -1,6 +1,7 @@
 import os
 import json
 import ijson
+import math
 import torch
 import struct
 import random
@@ -8,7 +9,7 @@ import threading
 import numpy as np
 import sentencepiece as spm
 from bisect import bisect_left
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, IterableDataset
 
 _tls = threading.local()  # per-thread file handle cache: _tls.handles = {path: file}
 
@@ -176,6 +177,105 @@ class TextStreamDataset(NLPDataset):
         mask = (input != self.pad_token) & self._causal_mask
         
         return input, output, mask
+
+
+class PackedTextStreamDataset(TextStreamDataset, IterableDataset):
+    """
+    Inherits TextStreamDataset but yields fixed-length packed sequences instead
+    of individually padded samples.  Multiple short documents are concatenated
+    end-to-end until the context window is full; a block-diagonal causal mask
+    prevents any token from attending across document boundaries.
+
+    Because every position in every sequence carries a real token, this
+    eliminates the ~75% padding overhead present in the base class and gives
+    roughly 4x more useful learning signal per GPU-second.
+
+    Shuffling and sharding (for DataLoader workers and DDP ranks) are handled
+    inside __iter__, so no external Sampler is needed or supported.
+    """
+
+    def __init__(self, file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int, workers: int = 0) -> None:
+        TextStreamDataset.__init__(self, file_path, tokenizer, max_len, workers)
+        self._epoch: int = 0
+
+    def __len__(self) -> int:
+        return self.tokens // self.max_len
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __iter__(self):
+        # All DDP ranks and DataLoader workers derive their index permutation
+        # from the same epoch seed so the global shuffle is consistent, then
+        # each party takes a non-overlapping shard.
+        rng = random.Random(self._epoch)
+        indices = list(range(len(self.offsets)))
+        rng.shuffle(indices)
+
+        # DDP shard: each rank gets 1/WORLD_SIZE of the shuffled indices.
+        if WORLD_SIZE > 1:
+            per_rank = math.ceil(len(indices) / WORLD_SIZE)
+            indices = indices[GLOBAL_RANK * per_rank : (GLOBAL_RANK + 1) * per_rank]
+
+        # DataLoader worker shard: split the rank's shard across workers.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            per_worker = math.ceil(len(indices) / worker_info.num_workers)
+            indices = indices[worker_info.id * per_worker : (worker_info.id + 1) * per_worker]
+
+        inp_buf: list[int] = []
+        out_buf: list[int] = []
+        doc_ends: list[int] = []  # absolute end position of each document in the buffer
+
+        for i in indices:
+            inp, out, _ = self[i]
+            actual_len = int((inp != self.pad_token).sum())
+            if actual_len == 0:
+                continue
+
+            inp_buf.extend(inp[:actual_len].tolist())
+            out_buf.extend(out[:actual_len].tolist())
+            doc_ends.append(len(inp_buf))
+
+            while len(inp_buf) >= self.max_len:
+                chunk_inp = inp_buf[:self.max_len]
+                chunk_out = out_buf[:self.max_len]
+
+                # Build block-diagonal causal mask: token i attends to token j
+                # iff i >= j AND both belong to the same document.
+                mask = torch.zeros(1, self.max_len, self.max_len, dtype=torch.bool)
+                prev = 0
+                for end in doc_ends:
+                    end = min(end, self.max_len)
+                    n = end - prev
+                    if n > 0:
+                        mask[0, prev:end, prev:end] = torch.ones(n, n, dtype=torch.bool).tril()
+                    prev = end
+                    if end == self.max_len:
+                        break
+
+                yield (
+                    torch.tensor(chunk_inp, dtype=torch.int64),
+                    torch.tensor(chunk_out, dtype=torch.int64),
+                    mask,
+                )
+
+                inp_buf = inp_buf[self.max_len:]
+                out_buf = out_buf[self.max_len:]
+                doc_ends = [e - self.max_len for e in doc_ends if e > self.max_len]
+
+    def get_loader(self, batch_size: int, sampler: Sampler = None) -> DataLoader:
+        # IterableDataset does not support external samplers; sharding is
+        # handled inside __iter__ via set_epoch / worker_info / GLOBAL_RANK.
+        return DataLoader(
+            dataset=self,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=None,
+            num_workers=self.workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+        )
 
 
 class FineTuningDataset(NLPDataset):

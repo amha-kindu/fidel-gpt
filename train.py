@@ -17,7 +17,7 @@ from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
-from dataset import TextStreamDataset, TextDataset, NLPDataset
+from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
 from utils import EarlyStopping, init_sdp_backend, log_gradients, log_confidence_metrics, save_checkpoint, validate
 
 
@@ -65,14 +65,22 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
     loss_func = nn.CrossEntropyLoss(ignore_index=train_dataset.ignore_index, label_smoothing=config.label_smoothing).to(DEVICE)
     
-    train_sampler = DistributedSampler(train_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=True, drop_last=True) if is_distributed else None
+    # PackedTextStreamDataset handles DDP sharding internally via set_epoch;
+    # an external DistributedSampler is only needed for map-style datasets.
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=True, drop_last=True)
+        if is_distributed and not isinstance(train_dataset, PackedTextStreamDataset)
+        else None
+    )
     raw_data_loader = train_dataset.get_loader(config.batch_size, sampler=train_sampler)
 
     val_sampler = RandomSampler(val_dataset, replacement=True, num_samples=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps))
     val_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
 
     for epoch in range(initial_epoch, config.epochs):
-        if is_distributed:
+        if isinstance(train_dataset, PackedTextStreamDataset):
+            train_dataset.set_epoch(epoch)
+        elif train_sampler is not None:
             train_sampler.set_epoch(epoch)
         data_loader = tqdm(raw_data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
 
@@ -253,6 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
     parser.add_argument("--dl-workers", type=int, help="Number of subprocesses to use for data loading")
     parser.add_argument("--stream", default=False, action="store_true", help="Stream data from disk")
+    parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple documents per sequence to eliminate padding waste (default: enabled)")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
@@ -303,7 +312,10 @@ if __name__ == "__main__":
     if args.stream or os.path.getsize(training_config.training_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
             LOGGER.info(f"File '{os.path.basename(training_config.training_data)}' too large! streaming file...")
-        train_dataset = TextStreamDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
+        if training_config.pack_sequences:
+            train_dataset = PackedTextStreamDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
+        else:
+            train_dataset = TextStreamDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
     else:
         train_dataset = TextDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
             
