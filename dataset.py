@@ -180,19 +180,6 @@ class TextStreamDataset(NLPDataset):
 
 
 class PackedTextStreamDataset(TextStreamDataset, IterableDataset):
-    """
-    Inherits TextStreamDataset but yields fixed-length packed sequences instead
-    of individually padded samples.  Multiple short documents are concatenated
-    end-to-end until the context window is full; a block-diagonal causal mask
-    prevents any token from attending across document boundaries.
-
-    Because every position in every sequence carries a real token, this
-    eliminates the ~75% padding overhead present in the base class and gives
-    roughly 4x more useful learning signal per GPU-second.
-
-    Shuffling and sharding (for DataLoader workers and DDP ranks) are handled
-    inside __iter__, so no external Sampler is needed or supported.
-    """
 
     def __init__(self, file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int, workers: int = 0) -> None:
         TextStreamDataset.__init__(self, file_path, tokenizer, max_len, workers)

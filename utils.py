@@ -1,5 +1,6 @@
 import re
 import torch
+import itertools
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
@@ -158,9 +159,10 @@ def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tens
 
 
 @torch.no_grad()
-def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntropyLoss):
+def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntropyLoss, max_batches: int | None = None):
+    batches = 0
     val_loss = 0.0
-    for batch in data_loader:
+    for batch in itertools.islice(data_loader, max_batches):
         # (N_BATCHES, SEQ_LEN)
         decoder_input: torch.Tensor = batch[0].to(DEVICE, non_blocking=True)
         label: torch.Tensor         = batch[1].to(DEVICE, non_blocking=True)
@@ -181,8 +183,9 @@ def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntrop
             ) 
 
         val_loss += loss.item()
+        batches += 1
 
-    return val_loss / len(data_loader) if len(data_loader) > 0 else 0.0
+    return val_loss / batches if batches > 0 else 0.0
 
 @_non_blocking()
 def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, config: TrainingConfig, training_state: TrainingState):

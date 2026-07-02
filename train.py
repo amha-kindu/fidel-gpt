@@ -76,8 +76,12 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     )
     raw_data_loader = train_dataset.get_loader(config.batch_size, sampler=train_sampler)
 
-    val_sampler = RandomSampler(val_dataset, replacement=True, num_samples=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps))
-    val_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
+    val_batches = int(config.vt_ratio * config.validate_every * config.grad_accum_steps)
+    if isinstance(val_dataset, PackedTextStreamDataset):
+        val_loader = val_dataset.get_loader(config.batch_size)
+    else:
+        val_sampler = RandomSampler(val_dataset, replacement=True, num_samples=config.batch_size * val_batches)
+        val_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
 
     last_step_time = time.monotonic()
     for epoch in range(initial_epoch, config.epochs):
@@ -172,9 +176,12 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     val_loss = validate(
                         model=base_model,
                         data_loader=val_loader,
-                        loss_func=loss_func
+                        loss_func=loss_func,
+                        max_batches=val_batches,
                     )
                     model.train()
+                    if isinstance(val_dataset, PackedTextStreamDataset):
+                        val_dataset.set_epoch(global_step // config.validate_every)
 
                     if validation_loss == 0:
                         validation_loss = val_loss
@@ -343,7 +350,10 @@ if __name__ == "__main__":
     if args.stream or os.path.getsize(training_config.validation_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
             LOGGER.info(f"File '{os.path.basename(training_config.validation_data)}' too large! streaming file...")
-        val_dataset = TextStreamDataset(training_config.validation_data, tokenizer, model_config.seq_len)
+        if training_config.pack_sequences:
+            val_dataset = PackedTextStreamDataset(training_config.validation_data, tokenizer, model_config.seq_len)
+        else:
+            val_dataset = TextStreamDataset(training_config.validation_data, tokenizer, model_config.seq_len)
     else:
         val_dataset = TextDataset(training_config.validation_data, tokenizer, model_config.seq_len)
     
