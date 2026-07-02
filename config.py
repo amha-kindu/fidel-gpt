@@ -137,7 +137,6 @@ class TrainingConfig(Config):
         self.beta2: float = kwargs.get("beta2", 0.999)
         self.epsilon: float = kwargs.get("epsilon", 1e-08)
         self.max_norm: float = kwargs.get("max_norm", 1.0)
-        self.ema_alpha: float = kwargs.get("ema_alpha", 0.9)
         self.label_smoothing: float = kwargs.get("label_smoothing", 0)
         self.es_min_delta: float = kwargs.get("es_min_delta", 0.01)
         self.es_patience: float = kwargs.get("es_patience", 10000)

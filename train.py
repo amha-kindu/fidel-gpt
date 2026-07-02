@@ -48,17 +48,16 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
     scheduler = get_lr_scheduler(optimizer, config, base_model.config.embed_dim)
     
-    accum_loss = 0
     global_step = 0
     initial_epoch = 0
     training_loss = 0
-    validation_loss = 0
+    val_loss = 0
     should_early_stop = False
     if training_state:
         global_step = training_state.global_step + 1
         initial_epoch = int(training_state.global_step / config.steps_per_epoch)
         training_loss = training_state.training_loss
-        validation_loss = training_state.validation_loss
+        val_loss = training_state.validation_loss
         early_stopping.best_loss = training_state.best_val_loss
         optimizer.load_state_dict(training_state.optimizer_state)
         scheduler.load_state_dict(training_state.lr_scheduler_state)
@@ -113,15 +112,15 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     label.view(-1)
                 )
             
-            accum_loss += batch_loss.detach().item() / config.grad_accum_steps
+            training_loss += batch_loss.detach().item() / config.grad_accum_steps
             update_weights = ((i + 1) % config.grad_accum_steps) == 0
             
-            scaled_loss = batch_loss / config.grad_accum_steps
+            avg_loss = batch_loss / config.grad_accum_steps
             # Skip gradient sync on accumulation steps; only sync on the last step.
             sync_ctx = model.no_sync() if is_distributed and not update_weights else contextlib.nullcontext()
             if MIXED_PRECISION_ENABLED:
                 with sync_ctx:
-                    scaler.scale(scaled_loss).backward()
+                    scaler.scale(avg_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
                     if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
@@ -140,7 +139,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     optimizer.zero_grad()
             else:
                 with sync_ctx:
-                    scaled_loss.backward()
+                    avg_loss.backward()
                 if update_weights:
                     if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
                         grad_snapshot, weight_snapshot = {}, {}
@@ -162,16 +161,13 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 last_step_time = now
                 if MIXED_PRECISION_ENABLED and GLOBAL_RANK == COORDINATOR_RANK:
                     tb_logger.log_scalar("Training/ScalerScale", scaler.get_scale(), global_step)
-                if training_loss == 0:
-                    training_loss = accum_loss
-                else:
-                    training_loss = config.ema_alpha * training_loss + (1 - config.ema_alpha) * accum_loss
-                accum_loss = 0.0
 
                 tb_logger.log_scalars("Loss/Curves", {"Train": training_loss}, global_step)
                 tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
-
+                
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
+                    if isinstance(val_dataset, PackedTextStreamDataset):
+                        val_dataset.set_epoch(global_step // config.validate_every)
                     model.eval()
                     val_loss = validate(
                         model=base_model,
@@ -180,15 +176,8 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                         max_batches=val_batches,
                     )
                     model.train()
-                    if isinstance(val_dataset, PackedTextStreamDataset):
-                        val_dataset.set_epoch(global_step // config.validate_every)
 
-                    if validation_loss == 0:
-                        validation_loss = val_loss
-                    else:
-                        validation_loss = config.ema_alpha * validation_loss + (1 - config.ema_alpha) * val_loss
-
-                    if early_stopping(validation_loss):
+                    if early_stopping(val_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
                         should_early_stop = True
 
@@ -201,13 +190,13 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     break
 
                 if global_step % config.validate_every == 0:
-                    tb_logger.log_scalars("Loss/Curves", {"Val": validation_loss}, global_step)
-                    tb_logger.log_scalar("Perplexity/Val", math.exp(min(validation_loss, 20)), global_step)
-                    tb_logger.log_scalar("Loss/Gap", validation_loss - training_loss, global_step)
+                    tb_logger.log_scalars("Loss/Curves", {"Val": val_loss}, global_step)
+                    tb_logger.log_scalar("Perplexity/Val", math.exp(min(val_loss, 20)), global_step)
+                    tb_logger.log_scalar("Loss/Gap", val_loss - training_loss, global_step)
 
                 data_loader.set_postfix({
                     "train_loss": f"{training_loss:6.3f}",
-                    "val_loss": f"{validation_loss:6.3f}"
+                    "val_loss": f"{val_loss:6.3f}"
                 })
                 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
@@ -224,20 +213,20 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                             epoch=epoch,
                             global_step=global_step,
                             training_loss=training_loss,
-                            validation_loss=validation_loss,
+                            validation_loss=val_loss,
                             best_val_loss=early_stopping.best_loss,
                             optimizer_state=optimizer.state_dict(),
                             lr_scheduler_state=scheduler.state_dict(),
                             scaler_state=scaler.state_dict() if scaler else None,
                         )
                     )
-
+                
+                training_loss = 0.0
                 global_step += 1
 
         # Discard gradients from any partial accumulation window at the epoch boundary.
         if len(data_loader) > 0 and (i + 1) % config.grad_accum_steps != 0:
             optimizer.zero_grad()
-        accum_loss = 0.0
 
         if should_early_stop:
             break
@@ -269,7 +258,6 @@ if __name__ == "__main__":
     parser.add_argument("--beta2", type=float, help="Adam optimizer beta2")
     parser.add_argument("--epsilon", type=float, help="Adam optimizer epsilon")
     parser.add_argument("--max-norm", type=float, help="Gradient clipping threshold")
-    parser.add_argument("--ema-alpha", type=float, help="Exponential moving average parameter")
     parser.add_argument("--label-smoothing", type=float, help="Label smoothing factor")
     parser.add_argument("--es-patience", type=int, help="Early stopping patience(number of steps)")
     parser.add_argument("--es-min-delta", type=float, help="Early stopping min delta")
