@@ -306,6 +306,8 @@ if __name__ == "__main__":
         LOGGER.info(f"Loading initial weights from '{args.init_weights}'...")
         checkpoint = torch.load(args.init_weights, map_location=DEVICE, weights_only=False)
         weights = checkpoint['weights']
+        model_config: ModelConfig = checkpoint['model_config']
+        model_config.update(dropout=args.dropout)
     elif args.resume:
         if not os.path.isfile(args.checkpoint):
             raise FileNotFoundError(f"File {args.checkpoint} does not exist")
