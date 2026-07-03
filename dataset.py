@@ -266,7 +266,7 @@ class PackedTextStreamDataset(TextStreamDataset, IterableDataset):
 
 
 class FineTuningDataset(NLPDataset):
-    def __init__(self, intent: str, file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int) -> None:
+    def __init__(self, intent: str, file_path: str, samples: list[dict], tokenizer: spm.SentencePieceProcessor, max_len: int) -> None:
         super().__init__(file_path, tokenizer, max_len)
         self.bot_token = self.tokenizer.PieceToId("[BOT]")
         self.user_token = self.tokenizer.PieceToId("[USER]")
@@ -276,38 +276,54 @@ class FineTuningDataset(NLPDataset):
         skips = 0
         self.samples = []
         file_name = os.path.basename(file_path)
-        with open(file_path, 'r', encoding='utf-8') as f:
-            LOGGER.info(f"\033[93mLoading data from {file_name}{'/' + intent if intent else ''}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-            for sample in ijson.items(f, 'item'):
-                if intent and sample['type'] != intent:
-                    continue
-                system_prompt = sample.get("system", "")
-                if system_prompt:
-                    system_prompt = self.preprocessor.execute(system_prompt)
-                conv = Conversation(sample['type'], system_prompt)
-                for exchange in sample["exchanges"]:
-                    try:
-                        conv.add_exchange(
-                            self.preprocessor.execute(exchange["input"]),
-                            self.preprocessor.execute(exchange["output"])
-                        )
-                    except Exception as e:
-                        LOGGER.error('File must be in JSON format [{"system": ..., "exchanges": [{"input": ..., "output": ...}, ...}]]')
-                        exit(1)
+        LOGGER.info(f"\033[93mTokenizing {len(samples)} samples from {file_name}{'/' + intent if intent else ''}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+        for sample in samples:
+            system_prompt = sample.get("system", "")
+            if system_prompt:
+                system_prompt = self.preprocessor.execute(system_prompt)
+            conv = Conversation(sample['type'], system_prompt)
+            for exchange in sample["exchanges"]:
                 try:
-                    io_tensors = self.get_io_tensors(conv)
-                except ValueError:
-                    skips += 1
-                    continue
-                self.samples.append(io_tensors)
-                self.tokens += int((io_tensors[0] != self.pad_token).sum())
+                    conv.add_exchange(
+                        self.preprocessor.execute(exchange["input"]),
+                        self.preprocessor.execute(exchange["output"])
+                    )
+                except Exception as e:
+                    LOGGER.error('File must be in JSON format [{"system": ..., "exchanges": [{"input": ..., "output": ...}, ...}]]')
+                    exit(1)
+            try:
+                io_tensors = self.get_io_tensors(conv)
+            except ValueError:
+                skips += 1
+                continue
+            self.samples.append(io_tensors)
+            self.tokens += int((io_tensors[0] != self.pad_token).sum())
 
-                if self.samples and len(self.samples) % 30000 == 0:
-                    LOGGER.info(f"\033[93mLoaded {len(self.samples)} samples from {file_name}{'/' + intent if intent else ''}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None    
+            if self.samples and len(self.samples) % 30000 == 0:
+                LOGGER.info(f"\033[93mLoaded {len(self.samples)} samples from {file_name}{'/' + intent if intent else ''}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
         LOGGER.info(f"\033[92mDone! Loaded {len(self.samples)} samples from {file_name}{'/' + intent if intent else ''}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
         LOGGER.info(f"\033[93mSkipped {skips} samples from {file_name}{'/' + intent if intent else ''}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
         LOGGER.info(f"\033[93mUsing {len(self.samples)} samples from {file_name}{'/' + intent if intent else ''}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-    
+
+    @classmethod
+    def load_many(cls, intents: list[str], file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int) -> dict[str, "FineTuningDataset"]:
+        """Single streaming pass over file_path, bucketing raw samples by `type`
+        before tokenizing - instead of every intent re-parsing the whole file
+        just to filter out the ~1/len(intents) share it cares about."""
+        buckets: dict[str, list[dict]] = {intent: [] for intent in intents}
+        file_name = os.path.basename(file_path)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            LOGGER.info(f"\033[93mScanning {file_name} for {len(intents)} intents...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+            for sample in ijson.items(f, 'item'):
+                bucket = buckets.get(sample['type'])
+                if bucket is not None:
+                    bucket.append(sample)
+
+        return {
+            intent: cls(intent, file_path, buckets[intent], tokenizer, max_len)
+            for intent in intents
+        }
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -480,7 +496,7 @@ class PackedFineTuningDataset(IterableDataset):
         # Independent RNG stream per (epoch, rank, worker): DataLoader workers are
         # forked from the parent's already-seeded global RNG, so sampling with the
         # module-level `random` here would give every worker identical draws.
-        rng = random.Random((self._epoch, GLOBAL_RANK, worker_id))
+        rng = random.Random(f"{self._epoch}-{GLOBAL_RANK}-{worker_id}")
         per_worker_len = math.ceil(self.samples_per_epoch / num_workers)
         task_ids = list(range(len(self.mt.datasets)))
 

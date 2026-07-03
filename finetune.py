@@ -159,6 +159,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                 last_step_time = now
                 if MIXED_PRECISION_ENABLED and GLOBAL_RANK == COORDINATOR_RANK:
                     tb_logger.log_scalar("Training/ScalerScale", scaler.get_scale(), global_step)
+                
+                tb_logger.log_scalars("Loss/Curves", {"Train": training_loss}, global_step)
                 tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
@@ -339,10 +341,7 @@ if __name__ == "__main__":
         "masakhanews", "masakhaner", "xlsum_summarization",
         "xlsum_reverse_summarization", "amharic_title_generation",
     ]
-    train_datasets = {
-        intent: FineTuningDataset(intent, training_config.training_data, tokenizer, model_config.seq_len)
-        for intent in intents
-    }
+    train_datasets = FineTuningDataset.load_many(intents, training_config.training_data, tokenizer, model_config.seq_len)
     finetune_dataset = MultiTaskDataset(
         datasets={k: v for k, v in train_datasets.items() if len(v) > 0},
         workers=training_config.dl_workers
@@ -358,10 +357,7 @@ if __name__ == "__main__":
         training_config.batches_per_epoch = int(samples / (training_config.batch_size * WORLD_SIZE))
     training_config.steps_per_epoch = int(training_config.batches_per_epoch / training_config.grad_accum_steps)
 
-    val_datasets = {
-        intent: FineTuningDataset(intent, training_config.validation_data, tokenizer, model_config.seq_len)
-        for intent in intents
-    }
+    val_datasets = FineTuningDataset.load_many(intents, training_config.validation_data, tokenizer, model_config.seq_len)
     val_dataset = MultiTaskDataset(
         datasets={k: v for k, v in val_datasets.items() if len(v) > 0},
         workers=training_config.dl_workers,

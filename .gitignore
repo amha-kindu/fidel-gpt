@@ -1,8 +1,9 @@
 .venv
 venv
 __pycache__
-logs
+logs*
 data
 weights
 models
 kernels
+checkpoints
