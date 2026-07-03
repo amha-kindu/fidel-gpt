@@ -202,8 +202,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Finetune a pretrained GPT model")
-    parser.add_argument("--training-data", required=True, type=str, help="Path to the training dataset")
-    parser.add_argument("--validation-data", required=True, type=str, help="Path to the validation dataset")
+    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset")
+    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset")
     parser.add_argument("--tokenizer", type=str, required=True, help="The path to the trained tokenizer model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--batch-size", type=int, help="Batch size")
@@ -242,7 +242,13 @@ if __name__ == "__main__":
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
-    
+
+    if not args.resume:
+        if not args.training_data:
+            parser.error("--training-data is required")
+        if not args.validation_data:
+            parser.error("--validation-data is required")
+
     init_sdp_backend(args.sdp_kernel)
     
     if args.lora:
@@ -288,7 +294,7 @@ if __name__ == "__main__":
         weights.update(checkpoint["weights"])
         
         training_config: TrainingConfig = checkpoint["training_config"]
-        training_config.update(skip=['checkpoint', 'training_data', 'validation_data'], **args.__dict__)
+        training_config.update(skip=['checkpoint'], **args.__dict__)
         
         model_config: ModelConfig | ModelWithLoRAConfig = checkpoint["model_config"]
         model_config.update(dropout=args.dropout, lora_dropout=args.lora_dropout)

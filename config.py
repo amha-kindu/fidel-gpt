@@ -141,7 +141,7 @@ class TrainingConfig(Config):
         self.es_min_delta: float = kwargs.get("es_min_delta", 0.01)
         self.es_patience: float = kwargs.get("es_patience", 10000)
         self.tb_log_dir: str = kwargs.get("tb_log_dir", "logs")
-        self.checkpoint: str = kwargs.get("checkpoint", "amharic-gpt.pt")
+        self.checkpoint: str = kwargs.get("checkpoint", None)
         self.max_checkpoints_to_keep: int = kwargs.get("max_checkpoints_to_keep", 5)
         self.warmup_steps: int = kwargs.get("warmup_steps", 1000)
         self.save_every: int = kwargs.get("save_every", 1000)
@@ -153,6 +153,7 @@ class TrainingConfig(Config):
         self.grad_scaler_init: float = kwargs.get("grad_scaler_init", 2 ** 14)
         self.vt_ratio: float = kwargs.get("vt_ratio", 1.0)
         self.pack_sequences: bool = kwargs.get("pack_sequences", True)
+        self.stream: bool = kwargs.get("stream", False)
         
         if self.training_data and not os.path.isfile(self.training_data):
             raise FileNotFoundError(f"File '{self.training_data}' does not exist")

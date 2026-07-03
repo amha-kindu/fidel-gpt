@@ -239,8 +239,8 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a GPT model")
     parser.add_argument("--is-distributed", action="store_true", help="Device to train the model on")
-    parser.add_argument("--training-data", required=True, type=str, help="Path to the training dataset")
-    parser.add_argument("--validation-data", required=True, type=str, help="Path to the validation dataset")
+    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset")
+    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset")
     parser.add_argument("--tokenizer", type=str, required=True, help="The path to the trained tokenizer model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--init-weights", type=str, help="Path to checkpoint with weights for initialization")
@@ -281,7 +281,13 @@ if __name__ == "__main__":
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
-    
+
+    if not args.resume:
+        if not args.training_data:
+            parser.error("--training-data is required")
+        if not args.validation_data:
+            parser.error("--validation-data is required")
+
     init_sdp_backend(args.sdp_kernel)
     
     if args.is_distributed:
@@ -319,7 +325,8 @@ if __name__ == "__main__":
         model_config.update(dropout=args.dropout)
         
         training_config: TrainingConfig = checkpoint["training_config"]
-        training_config.update(skip=['checkpoint', 'training_data', 'validation_data'], **args.__dict__)
+        training_config.update(skip=['checkpoint', 'stream'], **args.__dict__)
+        training_config.stream = training_config.stream or args.stream
         
         training_state = checkpoint["training_state"]
     
@@ -327,7 +334,7 @@ if __name__ == "__main__":
     tokenizer = spm.SentencePieceProcessor()
     tokenizer.LoadFromFile(args.tokenizer)
     
-    if args.stream or os.path.getsize(training_config.training_data) > 200 * 1024 * 1024:
+    if training_config.stream or os.path.getsize(training_config.training_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
             LOGGER.info(f"File '{os.path.basename(training_config.training_data)}' too large! streaming file...")
         if training_config.pack_sequences:
@@ -337,7 +344,7 @@ if __name__ == "__main__":
     else:
         train_dataset = TextDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
             
-    if args.stream or os.path.getsize(training_config.validation_data) > 200 * 1024 * 1024:
+    if training_config.stream or os.path.getsize(training_config.validation_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
             LOGGER.info(f"File '{os.path.basename(training_config.validation_data)}' too large! streaming file...")
         if training_config.pack_sequences:
