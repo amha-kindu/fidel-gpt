@@ -21,10 +21,11 @@ class GptInferenceEngine:
         self.tokenizer = tokenizer
         self.preprocessor = AmharicPreprocessor()
         self.max_len = self.model.config.seq_len
-        self.use_kv_cache = config.kv_cache_size > 0
+        # kv_cache_size <= 0 means "unset": default to the model's full context
+        # window rather than disabling the cache.
+        cache_size = config.kv_cache_size if config.kv_cache_size > 0 else self.max_len
         self.kv_caches = [
-            SlidingKVCache(config.kv_cache_size) for _ in range(self.model.config.n_blocks) \
-            if self.use_kv_cache
+            SlidingKVCache(cache_size) for _ in range(self.model.config.n_blocks)
         ]
         
         self.top_k = config.top_k
@@ -89,10 +90,9 @@ class GptInferenceEngine:
     @torch.no_grad()
     def complete(self, token_ids: list[int]) -> Iterator[int]:
         for cache in self.kv_caches:
-            cache.keys = None
-            cache.values = None
+            cache.reset()
         while token_ids and len(token_ids) < self.max_len:
-            cache_warm = self.use_kv_cache and self.kv_caches[0].keys is not None
+            cache_warm = self.kv_caches[0].keys is not None
             if cache_warm:
                 # Decode phase: only feed the last token; KV cache supplies the history.
                 # Use the token's absolute position so the PE is correct.
@@ -107,7 +107,7 @@ class GptInferenceEngine:
 
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (1, SEQ_LEN, VOCAB_SIZE)
-                logits: torch.Tensor = self.model(decoder_input, decoder_mask, self.use_kv_cache, self.kv_caches, position_offset)
+                logits: torch.Tensor = self.model(decoder_input, decoder_mask, True, self.kv_caches, position_offset)
 
             # (VOCAB_SIZE,)
             # Take logits for the last position and apply temperature scaling
@@ -167,7 +167,7 @@ if __name__ == '__main__':
     parser.add_argument("--freq-penalty", type=float, default=DEFAULT_INFERENCE_CONFIG.freq_penalty, help="Frequency penalty strength")
     parser.add_argument("--no-repeat-ngram-size", type=int, default=DEFAULT_INFERENCE_CONFIG.no_repeat_ngram_size, help="No repeat n-gram size")
     parser.add_argument("--rep-window", type=int, default=DEFAULT_INFERENCE_CONFIG.rep_window, help="Repeat window size")
-    parser.add_argument("--kv-cache-size", type=int, default=DEFAULT_INFERENCE_CONFIG.kv_cache_size, help="KV cache size")
+    parser.add_argument("--kv-cache-size", type=int, default=DEFAULT_INFERENCE_CONFIG.kv_cache_size, help="KV cache size (sliding window). 0 or unset defaults to the model's full context window")
     parser.add_argument("--checkpoint", type=str, required=True, help="File path to load saved checkpoint")
     parser.add_argument("--tokenizer", type=str, required=True, help="File path to load SentencePiece tokenizer")
 

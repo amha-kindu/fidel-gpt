@@ -79,7 +79,7 @@ if __name__ == '__main__':
     parser.add_argument("--freq-penalty", type=float, help="Frequency penalty strength")
     parser.add_argument("--no-repeat-ngram-size", type=int, help="No repeat n-gram size")
     parser.add_argument("--rep-window", type=int, help="Repeat window size")
-    parser.add_argument("--kv-cache-size", type=int, help="KV cache size")
+    parser.add_argument("--kv-cache-size", type=int, help="KV cache size (sliding window). 0 or unset defaults to the model's full context window")
     parser.add_argument("--lora-checkpoint", default="", type=str, help="Path to LoRA adapters")
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuned checkpoint")
     parser.add_argument("--checkpoint", type=str, required=True, help="File path to load saved checkpoint")

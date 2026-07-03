@@ -9,7 +9,7 @@
     },
     "decoders": {
         "type": "ModuleList",
-        "indices": [3, 4, 5],
+        "indices": [9, 10, 11],
         "submodules": [
             "norm1",
             "norm2",

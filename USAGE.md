@@ -263,6 +263,7 @@ python finetune.py \
 | `--trainable-params` | — | Path to a JSON file specifying which layers to train (all others are frozen). |
 | `--resume` | `False` | Resume finetuning from `--lora-checkpoint` or `--finetuned-checkpoint`. |
 | `--dl-workers` | `0` | Dataloader subprocess count. |
+| `--pack-sequences` / `--no-pack-sequences` | `True` | Pack multiple conversations per row behind a block-diagonal causal mask, instead of padding each conversation out to `--seq-len` individually. Eliminates padding waste and increases real tokens seen per step. |
 
 #### LoRA
 
@@ -458,7 +459,7 @@ python inference.py \
 | `--freq-penalty` | `0.3` | Penalty scaled by token count (OpenAI-style) |
 | `--no-repeat-ngram-size` | `3` | Ban any n-gram that has already appeared |
 | `--rep-window` | `200` | Token history window for repetition penalties |
-| `--kv-cache-size` | `0` | Enable sliding KV cache with this size. `0` disables. |
+| `--kv-cache-size` | `0` | Sliding KV cache window size. `0` (default) uses the model's full context window (`max_len`); a smaller positive value trades long-range context for a smaller cache. |
 
 **Example**
 ```

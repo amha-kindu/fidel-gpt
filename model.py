@@ -66,12 +66,13 @@ class MultiHeadAttentionBlock(nn.Module):
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
-    # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
+    # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -92,21 +93,15 @@ class MultiHeadAttentionBlock(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
-        
-        # During decode (single new token against full KV cache), Q is shorter than K.
-        # The cache already enforces causal ordering, so no mask is needed.
-        in_decode_phase = query.size(2) < key.size(2)
 
-        attn_bias = None
-        if mask is not None and not in_decode_phase:
-            attn_bias = torch.zeros_like(mask, dtype=query.dtype)
-            attn_bias.masked_fill_(mask.logical_not(), -1e4)
-
+        # attn_mask/is_causal are resolved once per forward pass by GPTmodel._decode
+        # (identical for every block), instead of rebuilding a float bias here on
+        # every one of the n_blocks calls. SDPA accepts a boolean attn_mask directly.
         output = F.scaled_dot_product_attention(
             query, key, value,
-            attn_mask=attn_bias,
+            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=(mask is None) and not in_decode_phase,
+            is_causal=is_causal,
         )
 
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
@@ -145,21 +140,22 @@ class DecoderBlock(nn.Module):
         self.feed_forward = FeedForwardBlock(config)
         self.masked_multihead_attention = MultiHeadAttentionBlock(config)
 
-    # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
+    # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, mask, use_cache, kv_cache)
+            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), mask, use_cache, kv_cache)
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -211,9 +207,15 @@ class GPTmodel(nn.Module):
         use_cache: bool = False,
         kv_caches: list[SlidingKVCache] | None = None,
     ) -> torch.Tensor:
+        # During decode (single new token against full KV cache), Q is shorter than K.
+        # The cache already enforces causal ordering, so no mask is needed.
+        in_decode_phase = use_cache and kv_caches is not None and kv_caches[0].get() is not None
+        attn_mask = mask if (mask is not None and not in_decode_phase) else None
+        is_causal = (mask is None) and not in_decode_phase
+
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv = decoder(x, mask, use_cache, kv_cache)
+            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x

@@ -14,7 +14,7 @@ from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
-from dataset import MultiTaskDataset, TemperatureSampler, FineTuningDataset
+from dataset import MultiTaskDataset, TemperatureSampler, FineTuningDataset, PackedFineTuningDataset
 from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params, validate
 
 
@@ -56,22 +56,44 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
 
     loss_func = nn.CrossEntropyLoss(ignore_index=finetune_dataset.ignore_index, label_smoothing=config.label_smoothing).to(DEVICE)
         
-    train_sampler = TemperatureSampler(
-        finetune_dataset,
-        alpha=config.sampler_alpha,
-        iter_size=config.batch_size * config.batches_per_epoch,
-    )
-    raw_data_loader = finetune_dataset.get_loader(config.batch_size, sampler=train_sampler)
+    packed_train_dataset = packed_val_dataset = None
+    if config.pack_sequences:
+        packed_train_dataset = PackedFineTuningDataset(
+            finetune_dataset,
+            max_len=model.config.seq_len,
+            alpha=config.sampler_alpha,
+            samples_per_epoch=config.batch_size * config.batches_per_epoch,
+            workers=config.dl_workers,
+        )
+        raw_data_loader = packed_train_dataset.get_loader(config.batch_size)
 
-    val_sampler = TemperatureSampler(
-        val_dataset,
-        alpha=config.sampler_alpha,
-        iter_size=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
-    )
-    val_data_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
+        packed_val_dataset = PackedFineTuningDataset(
+            val_dataset,
+            max_len=model.config.seq_len,
+            alpha=config.sampler_alpha,
+            samples_per_epoch=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
+            workers=config.dl_workers,
+        )
+        val_data_loader = packed_val_dataset.get_loader(config.batch_size)
+    else:
+        train_sampler = TemperatureSampler(
+            finetune_dataset,
+            alpha=config.sampler_alpha,
+            iter_size=config.batch_size * config.batches_per_epoch,
+        )
+        raw_data_loader = finetune_dataset.get_loader(config.batch_size, sampler=train_sampler)
+
+        val_sampler = TemperatureSampler(
+            val_dataset,
+            alpha=config.sampler_alpha,
+            iter_size=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
+        )
+        val_data_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
     
     last_step_time = time.monotonic()
     for epoch in range(initial_epoch, config.epochs):
+        if packed_train_dataset is not None:
+            packed_train_dataset.set_epoch(epoch)
         data_loader = tqdm(raw_data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
         for i, batch in enumerate(data_loader):
             # (N_BATCHES, SEQ_LEN)
@@ -140,6 +162,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                 tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
+                    if packed_val_dataset is not None:
+                        packed_val_dataset.set_epoch(global_step // config.validate_every)
                     model.eval()
                     val_loss = validate(
                         model=model,
@@ -240,6 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora-checkpoint", default="", type=str, help="Path to LoRA adapters")
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuning checkpoint")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
+    parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple conversations per sequence to eliminate padding waste (default: enabled)")
 
     args = parser.parse_args()
 
@@ -324,7 +349,13 @@ if __name__ == "__main__":
     )
     samples = len(finetune_dataset)
 
-    training_config.batches_per_epoch = int(samples / (training_config.batch_size * WORLD_SIZE))
+    if training_config.pack_sequences:
+        # Packed rows are measured in real tokens, not raw conversation count, since
+        # each row now holds several conversations back-to-back instead of one
+        # padded out to seq_len.
+        training_config.batches_per_epoch = int(finetune_dataset.tokens / model_config.seq_len / (training_config.batch_size * WORLD_SIZE))
+    else:
+        training_config.batches_per_epoch = int(samples / (training_config.batch_size * WORLD_SIZE))
     training_config.steps_per_epoch = int(training_config.batches_per_epoch / training_config.grad_accum_steps)
 
     val_datasets = {
