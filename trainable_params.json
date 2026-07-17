@@ -7,6 +7,10 @@
         "type": "Module",
         "submodules": []
     },
+    "norm_f": {
+        "type": "Module",
+        "submodules": []
+    },
     "decoders": {
         "type": "ModuleList",
         "indices": [9, 10, 11],

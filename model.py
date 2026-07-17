@@ -247,6 +247,13 @@ class GPTmodel(nn.Module):
         base_weights = {k: v for k, v in weights.items() if k not in lora_weights}
 
         if weights:
+            if config.tie_weights and "embedding.embedding.weight" in base_weights:
+                # Finetuned checkpoints saved via named_parameters() deduplicate tied
+                # params and drop projection.linear.weight, so a merged weights dict can
+                # hold a stale projection value. load_state_dict copies projection after
+                # embedding into the one shared tensor, letting the stale value clobber
+                # the finetuned embedding — keep the two keys in sync before loading.
+                base_weights["projection.linear.weight"] = base_weights["embedding.embedding.weight"]
             model.load_state_dict(base_weights, strict=True)
         else:
             def init_weights(m):

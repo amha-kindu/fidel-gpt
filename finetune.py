@@ -195,7 +195,9 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
                     # Snapshot trainable weights to CPU synchronously so the async
                     # thread-pool write cannot race with optimizer.step() next batch.
-                    weights_snapshot = {k: v.detach().cpu() for k, v in model.named_parameters() if v.requires_grad}
+                    # remove_duplicate=False keeps both names of tied params (embedding/
+                    # projection) so the checkpoint stays complete on its own.
+                    weights_snapshot = {k: v.detach().cpu() for k, v in model.named_parameters(remove_duplicate=False) if v.requires_grad}
                     save_checkpoint(
                         weights=weights_snapshot,
                         model_config=model.config,
