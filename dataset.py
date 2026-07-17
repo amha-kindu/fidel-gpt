@@ -8,7 +8,7 @@ import random
 import threading
 import numpy as np
 import sentencepiece as spm
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from torch.utils.data import Dataset, DataLoader, Sampler, IterableDataset
 
 _tls = threading.local()  # per-thread file handle cache: _tls.handles = {path: file}
@@ -26,6 +26,8 @@ class NLPDataset(Dataset):
         self.workers = workers
         self.max_len = max_len
         self.file_path = file_path
+        # file_path may be a comma-separated list of files; all subclasses read from file_paths
+        self.file_paths = [p.strip() for p in file_path.split(',') if p.strip()]
         self.tokenizer = tokenizer
         self.preprocessor = AmharicPreprocessor()
 
@@ -77,18 +79,19 @@ class TextDataset(NLPDataset):
     def __init__(self, file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int, workers: int = 0) -> None:
         super().__init__(file_path, tokenizer, max_len, workers)
 
-        file_name = os.path.basename(file_path)
         self.samples: list[tuple[torch.Tensor, torch.Tensor]] = []
-        assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
-        with open(file_path, 'r', encoding='utf-8') as f:
-            LOGGER.info(f"\033[93mLoading data from {file_name}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-            for line in f:
-                text = json.loads(line.strip())
-                if text and self.preprocessor.execute(text):
-                    self.samples.append(self.get_io_tensors(text))
-                    if self.samples and len(self.samples) % 100000 == 0:
-                        LOGGER.info(f"\033[93mLoaded {len(self.samples)} samples from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-        LOGGER.info(f"\033[92mDone! Loaded {len(self.samples)} samples from {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+        for path in self.file_paths:
+            file_name = os.path.basename(path)
+            assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
+            with open(path, 'r', encoding='utf-8') as f:
+                LOGGER.info(f"\033[93mLoading data from {file_name}...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+                for line in f:
+                    text = json.loads(line.strip())
+                    if text and self.preprocessor.execute(text):
+                        self.samples.append(self.get_io_tensors(text))
+                        if self.samples and len(self.samples) % 100000 == 0:
+                            LOGGER.info(f"\033[93mLoaded {len(self.samples)} samples\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+            LOGGER.info(f"\033[92mDone! Loaded {len(self.samples)} total samples through {file_name}\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -106,6 +109,34 @@ class TextStreamDataset(NLPDataset):
     def __init__(self, file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int, workers: int = 0):
         super().__init__(file_path, tokenizer, max_len, workers)
         
+        # Coordinator builds/refreshes every file's index before any rank maps them.
+        if GLOBAL_RANK == COORDINATOR_RANK:
+            for path in self.file_paths:
+                self._build_index(path)
+
+        # Coordinator must finish writing the indexes before any rank mmaps them.
+        if WORLD_SIZE > 1:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
+
+        # Read-only memmaps of uint64 sample offsets, one per file, addressed
+        # through cumulative lengths so a global index spans all files.
+        total = 0
+        self.offset_maps: list[np.memmap] = []
+        self.cum_lengths: list[int] = []
+        for path in self.file_paths:
+            with open(path + '.meta.json', 'r') as f:
+                self.tokens += json.load(f)['tokens']
+            offsets = np.memmap(path + '.index', dtype=np.uint64, mode='r')
+            self.offset_maps.append(offsets)
+            total += len(offsets)
+            self.cum_lengths.append(total)
+        if GLOBAL_RANK == COORDINATOR_RANK:
+            mib = sum(m.nbytes for m in self.offset_maps) / (1024 ** 2)
+            LOGGER.info(f"\033[92mEstablished read-only memory mapping with {len(self.file_paths)} index file(s) ({mib:.2f} MiB) for {total} offsets\033[0m")
+
+    def _build_index(self, file_path: str) -> None:
         meta_data = {}
         index_path = file_path + '.index'
         meta_path = file_path + '.meta.json'
@@ -113,59 +144,49 @@ class TextStreamDataset(NLPDataset):
         if os.path.exists(meta_path):
             with open(meta_path, 'r') as f:
                 meta_data = json.load(f)
-            self.tokens = meta_data['tokens']
-        
-        if GLOBAL_RANK == COORDINATOR_RANK:
-            if meta_data.get('mtime', None) != os.path.getmtime(file_path) or not os.path.exists(index_path):
-                assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
-                with open(file_path, 'rb', buffering=1024 * 1024) as fin, open(index_path, 'wb') as fout:
-                    LOGGER.info(f"\033[93mRegistering offsets from {file_name}...\033[0m")
-                    count = 0
-                    while True:
-                        pos = fin.tell()
-                        line = fin.readline()
-                        if not line:    break
 
-                        preprocessed_line = self.preprocessor.execute(json.loads(line.strip()))
-                        self.tokens += len(self.tokenizer.Encode(preprocessed_line, out_type=int))
+        if meta_data.get('mtime', None) == os.path.getmtime(file_path) and os.path.exists(index_path):
+            LOGGER.info(f"\033[93mUsing existing index for {file_name}\033[0m")
+            return
 
-                        fout.write(struct.pack('<Q', pos))
-                        count += 1
-                        if count % 1_000_000 == 0:
-                            LOGGER.info(f"\033[93mRegistered {count} offsets from {file_name}\033[0m")
+        assert '.jsonl' in file_name, f"Only JSONL files are supported for raw text datasets!"
+        with open(file_path, 'rb', buffering=1024 * 1024) as fin, open(index_path, 'wb') as fout:
+            LOGGER.info(f"\033[93mRegistering offsets from {file_name}...\033[0m")
+            count = 0
+            tokens = 0
+            while True:
+                pos = fin.tell()
+                line = fin.readline()
+                if not line:    break
 
-                    with open(meta_path, 'w') as f:
-                        json.dump({ "mtime": os.path.getmtime(file_path), "tokens": self.tokens, "samples": count }, f, indent=2)
+                preprocessed_line = self.preprocessor.execute(json.loads(line.strip()))
+                tokens += len(self.tokenizer.Encode(preprocessed_line, out_type=int))
 
-                LOGGER.info(f"\033[92mDone! Registered {count} offsets from {file_name}\033[0m")
-            else:
-                LOGGER.info(f"\033[93mUsing existing index for {file_name}\033[0m")
+                fout.write(struct.pack('<Q', pos))
+                count += 1
+                if count % 1_000_000 == 0:
+                    LOGGER.info(f"\033[93mRegistered {count} offsets from {file_name}\033[0m")
 
-        # Coordinator must finish writing the index before any rank mmaps it.
-        if WORLD_SIZE > 1:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                dist.barrier()
+            with open(meta_path, 'w') as f:
+                json.dump({ "mtime": os.path.getmtime(file_path), "tokens": tokens, "samples": count }, f, indent=2)
 
-        # Read-only memmap of uint64 offsets of each sample
-        self.offsets = np.memmap(index_path, dtype=np.uint64, mode='r')
-        if GLOBAL_RANK == COORDINATOR_RANK:
-            index_file = os.path.basename(index_path)
-            mib = self.offsets.nbytes / (1024 ** 2)
-            LOGGER.info(f"\033[92mEstablished read-only memory mapping with {index_file} ({mib:.2f} MiB) for {len(self.offsets)} offsets\033[0m")
-    
+        LOGGER.info(f"\033[92mDone! Registered {count} offsets from {file_name}\033[0m")
+
     def __len__(self) -> int:
-        return len(self.offsets)
-        
+        return self.cum_lengths[-1] if self.cum_lengths else 0
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        offset = int(self.offsets[index])
-        # One open handle per (thread, path) so interleaving train/val datasets doesn't thrash.
+        file_idx = bisect_right(self.cum_lengths, index)
+        local_index = index - (self.cum_lengths[file_idx - 1] if file_idx > 0 else 0)
+        file_path = self.file_paths[file_idx]
+        offset = int(self.offset_maps[file_idx][local_index])
+        # One open handle per (thread, path) so interleaving files/datasets doesn't thrash.
         if not hasattr(_tls, 'handles'):
             _tls.handles = {}
-        f = _tls.handles.get(self.file_path)
+        f = _tls.handles.get(file_path)
         if f is None:
-            f = open(self.file_path, 'rb')
-            _tls.handles[self.file_path] = f
+            f = open(file_path, 'rb')
+            _tls.handles[file_path] = f
         f.seek(offset)
         line = f.readline()
 
@@ -196,7 +217,7 @@ class PackedTextStreamDataset(TextStreamDataset, IterableDataset):
         # from the same epoch seed so the global shuffle is consistent, then
         # each party takes a non-overlapping shard.
         rng = random.Random(self._epoch)
-        indices = list(range(len(self.offsets)))
+        indices = list(range(TextStreamDataset.__len__(self)))
         rng.shuffle(indices)
 
         # DDP shard: each rank gets 1/WORLD_SIZE of the shuffled indices.
@@ -307,20 +328,24 @@ class FineTuningDataset(NLPDataset):
 
     @classmethod
     def load_many(cls, intents: list[str], file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int) -> dict[str, "FineTuningDataset"]:
-        """Single streaming pass over file_path, bucketing raw samples by `type`
-        before tokenizing - instead of every intent re-parsing the whole file
-        just to filter out the ~1/len(intents) share it cares about."""
+        """Single streaming pass over each file in file_path (comma-separated),
+        bucketing raw samples by `type` before tokenizing - instead of every
+        intent re-parsing the whole file just to filter out the
+        ~1/len(intents) share it cares about."""
         buckets: dict[str, list[dict]] = {intent: [] for intent in intents}
-        file_name = os.path.basename(file_path)
-        with open(file_path, 'r', encoding='utf-8') as f:
-            LOGGER.info(f"\033[93mScanning {file_name} for {len(intents)} intents...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
-            for sample in ijson.items(f, 'item'):
-                bucket = buckets.get(sample['type'])
-                if bucket is not None:
-                    bucket.append(sample)
+        paths = [p.strip() for p in file_path.split(',') if p.strip()]
+        for path in paths:
+            file_name = os.path.basename(path)
+            with open(path, 'r', encoding='utf-8') as f:
+                LOGGER.info(f"\033[93mScanning {file_name} for {len(intents)} intents...\033[0m") if GLOBAL_RANK == COORDINATOR_RANK else None
+                for sample in ijson.items(f, 'item'):
+                    bucket = buckets.get(sample['type'])
+                    if bucket is not None:
+                        bucket.append(sample)
 
+        label = "+".join(os.path.basename(p) for p in paths)
         return {
-            intent: cls(intent, file_path, buckets[intent], tokenizer, max_len)
+            intent: cls(intent, label, buckets[intent], tokenizer, max_len)
             for intent in intents
         }
 

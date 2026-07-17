@@ -155,11 +155,11 @@ class TrainingConfig(Config):
         self.pack_sequences: bool = kwargs.get("pack_sequences", True)
         self.stream: bool = kwargs.get("stream", False)
         
-        if self.training_data and not os.path.isfile(self.training_data):
-            raise FileNotFoundError(f"File '{self.training_data}' does not exist")
-        
-        if self.validation_data and not os.path.isfile(self.validation_data):
-            raise FileNotFoundError(f"File '{self.validation_data}' does not exist")
+        # training_data/validation_data may be comma-separated lists of files
+        for data in (self.training_data, self.validation_data):
+            for path in (data.split(',') if data else []):
+                if path.strip() and not os.path.isfile(path.strip()):
+                    raise FileNotFoundError(f"File '{path.strip()}' does not exist")
         
 class TrainingState:
     def __init__(self, epoch: int, global_step: int, training_loss: float, validation_loss: float, best_val_loss: float, optimizer_state: dict, lr_scheduler_state: dict, scaler_state: dict | None = None):

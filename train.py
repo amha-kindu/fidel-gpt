@@ -23,6 +23,14 @@ from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStream
 from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint, validate
 
 
+def data_size(paths: str) -> int:
+    return sum(os.path.getsize(p.strip()) for p in paths.split(',') if p.strip())
+
+
+def data_names(paths: str) -> str:
+    return ", ".join(os.path.basename(p.strip()) for p in paths.split(',') if p.strip())
+
+
 def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, val_dataset: NLPDataset, is_distributed: bool = False, training_state: TrainingState | None = None) -> None:
     tb_logger = TensorboardLogger(config.tb_log_dir)
     
@@ -239,8 +247,8 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a GPT model")
     parser.add_argument("--is-distributed", action="store_true", help="Device to train the model on")
-    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset")
-    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset")
+    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset (comma-separated for multiple files)")
+    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset (comma-separated for multiple files)")
     parser.add_argument("--tokenizer", type=str, required=True, help="The path to the trained tokenizer model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--init-weights", type=str, help="Path to checkpoint with weights for initialization")
@@ -334,9 +342,9 @@ if __name__ == "__main__":
     tokenizer = spm.SentencePieceProcessor()
     tokenizer.LoadFromFile(args.tokenizer)
     
-    if training_config.stream or os.path.getsize(training_config.training_data) > 200 * 1024 * 1024:
+    if training_config.stream or data_size(training_config.training_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
-            LOGGER.info(f"File '{os.path.basename(training_config.training_data)}' too large! streaming file...")
+            LOGGER.info(f"File(s) '{data_names(training_config.training_data)}' too large! streaming...")
         if training_config.pack_sequences:
             train_dataset = PackedTextStreamDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
         else:
@@ -344,9 +352,9 @@ if __name__ == "__main__":
     else:
         train_dataset = TextDataset(training_config.training_data, tokenizer, model_config.seq_len, training_config.dl_workers)
             
-    if training_config.stream or os.path.getsize(training_config.validation_data) > 200 * 1024 * 1024:
+    if training_config.stream or data_size(training_config.validation_data) > 200 * 1024 * 1024:
         if GLOBAL_RANK == COORDINATOR_RANK:
-            LOGGER.info(f"File '{os.path.basename(training_config.validation_data)}' too large! streaming file...")
+            LOGGER.info(f"File(s) '{data_names(training_config.validation_data)}' too large! streaming...")
         if training_config.pack_sequences:
             val_dataset = PackedTextStreamDataset(training_config.validation_data, tokenizer, model_config.seq_len)
         else:

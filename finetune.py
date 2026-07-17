@@ -230,8 +230,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Finetune a pretrained GPT model")
-    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset")
-    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset")
+    parser.add_argument("--training-data", required=False, type=str, help="Path to the training dataset (comma-separated for multiple files)")
+    parser.add_argument("--validation-data", required=False, type=str, help="Path to the validation dataset (comma-separated for multiple files)")
     parser.add_argument("--tokenizer", type=str, required=True, help="The path to the trained tokenizer model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--batch-size", type=int, help="Batch size")
