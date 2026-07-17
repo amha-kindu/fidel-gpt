@@ -46,16 +46,15 @@ class ChatBot(GptInferenceEngine):
         ]
         for exchange in reversed(self.conv.exchanges):
             # Discard tokens of the earlier exchanges if input_ids gets too long(exceeds max_len)
-            if len(input_ids) + len(exchanges) + len(exchange["input"]) + len(exchange["output"]) + 3 > self.max_len:
+            if len(input_ids) + len(exchanges) + len(exchange["input"]) + len(exchange["output"]) + 2 > self.max_len:
                 break
-            
+
             if exchange["input"] and exchange["output"]:
                 exchanges = [
                     self.user_token,
                     *exchange["input"],
                     self.bot_token,
-                    *exchange["output"],
-                    self.stop_token
+                    *exchange["output"]
                 ] + exchanges
                 
         input_ids.extend(exchanges)
