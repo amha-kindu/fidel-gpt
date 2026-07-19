@@ -14,7 +14,8 @@ from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
-from dataset import MultiTaskDataset, TemperatureSampler, FineTuningDataset, PackedFineTuningDataset
+from torch.utils.data import RandomSampler
+from dataset import FineTuningDataset, MultiTaskDataset, PackedFineTuningDataset
 from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params, validate
 
 
@@ -55,45 +56,31 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
             scaler.load_state_dict(training_state.scaler_state)
 
     loss_func = nn.CrossEntropyLoss(ignore_index=finetune_dataset.ignore_index, label_smoothing=config.label_smoothing).to(DEVICE)
-        
-    packed_train_dataset = packed_val_dataset = None
-    if config.pack_sequences:
-        packed_train_dataset = PackedFineTuningDataset(
-            finetune_dataset,
-            max_len=model.config.seq_len,
-            alpha=config.sampler_alpha,
-            samples_per_epoch=config.batch_size * config.batches_per_epoch,
-            workers=config.dl_workers,
-        )
-        raw_data_loader = packed_train_dataset.get_loader(config.batch_size)
 
-        packed_val_dataset = PackedFineTuningDataset(
-            val_dataset,
-            max_len=model.config.seq_len,
-            alpha=config.sampler_alpha,
-            samples_per_epoch=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
-            workers=config.dl_workers,
-        )
-        val_data_loader = packed_val_dataset.get_loader(config.batch_size)
-    else:
-        train_sampler = TemperatureSampler(
-            finetune_dataset,
-            alpha=config.sampler_alpha,
-            iter_size=config.batch_size * config.batches_per_epoch,
-        )
-        raw_data_loader = finetune_dataset.get_loader(config.batch_size, sampler=train_sampler)
+    raw_data_loader = finetune_dataset.get_loader(config.batch_size)
 
-        val_sampler = TemperatureSampler(
-            val_dataset,
-            alpha=config.sampler_alpha,
-            iter_size=config.batch_size * int(config.vt_ratio * config.validate_every * config.grad_accum_steps),
-        )
-        val_data_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
-    
+    val_batches = int(config.vt_ratio * config.validate_every * config.grad_accum_steps)
+    intent_val_batches = max(2, val_batches // len(val_dataset.task_names))
+    # Per-intent validation: each member gets its own loader so a small,
+    # heavily-oversampled bucket can't hide inside an aggregate loss.
+    intent_val_loaders = {}
+    for intent, ds in val_dataset.items():
+        if isinstance(ds, PackedFineTuningDataset):
+            ds.samples_per_epoch = config.batch_size * intent_val_batches
+            intent_val_loaders[intent] = (ds, ds.get_loader(config.batch_size))
+        else:
+            sampler = RandomSampler(ds, replacement=True, num_samples=config.batch_size * intent_val_batches)
+            intent_val_loaders[intent] = (None, ds.get_loader(config.batch_size, sampler=sampler))
+
+    # Main val loss follows the train sampling mix so it stays comparable to
+    # the training loss curve; intents absent from training get zero weight.
+    train_probs = dict(zip(finetune_dataset.task_names, finetune_dataset.task_probs(config.sampler_alpha)))
+    total_weight = sum(train_probs.get(intent, 0.0) for intent in val_dataset.task_names) or 1.0
+    val_weights = {intent: train_probs.get(intent, 0.0) / total_weight for intent in val_dataset.task_names}
+
     last_step_time = time.monotonic()
     for epoch in range(initial_epoch, config.epochs):
-        if packed_train_dataset is not None:
-            packed_train_dataset.set_epoch(epoch)
+        finetune_dataset.set_epoch(epoch)
         data_loader = tqdm(raw_data_loader, desc=f"\033[95m{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}\033[0m - \033[94mINFO\033[0m - \033[96m{LOGGER.name}\033[0m - \033[93mEpoch {epoch+1}/{config.epochs}", disable = GLOBAL_RANK != COORDINATOR_RANK, total=config.batches_per_epoch)
         for i, batch in enumerate(data_loader):
             # (N_BATCHES, SEQ_LEN)
@@ -164,15 +151,18 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
                 tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
 
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
-                    if packed_val_dataset is not None:
-                        packed_val_dataset.set_epoch(global_step // config.validate_every)
                     model.eval()
-                    val_loss = validate(
-                        model=model,
-                        data_loader=val_data_loader,
-                        loss_func=loss_func
-                    )
+                    intent_losses = {}
+                    for intent, (packed_ds, intent_loader) in intent_val_loaders.items():
+                        if packed_ds is not None:
+                            # fresh draws each validation, like the train-side epoch reshuffle
+                            packed_ds.set_epoch(global_step // config.validate_every)
+                        intent_losses[intent] = validate(model, intent_loader, loss_func)
                     model.train()
+
+                    val_loss = sum(val_weights[intent] * loss for intent, loss in intent_losses.items())
+                    for intent, loss in intent_losses.items():
+                        tb_logger.log_scalars("Loss/Tasks/Val", {f"{intent}": loss }, global_step)
 
                     if early_stopping(val_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
@@ -343,27 +333,31 @@ if __name__ == "__main__":
         "masakhanews", "masakhaner", "xlsum_summarization",
         "xlsum_reverse_summarization", "amharic_title_generation",
     ]
-    train_datasets = FineTuningDataset.load_many(intents, training_config.training_data, tokenizer, model_config.seq_len)
-    finetune_dataset = MultiTaskDataset(
-        datasets={k: v for k, v in train_datasets.items() if len(v) > 0},
-        workers=training_config.dl_workers
-    )
-    samples = len(finetune_dataset)
+    train_datasets = {k: v for k, v in FineTuningDataset.load_many(intents, training_config.training_data, tokenizer, model_config.seq_len).items() if len(v) > 0}
+    samples = sum(len(ds) for ds in train_datasets.values())
+    tokens = sum(ds.tokens for ds in train_datasets.values())
 
     if training_config.pack_sequences:
         # Packed rows are measured in real tokens, not raw conversation count, since
-        # each row now holds several conversations back-to-back instead of one
-        # padded out to seq_len.
-        training_config.batches_per_epoch = int(finetune_dataset.tokens / model_config.seq_len / (training_config.batch_size * WORLD_SIZE))
+        # each row holds several conversations back-to-back instead of one padded
+        # out to seq_len.
+        training_config.batches_per_epoch = int(tokens / model_config.seq_len / (training_config.batch_size * WORLD_SIZE))
+        train_datasets = {k: PackedFineTuningDataset(v, model_config.seq_len) for k, v in train_datasets.items()}
     else:
         training_config.batches_per_epoch = int(samples / (training_config.batch_size * WORLD_SIZE))
     training_config.steps_per_epoch = int(training_config.batches_per_epoch / training_config.grad_accum_steps)
 
-    val_datasets = FineTuningDataset.load_many(intents, training_config.validation_data, tokenizer, model_config.seq_len)
-    val_dataset = MultiTaskDataset(
-        datasets={k: v for k, v in val_datasets.items() if len(v) > 0},
+    finetune_dataset = MultiTaskDataset(
+        train_datasets,
+        alpha=training_config.sampler_alpha,
+        samples_per_epoch=training_config.batch_size * training_config.batches_per_epoch,
         workers=training_config.dl_workers,
     )
+
+    val_datasets = {k: v for k, v in FineTuningDataset.load_many(intents, training_config.validation_data, tokenizer, model_config.seq_len).items() if len(v) > 0}
+    if training_config.pack_sequences:
+        val_datasets = {k: PackedFineTuningDataset(v, model_config.seq_len) for k, v in val_datasets.items()}
+    val_dataset = MultiTaskDataset(val_datasets)
     
     model = GPTmodel.build(model_config, weights).to(DEVICE)
     

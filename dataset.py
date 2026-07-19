@@ -8,7 +8,7 @@ import random
 import threading
 import numpy as np
 import sentencepiece as spm
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from torch.utils.data import Dataset, DataLoader, Sampler, IterableDataset
 
 _tls = threading.local()  # per-thread file handle cache: _tls.handles = {path: file}
@@ -328,10 +328,6 @@ class FineTuningDataset(NLPDataset):
 
     @classmethod
     def load_many(cls, intents: list[str], file_path: str, tokenizer: spm.SentencePieceProcessor, max_len: int) -> dict[str, "FineTuningDataset"]:
-        """Single streaming pass over each file in file_path (comma-separated),
-        bucketing raw samples by `type` before tokenizing - instead of every
-        intent re-parsing the whole file just to filter out the
-        ~1/len(intents) share it cares about."""
         buckets: dict[str, list[dict]] = {intent: [] for intent in intents}
         paths = [p.strip() for p in file_path.split(',') if p.strip()]
         for path in paths:
@@ -431,80 +427,16 @@ class FineTuningDataset(NLPDataset):
         return input, output
 
 
-class MultiTaskDataset(Dataset):
-    ignore_index = NLPDataset.ignore_index
-    
-    def __init__(self, datasets: dict[str, NLPDataset], workers: int = 0) -> None:
-        self.workers = workers
-        self.task_names = list(datasets.keys())
-        self.datasets = [datasets[k] for k in self.task_names]
-        self.lengths = [len(ds) for ds in self.datasets]
-        self.offsets = []
-        total = 0
-        for L in self.lengths:
-            self.offsets.append(total)
-            total += L
-        self.total_len = total
-        self.tokens = sum(getattr(ds, 'tokens', 0) for ds in self.datasets)
-
-    def __len__(self):
-        return self.total_len
-
-    def task_probs(self, alpha: float) -> list[float]:
-        weights = [L ** alpha for L in self.lengths]
-        total = sum(weights)
-        return [w / total for w in weights]
-
-    def get_loader(self, batch_size: int, sampler: Sampler=None) -> DataLoader:
-        return DataLoader(
-            dataset=self,
-            batch_size=batch_size,
-            shuffle=(sampler is None),      # Sampler itself will handle shuffling if provided
-            sampler=sampler,
-            num_workers=self.workers,       # Number of subprocesses to use for data loading
-            pin_memory=torch.cuda.is_available(),  # pre-allocate batches in page-locked memory so that GPU transfers are faster and can be asynchronous
-            drop_last=True,                 # drop the last incomplete(does not have the size 'batch_size') batch
-        )
-    
-    def __getitem__(self, global_index: int):
-        task_id = bisect_left(self.offsets, global_index)
-        if task_id == len(self.offsets) or global_index != self.offsets[task_id]:
-            task_id -= 1
-        return self.datasets[task_id][global_index - self.offsets[task_id]]
-
-
-class TemperatureSampler(Sampler[int]):
-    def __init__(self, mt_dataset: MultiTaskDataset, iter_size: int, alpha: float = 0.5):
-        self.alpha = alpha
-        self.mt = mt_dataset
-        self.iter_size = iter_size
-        self.lengths = torch.tensor(self.mt.lengths, dtype=torch.float)
-        self.offsets = torch.tensor(self.mt.offsets, dtype=torch.long)
-        self.task_probs = mt_dataset.task_probs(alpha)  # probs ∝ n^alpha
-
-    def __len__(self):
-        return self.iter_size
-
-    def __iter__(self):
-        probs = torch.tensor(self.task_probs, dtype=torch.float)
-        for _ in range(self.iter_size):
-            task = torch.multinomial(probs, 1).item()
-            local_len = int(self.lengths[task].item())
-            j = random.randrange(local_len)
-            global_index = self.offsets[task].item() + j
-            yield global_index
-
-
 class PackedFineTuningDataset(IterableDataset):
     ignore_index = NLPDataset.ignore_index
 
-    def __init__(self, mt_dataset: MultiTaskDataset, max_len: int, alpha: float = 0.5, samples_per_epoch: int = 0, workers: int = 0) -> None:
-        self.mt = mt_dataset
+    def __init__(self, dataset: FineTuningDataset, max_len: int, samples_per_epoch: int = 0, workers: int = 0) -> None:
+        self.dataset = dataset
         self.max_len = max_len
         self.workers = workers
-        self.pad_token = mt_dataset.datasets[0].pad_token
+        self.tokens = dataset.tokens
+        self.pad_token = dataset.pad_token
         self.samples_per_epoch = samples_per_epoch
-        self.task_probs = mt_dataset.task_probs(alpha)
         self._epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -513,27 +445,13 @@ class PackedFineTuningDataset(IterableDataset):
     def __len__(self) -> int:
         return self.samples_per_epoch
 
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
-
-        # Independent RNG stream per (epoch, rank, worker): DataLoader workers are
-        # forked from the parent's already-seeded global RNG, so sampling with the
-        # module-level `random` here would give every worker identical draws.
-        rng = random.Random(f"{self._epoch}-{GLOBAL_RANK}-{worker_id}")
-        per_worker_len = math.ceil(self.samples_per_epoch / num_workers)
-        task_ids = list(range(len(self.mt.datasets)))
-
+    def rows(self, rng: random.Random):
         inp_buf: list[int] = []
         out_buf: list[int] = []
         doc_ends: list[int] = []  # absolute end position of each conversation in the buffer
-        yielded = 0
 
-        while yielded < per_worker_len:
-            task = rng.choices(task_ids, weights=self.task_probs, k=1)[0]
-            j = rng.randrange(self.mt.lengths[task])
-            inp, out, _ = self.mt.datasets[task][j]
+        while True:
+            inp, out, _ = self.dataset[rng.randrange(len(self.dataset))]
 
             actual_len = int((inp != self.pad_token).sum())
             if actual_len == 0:
@@ -565,13 +483,95 @@ class PackedFineTuningDataset(IterableDataset):
                     torch.tensor(chunk_out, dtype=torch.int64),
                     mask,
                 )
-                yielded += 1
-                if yielded >= per_worker_len:
-                    break
 
                 inp_buf = inp_buf[self.max_len:]
                 out_buf = out_buf[self.max_len:]
                 doc_ends = [e - self.max_len for e in doc_ends if e > self.max_len]
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        # Independent RNG stream per (epoch, rank, worker): DataLoader workers are
+        # forked from the parent's already-seeded global RNG, so sampling with the
+        # module-level `random` here would give every worker identical draws.
+        rng = random.Random(f"{self._epoch}-{GLOBAL_RANK}-{worker_id}")
+        per_worker_len = math.ceil(self.samples_per_epoch / num_workers)
+        stream = self.rows(rng)
+        for _ in range(per_worker_len):
+            yield next(stream)
+
+    def get_loader(self, batch_size: int, sampler: Sampler = None) -> DataLoader:
+        # IterableDataset does not support external samplers; sharding across
+        # ranks happens via GLOBAL_RANK in the RNG seed, and across DataLoader
+        # workers via worker_info inside __iter__.
+        return DataLoader(
+            dataset=self,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=None,
+            num_workers=self.workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+        )
+
+
+class MultiTaskDataset(IterableDataset):
+    ignore_index = NLPDataset.ignore_index
+
+    def __init__(self, datasets: dict[str, FineTuningDataset | PackedFineTuningDataset], alpha: float = 0.5, samples_per_epoch: int = 0, workers: int = 0) -> None:
+        self.alpha = alpha
+        self.workers = workers
+        self.samples_per_epoch = samples_per_epoch
+        self.task_names = list(datasets.keys())
+        self.datasets = [datasets[k] for k in self.task_names]
+        # underlying single-task datasets, whether or not a member is packed
+        self.base_datasets = [ds.dataset if isinstance(ds, PackedFineTuningDataset) else ds for ds in self.datasets]
+        self.lengths = [len(ds) for ds in self.base_datasets]
+        self.tokens = sum(ds.tokens for ds in self.base_datasets)
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def items(self):
+        return zip(self.task_names, self.datasets)
+
+    def task_probs(self, alpha: float) -> list[float]:
+        weights = [L ** alpha for L in self.lengths]
+        total = sum(weights)
+        return [w / total for w in weights]
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        # Independent RNG stream per (epoch, rank, worker): DataLoader workers are
+        # forked from the parent's already-seeded global RNG, so sampling with the
+        # module-level `random` here would give every worker identical draws.
+        rng = random.Random(f"{self._epoch}-{GLOBAL_RANK}-{worker_id}")
+        per_worker_len = math.ceil(self.samples_per_epoch / num_workers)
+        probs = self.task_probs(self.alpha)
+        task_ids = list(range(len(self.datasets)))
+
+        # one lazy packed-row stream per packed member; padded members are indexed directly
+        streams = {
+            i: ds.rows(rng) for i, ds in enumerate(self.datasets)
+            if isinstance(ds, PackedFineTuningDataset)
+        }
+
+        for _ in range(per_worker_len):
+            task = rng.choices(task_ids, weights=probs, k=1)[0]
+            if task in streams:
+                yield next(streams[task])
+            else:
+                ds = self.datasets[task]
+                yield ds[rng.randrange(len(ds))]
 
     def get_loader(self, batch_size: int, sampler: Sampler = None) -> DataLoader:
         # IterableDataset does not support external samplers; sharding across
