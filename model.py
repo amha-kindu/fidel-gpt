@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,36 +19,27 @@ class Embedding(nn.Module):
         return self.dropout(self.embedding(x))
 
 
-class PositionEncoder(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        
-        # (SEQ_LEN, 1)
-        positions = torch.arange(0, config.seq_len, dtype=torch.float).unsqueeze(1)
+        d_head = config.embed_dim // config.heads
+        assert d_head % 2 == 0, "RoPE requires an even head dimension"
 
-        # (EMBED_DIM//2,)
-        div_term = torch.exp(torch.arange(0, config.embed_dim, 2, dtype=torch.float) * -math.log(10000.0) / config.embed_dim)
+        # (d_head//2,)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, d_head, 2, dtype=torch.float) / d_head))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # (SEQ_LEN, EMBED_DIM)
-        position_encodings: torch.Tensor = torch.zeros(config.seq_len, config.embed_dim)
+    # Returns cos/sin of shape (SEQ_LEN, d_head), covering absolute positions
+    # [offset, offset + seq_len).
+    def forward(self, seq_len: int, offset: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(offset, offset + seq_len, device=device, dtype=self.inv_freq.dtype)
 
-        # PE(positions, 2i) = sin(positions / (10000 ^ (2i/embed_dim)))
-        # PE(positions, 2i) = sin(positions * exp(-2i * log(10000) / embed_dim))
-        position_encodings[:, ::2] = torch.sin(positions * div_term)
+        # (SEQ_LEN, d_head//2)
+        freqs = torch.outer(positions, self.inv_freq)
 
-        # PE(positions, 2i+1) = cos(positions / (10000 ^ (2i/embed_dim)))
-        # PE(positions, 2i+1) = cos(positions * exp(-2i * log(10000) / embed_dim))
-        position_encodings[:, 1::2] = torch.cos(positions * div_term)
-
-        # (SEQ_LEN, EMBED_DIM) --> (1, SEQ_LEN, EMBED_DIM)
-        position_encodings = position_encodings.unsqueeze(0)
-
-        self.register_buffer("position_encodings", position_encodings)
-
-    # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        return x + self.position_encodings[:, offset:offset + x.shape[1], :]
+        # (SEQ_LEN, d_head)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
 class MultiHeadAttentionBlock(nn.Module):
@@ -66,6 +56,18 @@ class MultiHeadAttentionBlock(nn.Module):
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
+    # x: (N_BATCHES, SEQ_LEN, EMBED_DIM); cos/sin: (SEQ_LEN, d_head)
+    # RoPE rotates within each head's d_head slice, so the head boundary must be
+    # exposed, but only via a free reshape (heads are already contiguous d_head
+    # blocks within EMBED_DIM) -- no transpose needed for the rotation itself.
+    def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        n, s, e = x.shape
+        x = x.view(n, s, self.heads, -1)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        x1, x2 = x.chunk(2, dim=-1)
+        x_rotated = torch.cat((-x2, x1), dim=-1)
+        return (x * cos + x_rotated * sin).view(n, s, e)
+
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(
@@ -74,15 +76,24 @@ class MultiHeadAttentionBlock(nn.Module):
         attn_mask: torch.Tensor | None,
         is_causal: bool,
         use_cache: bool = False,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
         key: torch.Tensor = self.Wk(x)
         query: torch.Tensor = self.Wq(x)
         value: torch.Tensor = self.Wv(x)
 
+        if rotary_emb is not None:
+            cos, sin = rotary_emb
+            query = self._apply_rotary(query, cos, sin)
+            key = self._apply_rotary(key, cos, sin)
+
         # Cache accumulates past tokens; the model only returns the new KV pairs.
-        # Concatenation of past+new is the cache's responsibility.
+        # Concatenation of past+new is the cache's responsibility. Keys are cached
+        # already rotated (rotation only depends on each token's own absolute
+        # position), so SlidingKVCache's non-chronological ring-buffer order
+        # doesn't affect correctness.
         new_kv = (key, value) if use_cache else None
         if use_cache and kv_cache is not None:
             key_past, value_past = kv_cache
@@ -148,14 +159,15 @@ class DecoderBlock(nn.Module):
         attn_mask: torch.Tensor | None,
         is_causal: bool,
         use_cache: bool = False,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache)
+            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache)
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -179,7 +191,7 @@ class GPTmodel(nn.Module):
         
         self.embedding = Embedding(config)
         self.projection = Projection(config)
-        self.position_encoder = PositionEncoder(config)
+        self.rotary_embedding = RotaryEmbedding(config)
         self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         if config.tie_weights:
@@ -189,15 +201,14 @@ class GPTmodel(nn.Module):
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    def _embed_and_encode_position(self, x: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
-        x = self.embedding(x)
-        return self.position_encoder(x, position_offset)
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embedding(x)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
     def _project(self, x: torch.Tensor) -> torch.Tensor:
         return self.projection(x)
-    
+
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def _decode(
@@ -206,6 +217,7 @@ class GPTmodel(nn.Module):
         mask: torch.Tensor,
         use_cache: bool = False,
         kv_caches: list[SlidingKVCache] | None = None,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # During decode (single new token against full KV cache), Q is shorter than K.
         # The cache already enforces causal ordering, so no mask is needed.
@@ -215,7 +227,7 @@ class GPTmodel(nn.Module):
 
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache)
+            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x
@@ -230,8 +242,9 @@ class GPTmodel(nn.Module):
         kv_caches: list[SlidingKVCache] | None = None,
         position_offset: int = 0,
     ) -> torch.Tensor:
-        x = self._embed_and_encode_position(x, position_offset)
-        x = self._decode(x, mask, use_cache, kv_caches)
+        x = self._embed(x)
+        rotary_emb = self.rotary_embedding(x.shape[1], position_offset, x.device, x.dtype)
+        x = self._decode(x, mask, use_cache, kv_caches, rotary_emb)
         return self._project(x)
     
 
