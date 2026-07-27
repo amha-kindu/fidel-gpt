@@ -259,6 +259,7 @@ if __name__ == "__main__":
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuning checkpoint")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
     parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple conversations per sequence to eliminate padding waste (default: enabled)")
+    parser.add_argument("--reinit-special-tokens", default=False, action="store_true", help="Re-initialize the [USER]/[BOT]/[SYSTEM]/[CONTEXT]/[STOP] embedding rows before training; use on the first finetuning run of a checkpoint that never saw these tokens during pretraining")
 
     args = parser.parse_args()
 
@@ -326,12 +327,12 @@ if __name__ == "__main__":
     
     intents = [
         "qa",
-        "afrisent",
-        "multiturn-dialogue",
-        "amharic_story_generation",
-        "amharic_spellcheck", "other",
-        "masakhanews", "masakhaner", "xlsum_summarization",
-        "xlsum_reverse_summarization", "amharic_title_generation",
+        "sentiment_analysis",
+        "dialogue",
+        "story_generation",
+        "spellcheck", "other",
+        "sentence_classification", "ner", "summarization",
+        "reverse_summarization", "title_generation",
     ]
     train_datasets = {k: v for k, v in FineTuningDataset.load_many(intents, training_config.training_data, tokenizer, model_config.seq_len).items() if len(v) > 0}
     samples = sum(len(ds) for ds in train_datasets.values())
@@ -360,7 +361,16 @@ if __name__ == "__main__":
     val_dataset = MultiTaskDataset(val_datasets)
     
     model = GPTmodel.build(model_config, weights).to(DEVICE)
-    
+
+    if args.reinit_special_tokens:
+        # None of these appear in raw-text pretraining data, yet tied embedding/projection weights
+        # (model.py) put every one of them in every pretraining step's softmax normalization without
+        # ever being a positive target -- likely biased against being generated, not neutral.
+        special_token_ids = [tokenizer.PieceToId(piece) for piece in ("[USER]", "[BOT]", "[SYSTEM]", "[CONTEXT]", "[STOP]")]
+        for token_id in special_token_ids:
+            nn.init.normal_(model.embedding.embedding.weight[token_id], mean=0.0, std=0.02)
+        LOGGER.info(f"Re-initialized embedding rows for special tokens {special_token_ids}")
+
     trainable_params = model_config.lora_targets if args.lora else None
     if args.trainable_params:
         assert os.path.exists(args.trainable_params), f"File {args.trainable_params} does not exist"

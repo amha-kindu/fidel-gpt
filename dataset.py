@@ -293,6 +293,7 @@ class FineTuningDataset(NLPDataset):
         self.user_token = self.tokenizer.PieceToId("[USER]")
         self.stop_token = self.tokenizer.PieceToId("[STOP]")
         self.system_token = self.tokenizer.PieceToId("[SYSTEM]")
+        self.context_token = self.tokenizer.PieceToId("[CONTEXT]")
 
         skips = 0
         self.samples = []
@@ -307,10 +308,11 @@ class FineTuningDataset(NLPDataset):
                 try:
                     conv.add_exchange(
                         self.preprocessor.execute(exchange["input"]),
-                        self.preprocessor.execute(exchange["output"])
+                        self.preprocessor.execute(exchange["output"]),
+                        self.preprocessor.execute(exchange["context"]) if exchange.get("context") else None
                     )
                 except Exception as e:
-                    LOGGER.error('File must be in JSON format [{"system": ..., "exchanges": [{"input": ..., "output": ...}, ...}]]')
+                    LOGGER.error('File must be in JSON format [{"system": ..., "exchanges": [{"input": ..., "output": ..., "context": (optional)...}, ...}]]')
                     exit(1)
             try:
                 io_tensors = self.get_io_tensors(conv)
@@ -365,7 +367,9 @@ class FineTuningDataset(NLPDataset):
         #                      Bot:  V W X Y Z
         # Input Structure:     [SYSTEM] K L M N O [USER] A B C D E [BOT] F G H I   J    ... [USER] Q R S T U [BOT] V W X Y   Z    $ $ $
         # Output Structure:        $    $ $ $ $ $    $   $ $ $ $ $   F   G H I J [STOP] ...    $   $ $ $ $ $   V   W X Y Z [STOP] $ $ $
-        
+        # An exchange with a grounding document inserts [CONTEXT] <doc tokens> right before that exchange's [USER],
+        # masked out of the loss the same way [SYSTEM]/[USER] are; exchanges without one omit it entirely.
+
         input_ids: list[int] = []
         output_ids: list[int] = []
         if conv.system_text:
@@ -374,25 +378,29 @@ class FineTuningDataset(NLPDataset):
                 *self.tokenizer.Encode(conv.system_text, out_type=int)
             ])
             output_ids.extend([self.ignore_index] * len(input_ids))
-        
+
         exchanges_ipt, exchanges_opt = [], []
         for exchange in reversed(conv.exchanges):
             input_token_ids = self.tokenizer.Encode(exchange["input"], out_type=int)
             output_token_ids = self.tokenizer.Encode(exchange["output"], out_type=int)
-            
-            if len(input_ids) + len(exchanges_ipt) + len(input_token_ids) + len(output_token_ids) + 2 > self.max_len:
+            context_token_ids = self.tokenizer.Encode(exchange["context"], out_type=int) if exchange.get("context") else []
+
+            if len(input_ids) + len(exchanges_ipt) + len(context_token_ids) + (1 if context_token_ids else 0) \
+               + len(input_token_ids) + len(output_token_ids) + 2 > self.max_len:
                 break
-            
-            # [USER] A B C ... H I J [BOT] K L M ... X Y   Z   
+
+            # [USER] A B C ... H I J [BOT] K L M ... X Y   Z
             #   $    $ $ $ ... $ $ $   K   L M O ... Y Z [STOP]
             if input_token_ids and output_token_ids:
                 exchanges_ipt = [
+                    *([self.context_token, *context_token_ids] if context_token_ids else []),
                     self.user_token,
                     *input_token_ids,
                     self.bot_token,
                     *output_token_ids
                 ] + exchanges_ipt
                 exchanges_opt = [
+                    *([self.ignore_index] * (len(context_token_ids) + 1) if context_token_ids else []),
                     *[self.ignore_index] * (len(input_token_ids) + 1),
                     *output_token_ids,
                     self.stop_token

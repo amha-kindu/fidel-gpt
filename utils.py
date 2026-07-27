@@ -15,10 +15,11 @@ class Conversation:
         self.exchanges = []
         self.system_text = system_text
     
-    def add_exchange(self, input_text: str, output_text: str):
+    def add_exchange(self, input_text: str, output_text: str, context_text: str | None = None):
         self.exchanges.append({
             "input": input_text,
-            "output": output_text
+            "output": output_text,
+            "context": context_text
         })
 
 class EarlyStopping:

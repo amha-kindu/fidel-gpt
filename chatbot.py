@@ -13,6 +13,10 @@ from dataset import Conversation
 from inference import GptInferenceEngine
 from utils import init_sdp_backend
 
+# Persona/safety system prompt used both for live chat
+# for the training data, so the model isn't finetuned on a distribution it never sees at inference.
+DEFAULT_SYSTEM_PROMPT = """አንቺ በአምሃ ክንዱ የተፈጠርሽ ኤአይ (አርቲፊሻል ኢንተለጀንስ) ነሽ፣ አንቺ አክብሮት የምታሳይ፣ ሐቀኛ፣ ተግባቢ እና ሙያዊ የኤአይ ረዳት ስለሆንሽ፣ ስለ ኢትዮጵያ—የበለፀገ ታሪኳ፣ የተለያዩ ባህሎቿ፣ ቋንቋዎቿ እና የጊዜው ዘመናዊ እድገቶቿ—ትክክለኛ እና ባህላዊ ግንዛቤ ያለው መረጃ ለመስጠት የተነደፉሽ ነሽ። ለሚቀርብልሽ ጥያቄዎች የምሰጪው መልሶች ምንም ዓይነት ጎጂ፣ ሥነ ምግባር የጎደለው፣ ዘረኛ፣ ወሲብ፣ መርዛማ፣ አደገኛ ወይም ሕገ ወጥ ይዘት ሊኖራቸው አይገባም። በተጨማሪም—የፋይናንስ (ለምሳሌ፣ የኢንቨስትመንት ምክሮች)፣ የህክምና (ለምሳሌ፣ ምርመራዎች)፣ ፖለቲካ፣ ሃይማኖት ወይም የህግ ምክሮች አንዳሰጪ ነገር ግን በትህትና ስለነዚ ርዕሶች ማውራት አልችልም ብለሽ መልሺ።"""
+
 
 class ChatBot(GptInferenceEngine):
     def __init__(self, model: GPTmodel, tokenizer: spm.SentencePieceProcessor, system_prompt: str = "", config: InferenceConfig = DEFAULT_INFERENCE_CONFIG) -> None:
@@ -22,7 +26,9 @@ class ChatBot(GptInferenceEngine):
         self.bot_token = self.tokenizer.PieceToId("[BOT]")
         self.user_token = self.tokenizer.PieceToId("[USER]")
         self.system_token = self.tokenizer.PieceToId("[SYSTEM]")
-        
+        self.context_token = self.tokenizer.PieceToId("[CONTEXT]")
+        self.pending_context: list[int] = []
+
         self.system_tokens = []
         if self.conv.system_text:
             self.conv.system_text = self.preprocessor.execute(self.conv.system_text)
@@ -31,41 +37,49 @@ class ChatBot(GptInferenceEngine):
                 *self.tokenizer.Encode(self.conv.system_text, out_type=int)
             ])
         
-    def get_tokens(self, text: str) -> list[int]:
+    def get_tokens(self, text: str, context: str | None = None) -> list[int]:
         input_ids: list[int] = []
         text = self.preprocessor.execute(text)
         self.user_input = self.tokenizer.Encode(text, out_type=int)
-        
+
+        self.pending_context = []
+        if context:
+            context = self.preprocessor.execute(context)
+            self.pending_context = self.tokenizer.Encode(context, out_type=int)
+
         if self.conv.system_text:
             input_ids.extend(self.system_tokens)
-        
+
         exchanges = [
+            *([self.context_token, *self.pending_context] if self.pending_context else []),
             self.user_token,
             *self.user_input,
             self.bot_token
         ]
         for exchange in reversed(self.conv.exchanges):
+            ctx = exchange.get("context") or []
             # Discard tokens of the earlier exchanges if input_ids gets too long(exceeds max_len)
-            if len(input_ids) + len(exchanges) + len(exchange["input"]) + len(exchange["output"]) + 2 > self.max_len:
+            if len(input_ids) + len(exchanges) + len(ctx) + (1 if ctx else 0) + len(exchange["input"]) + len(exchange["output"]) + 2 > self.max_len:
                 break
 
             if exchange["input"] and exchange["output"]:
                 exchanges = [
+                    *([self.context_token, *ctx] if ctx else []),
                     self.user_token,
                     *exchange["input"],
                     self.bot_token,
                     *exchange["output"]
                 ] + exchanges
-                
+
         input_ids.extend(exchanges)
         return input_ids
-    
+
     def complete(self, token_ids: list[int]) -> Iterator[int]:
         bot_output = []
         for prediction_token in super().complete(token_ids):
             bot_output.append(prediction_token)
             yield prediction_token
-        self.conv.add_exchange(self.user_input, bot_output)
+        self.conv.add_exchange(self.user_input, bot_output, self.pending_context or None)
         
 
 if __name__ == '__main__':
@@ -142,8 +156,7 @@ if __name__ == '__main__':
     tokenizer = spm.SentencePieceProcessor()
     tokenizer.LoadFromFile(args.tokenizer)
     
-    system_prompt = """አንቺ በአምሃ ክንዱ የተፈጠርሽ ኤአይ (አርቲፊሻል ኢንተለጀንስ) ነሽ፣ አንቺ አክብሮት የምታሳይ፣ ሐቀኛ፣ ተግባቢ እና ሙያዊ የኤአይ ረዳት ስለሆንሽ፣ ስለ ኢትዮጵያ—የበለፀገ ታሪኳ፣ የተለያዩ ባህሎቿ፣ ቋንቋዎቿ እና የጊዜው ዘመናዊ እድገቶቿ—ትክክለኛ እና ባህላዊ ግንዛቤ ያለው መረጃ ለመስጠት የተነደፉሽ ነሽ። ለሚቀርብልሽ ጥያቄዎች የምሰጪው መልሶች ምንም ዓይነት ጎጂ፣ ሥነ ምግባር የጎደለው፣ ዘረኛ፣ ወሲብ፣ መርዛማ፣ አደገኛ ወይም ሕገ ወጥ ይዘት ሊኖራቸው አይገባም። በተጨማሪም—የፋይናንስ (ለምሳሌ፣ የኢንቨስትመንት ምክሮች)፣ የህክምና (ለምሳሌ፣ ምርመራዎች)፣ ፖለቲካ፣ ሃይማኖት ወይም የህግ ምክሮች አንዳሰጪ ነገር ግን በትህትና ስለነዚ ርዕሶች ማውራት አልችልም ብለሽ መልሺ።"""
-    bot = ChatBot(model, tokenizer, system_prompt=system_prompt, config=inference_config)
+    bot = ChatBot(model, tokenizer, system_prompt=DEFAULT_SYSTEM_PROMPT, config=inference_config)
 
     while True:
         user_input = input("User: ")

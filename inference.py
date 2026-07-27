@@ -38,6 +38,7 @@ class GptInferenceEngine:
         self.stop_token = self.tokenizer.PieceToId("[STOP]")
         self.user_token = self.tokenizer.PieceToId("[USER]")
         self.system_token = self.tokenizer.PieceToId("[SYSTEM]")
+        self.context_token = self.tokenizer.PieceToId("[CONTEXT]")
 
         self.rep_window = config.rep_window
         self.freq_penalty = config.freq_penalty
@@ -117,7 +118,7 @@ class GptInferenceEngine:
             self._ban_tokens(
                 logits=logits, 
                 banned_token_ids=[
-                    self.unk_token, self.user_token, self.bot_token, self.system_token, self.pad_token,
+                    self.unk_token, self.user_token, self.bot_token, self.system_token, self.pad_token, self.context_token,
                     *self._no_repeat_ngrams_ids(token_ids, self.no_repeat_ngram_size)
                 ]
             )
