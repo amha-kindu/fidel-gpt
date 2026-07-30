@@ -303,16 +303,18 @@ class FineTuningDataset(NLPDataset):
             system_prompt = sample.get("system", "")
             if system_prompt:
                 system_prompt = self.preprocessor.execute(system_prompt)
-            conv = Conversation(sample['type'], system_prompt)
+            context = sample.get("context", "")
+            if context:
+                context = self.preprocessor.execute(context)
+            conv = Conversation(sample['type'], system_prompt, context)
             for exchange in sample["exchanges"]:
                 try:
                     conv.add_exchange(
                         self.preprocessor.execute(exchange["input"]),
                         self.preprocessor.execute(exchange["output"]),
-                        self.preprocessor.execute(exchange["context"]) if exchange.get("context") else None
                     )
                 except Exception as e:
-                    LOGGER.error('File must be in JSON format [{"system": ..., "exchanges": [{"input": ..., "output": ..., "context": (optional)...}, ...}]]')
+                    LOGGER.error('File must be in JSON format [{"system": ..., "context": ..., "exchanges": [{"input": ..., "output": ...}, ...]}]')
                     exit(1)
             try:
                 io_tensors = self.get_io_tensors(conv)
@@ -365,10 +367,10 @@ class FineTuningDataset(NLPDataset):
         #                      ...
         #                      User: Q R S T U
         #                      Bot:  V W X Y Z
-        # Input Structure:     [SYSTEM] K L M N O [USER] A B C D E [BOT] F G H I   J    ... [USER] Q R S T U [BOT] V W X Y   Z    $ $ $
-        # Output Structure:        $    $ $ $ $ $    $   $ $ $ $ $   F   G H I J [STOP] ...    $   $ $ $ $ $   V   W X Y Z [STOP] $ $ $
-        # An exchange with a grounding document inserts [CONTEXT] <doc tokens> right before that exchange's [USER],
-        # masked out of the loss the same way [SYSTEM]/[USER] are; exchanges without one omit it entirely.
+        # Input Structure:     [SYSTEM] K L M N O [CONTEXT] doc doc doc [USER] A B C D E [BOT] F G H I   J    ... [USER] Q R S T U [BOT] V W X Y   Z    $ $ $
+        # Output Structure:        $    $ $ $ $ $     $      $   $   $    $   $ $ $ $ $   F   G H I J [STOP] ...    $   $ $ $ $ $   V   W X Y Z [STOP] $ $ $
+        # A conversation's grounding document (if any) is shared by every exchange in it, so it's inserted once,
+        # right after [SYSTEM] and before the first (oldest kept) exchange -- masked out of the loss like [SYSTEM].
 
         input_ids: list[int] = []
         output_ids: list[int] = []
@@ -379,28 +381,32 @@ class FineTuningDataset(NLPDataset):
             ])
             output_ids.extend([self.ignore_index] * len(input_ids))
 
+        if conv.context_text:
+            context_start = len(input_ids)
+            input_ids.extend([
+                self.context_token,
+                *self.tokenizer.Encode(conv.context_text, out_type=int)
+            ])
+            output_ids.extend([self.ignore_index] * (len(input_ids) - context_start))
+
         exchanges_ipt, exchanges_opt = [], []
         for exchange in reversed(conv.exchanges):
             input_token_ids = self.tokenizer.Encode(exchange["input"], out_type=int)
             output_token_ids = self.tokenizer.Encode(exchange["output"], out_type=int)
-            context_token_ids = self.tokenizer.Encode(exchange["context"], out_type=int) if exchange.get("context") else []
 
-            if len(input_ids) + len(exchanges_ipt) + len(context_token_ids) + (1 if context_token_ids else 0) \
-               + len(input_token_ids) + len(output_token_ids) + 2 > self.max_len:
+            if len(input_ids) + len(exchanges_ipt) + len(input_token_ids) + len(output_token_ids) + 2 > self.max_len:
                 break
 
             # [USER] A B C ... H I J [BOT] K L M ... X Y   Z
             #   $    $ $ $ ... $ $ $   K   L M O ... Y Z [STOP]
             if input_token_ids and output_token_ids:
                 exchanges_ipt = [
-                    *([self.context_token, *context_token_ids] if context_token_ids else []),
                     self.user_token,
                     *input_token_ids,
                     self.bot_token,
                     *output_token_ids
                 ] + exchanges_ipt
                 exchanges_opt = [
-                    *([self.ignore_index] * (len(context_token_ids) + 1) if context_token_ids else []),
                     *[self.ignore_index] * (len(input_token_ids) + 1),
                     *output_token_ids,
                     self.stop_token

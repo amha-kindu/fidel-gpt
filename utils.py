@@ -10,11 +10,12 @@ from tensorboard_logger import TensorboardLogger
 
 
 class Conversation:
-    def __init__(self, type: str, system_text=None) -> None:
+    def __init__(self, type: str, system_text=None, context_text=None) -> None:
         self.type = type
         self.exchanges = []
         self.system_text = system_text
-    
+        self.context_text = context_text
+
     def add_exchange(self, input_text: str, output_text: str, context_text: str | None = None):
         self.exchanges.append({
             "input": input_text,
