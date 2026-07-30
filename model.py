@@ -55,7 +55,7 @@ class MultiHeadAttentionModule(nn.Module):
         self.Wk: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        
+
     # x: (N_BATCHES, SEQ_LEN, EMBED_DIM); cos/sin: (SEQ_LEN, d_head)
     # RoPE rotates within each head's d_head slice, so the head boundary must be
     # exposed, but only via a free reshape (heads are already contiguous d_head
@@ -120,9 +120,9 @@ class MultiHeadAttentionModule(nn.Module):
 
         # (N_BATCHES, SEQ_LEN, HEADS, d_head) -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
         output = output.contiguous().view(*x.shape[:-1], -1)
-        
+
         return self.Wo(output), new_kv
-    
+
 
 class FeedForwardModule(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -138,7 +138,6 @@ class FeedForwardModule(nn.Module):
         return self.linear2(
             self.dropout(self.gelu(self.linear1(x)))
         )
-
 
 class DecoderModule(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -161,16 +160,53 @@ class DecoderModule(nn.Module):
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        hist_residual: torch.Tensor | float = 0.0,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
             x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
-            x = self.norm1(x + self.dropout(x_update))
-            x = self.norm2(x + self.dropout(self.feed_forward(x)))
+            x = self.norm1(x + self.dropout(x_update) + hist_residual)
+            x = self.norm2(x + self.dropout(self.feed_forward(x)) + hist_residual)
         else:
             x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
-            x = x + self.dropout(x_update)
-            x = x + self.dropout(self.feed_forward(self.norm2(x)))
+            x = x + self.dropout(x_update) + hist_residual
+            x = x + self.dropout(self.feed_forward(self.norm2(x))) + hist_residual
         return x, new_kv
+
+class DecoderBlock(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        group_size = config.n_decoders // config.n_blocks
+        self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(group_size)])
+
+        self.depth_query: nn.Parameter | None = None
+        self.depth_norm: nn.RMSNorm | None = None
+        if getattr(config, "depth_attention", False):
+            self.depth_query = nn.Parameter(torch.empty(config.embed_dim))
+            nn.init.normal_(self.depth_query, std=0.02)
+            self.depth_norm = nn.RMSNorm(config.embed_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
+        use_cache: bool,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None],
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
+        k_history: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None], torch.Tensor | None]:
+        hist_residual = (
+            combine_depth_signal(self.depth_query, k_history)
+            if self.depth_query is not None else 0.0
+        )
+
+        new_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+        for decoder, kv_cache in zip(self.decoders, kv_caches):
+            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin, hist_residual)
+            new_kvs.append(new_kv)
+
+        k_block = self.depth_norm(x) if self.depth_norm is not None else None
+        return x, new_kvs, k_block
 
 
 class ProjectionModule(nn.Module):
@@ -178,9 +214,20 @@ class ProjectionModule(nn.Module):
         super().__init__()
         self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
 
+        self.depth_query: nn.Parameter | None = None
+        if getattr(config, "depth_attention", False):
+            self.depth_query = nn.Parameter(torch.empty(config.embed_dim))
+            nn.init.normal_(self.depth_query, std=0.02)
+
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        k_history: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if self.depth_query is not None:
+            x = x + combine_depth_signal(self.depth_query, k_history or [])
         return self.linear(x)
 
 
@@ -189,10 +236,13 @@ class GPTmodel(nn.Module):
         super().__init__()
         self.config: ModelConfig = config
         
+        assert config.n_decoders % config.n_blocks == 0, \
+            f"n_decoders ({config.n_decoders}) must be divisible by n_blocks ({config.n_blocks})"
+
         self.embedding = EmbeddingModule(config)
         self.projection = ProjectionModule(config)
         self.rope = RoPeModule(config)
-        self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
+        self.decoder_blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         if config.tie_weights:
             # Tie input embedding and output projection weights (standard for decoder-only LMs).
@@ -206,11 +256,15 @@ class GPTmodel(nn.Module):
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
-    def _project(self, x: torch.Tensor) -> torch.Tensor:
-        return self.projection(x)
+    def _project(
+        self,
+        x: torch.Tensor,
+        k_history: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        return self.projection(x, k_history)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
-    # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
+    # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM), plus the depth-attention history
     def _decode(
         self,
         x: torch.Tensor,
@@ -218,19 +272,39 @@ class GPTmodel(nn.Module):
         use_cache: bool = False,
         kv_caches: list[SlidingKVCache] | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         # During decode (single new token against full KV cache), Q is shorter than K.
         # The cache already enforces causal ordering, so no mask is needed.
         in_decode_phase = use_cache and kv_caches is not None and kv_caches[0].get() is not None
         attn_mask = mask if (mask is not None and not in_decode_phase) else None
         is_causal = (mask is None) and not in_decode_phase
 
-        for i, decoder in enumerate(self.decoders):
-            kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+        depth_attention = getattr(self.config, "depth_attention", False)
+        k_history: list[torch.Tensor] = []
+
+        n_blocks = len(self.decoder_blocks)
+        for g, block in enumerate(self.decoder_blocks):
+            group_size = len(block.decoders)
             if use_cache:
-                kv_caches[i].append(new_kv[0], new_kv[1])
-        return self.norm_f(x) if not self.config.post_norm else x
+                block_kv_caches = [kv_caches[g * group_size + j].get() for j in range(group_size)]
+            else:
+                block_kv_caches = [None] * group_size
+
+            x, new_kvs, k_block = block(
+                x, attn_mask, is_causal, use_cache, block_kv_caches, rope_cos_sin, k_history,
+            )
+
+            if use_cache:
+                for j, new_kv in enumerate(new_kvs):
+                    kv_caches[g * group_size + j].append(new_kv[0], new_kv[1])
+
+            # The last block's output is fed directly into ProjectionModule as x, so
+            # it never needs to be cached for anyone to consume.
+            if depth_attention and g < n_blocks - 1:
+                k_history.append(k_block)
+
+        x = self.norm_f(x) if not self.config.post_norm else x
+        return x, k_history
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -244,9 +318,9 @@ class GPTmodel(nn.Module):
     ) -> torch.Tensor:
         x = self._embed(x)
         rope_cos_sin = self.rope(x.shape[1], position_offset, x.device, x.dtype)
-        x = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
-        return self._project(x)
-    
+        x, k_history = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
+        return self._project(x, k_history)
+
 
     @staticmethod
     def build(
@@ -279,7 +353,7 @@ class GPTmodel(nn.Module):
                 elif isinstance(m, nn.LayerNorm):
                     nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
-            
+
             model.apply(init_weights)
             if config.tie_weights:
                 # apply() is children-first: EmbeddingModule gets normal(0, 0.02) then ProjectionModule
@@ -288,8 +362,30 @@ class GPTmodel(nn.Module):
 
         if isinstance(config, ModelWithLoRAConfig):
             LoRAdapter.apply_lora(model, config.lora_targets, config.lora_rank, config.lora_alpha, config.lora_dropout)
-            
+
             if lora_weights:
                 model.load_state_dict(lora_weights, strict=False)
 
         return model
+
+
+# Depth-wise attention residual: combines a query against cached, RMSNorm'd block
+# outputs from earlier blocks. Stateless (holds no parameters of its own) -- the
+# caller (DecoderBlock / ProjectionModule) owns and passes in the learnable query.
+# The same normalized tensor is used for both scoring and the mixed content
+def combine_depth_signal(
+    query: torch.Tensor,
+    k_history: list[torch.Tensor],
+) -> torch.Tensor | float:
+    if not k_history:
+        return 0.0
+
+    # (L, N_BATCHES, SEQ_LEN, EMBED_DIM)
+    all_k = torch.stack(k_history, dim=0)
+
+    # (L, N_BATCHES, SEQ_LEN)
+    score = torch.einsum("d,lbsd->lbs", query, all_k)
+    alpha = F.softmax(score, dim=0)
+
+    # (N_BATCHES, SEQ_LEN, EMBED_DIM)
+    return torch.einsum("lbs,lbsd->bsd", alpha, all_k)

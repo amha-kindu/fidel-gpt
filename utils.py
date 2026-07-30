@@ -126,14 +126,14 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
             global_sq += norm_sq
             if name.startswith("embedding"):
                 key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
+            elif name.startswith("decoder_blocks."):
+                key = f"Block{name.split('.')[1]}"
             elif name.startswith("projection"):
                 key = "Projection"
             else:
                 key = "NormF"
             component_sq[key] = component_sq.get(key, 0.0) + norm_sq
-        
+
         tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
         for key, sq in component_sq.items():
             tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
@@ -146,8 +146,8 @@ def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tens
             norm_sq = torch.linalg.vector_norm(param.float().view(-1)).item() ** 2
             if name.startswith("embedding"):
                 key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
+            elif name.startswith("decoder_blocks."):
+                key = f"Block{name.split('.')[1]}"
             elif name.startswith("projection"):
                 key = "Projection"
             else:
