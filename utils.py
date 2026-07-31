@@ -114,47 +114,80 @@ def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, g
         tb_logger.log_scalar("Confidence/MaxProb", max_prob, global_step)
         tb_logger.log_scalar("Confidence/LogitStd", logit_std, global_step)
 
+def _bucket_param_norms(tensors: dict[str, torch.Tensor]) -> tuple[float, dict[str, float], dict[str, dict[str, float]], dict[str, float]]:
+    global_sq = 0.0
+    flat_sq: dict[str, float] = {}
+    block_sq: dict[str, dict[str, float]] = {}
+    projection_sq: dict[str, float] = {}
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        norm_sq = torch.linalg.vector_norm(tensor.float().view(-1)).item() ** 2
+        global_sq += norm_sq
+
+        if name.startswith("embedding"):
+            flat_sq["Embedding"] = flat_sq.get("Embedding", 0.0) + norm_sq
+        elif name.startswith("projection"):
+            projection_sq["Total"] = projection_sq.get("Total", 0.0) + norm_sq
+            parts = name.split(".")
+            if parts[1] == "linear":
+                sub_key = "Linear"
+            elif parts[1] == "depth_query":
+                sub_key = "DepthQuery"
+            else:
+                sub_key = "Other"
+            projection_sq[sub_key] = projection_sq.get(sub_key, 0.0) + norm_sq
+        elif name.startswith("decoder_blocks."):
+            parts = name.split(".")
+            bucket = block_sq.setdefault(parts[1], {})
+            bucket["Total"] = bucket.get("Total", 0.0) + norm_sq
+            if parts[2] == "decoders":
+                sub_key = f"Decoder{parts[3]}"
+            elif parts[2] == "depth_query":
+                sub_key = "DepthQuery"
+            elif parts[2] == "depth_norm":
+                sub_key = "DepthNorm"
+            else:
+                sub_key = "Other"
+            bucket[sub_key] = bucket.get(sub_key, 0.0) + norm_sq
+        else:
+            flat_sq["NormF"] = flat_sq.get("NormF", 0.0) + norm_sq
+
+    return global_sq, flat_sq, block_sq, projection_sq
+
+def _log_component(tb_logger: TensorboardLogger, tag: str, sq: dict[str, float], global_step: int) -> None:
+    if not sq:
+        return
+    non_total = {k: v for k, v in sq.items() if k != "Total"}
+    if len(non_total) <= 1:
+        (value,) = non_total.values()
+        tb_logger.log_scalar(tag, value ** 0.5, global_step)
+    else:
+        tb_logger.log_scalars(tag, {k: v ** 0.5 for k, v in sq.items()}, global_step)
+
 @_non_blocking()
 def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int):
     with torch.no_grad():
-        global_sq = 0.0
-        component_sq: dict[str, float] = {}
-        for name, grad in grads.items():
-            if grad is None:
-                continue
-            norm_sq = torch.linalg.vector_norm(grad.float().view(-1)).item() ** 2
-            global_sq += norm_sq
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoder_blocks."):
-                key = f"Block{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
-            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
+        global_sq, flat_sq, block_sq, projection_sq = _bucket_param_norms(grads)
 
         tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
-        for key, sq in component_sq.items():
+        for key, sq in flat_sq.items():
             tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
+        _log_component(tb_logger, "Gradients/Projection", projection_sq, global_step)
+        for block_idx, sub in block_sq.items():
+            _log_component(tb_logger, f"Gradients/Block{block_idx}", sub, global_step)
 
 @_non_blocking()
 def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tensor], global_step: int):
     with torch.no_grad():
-        component_sq: dict[str, float] = {}
-        for name, param in weights.items():
-            norm_sq = torch.linalg.vector_norm(param.float().view(-1)).item() ** 2
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoder_blocks."):
-                key = f"Block{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
-            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
-        for key, sq in component_sq.items():
+        global_sq, flat_sq, block_sq, projection_sq = _bucket_param_norms(weights)
+
+        tb_logger.log_scalar("WeightNorm/Global", global_sq ** 0.5, global_step)
+        for key, sq in flat_sq.items():
             tb_logger.log_scalar(f"WeightNorm/{key}", sq ** 0.5, global_step)
+        _log_component(tb_logger, "WeightNorm/Projection", projection_sq, global_step)
+        for block_idx, sub in block_sq.items():
+            _log_component(tb_logger, f"WeightNorm/Block{block_idx}", sub, global_step)
 
 
 @_non_blocking()
