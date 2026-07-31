@@ -132,8 +132,12 @@ def _bucket_param_norms(tensors: dict[str, torch.Tensor]) -> tuple[float, dict[s
             parts = name.split(".")
             if parts[1] == "linear":
                 sub_key = "Linear"
-            elif parts[1] == "depth_query":
-                sub_key = "DepthQuery"
+            elif parts[1] == "block_query":
+                sub_key = "BlockQuery"
+            elif parts[1] == "rmsnorm":
+                sub_key = "RMSNorm"
+            elif parts[1] == "norm":
+                sub_key = "Norm"
             else:
                 sub_key = "Other"
             projection_sq[sub_key] = projection_sq.get(sub_key, 0.0) + norm_sq
@@ -143,10 +147,10 @@ def _bucket_param_norms(tensors: dict[str, torch.Tensor]) -> tuple[float, dict[s
             bucket["Total"] = bucket.get("Total", 0.0) + norm_sq
             if parts[2] == "decoders":
                 sub_key = f"Decoder{parts[3]}"
-            elif parts[2] == "depth_query":
-                sub_key = "DepthQuery"
-            elif parts[2] == "depth_norm":
-                sub_key = "DepthNorm"
+            elif parts[2] == "block_query":
+                sub_key = "BlockQuery"
+            elif parts[2] == "rmsnorm":
+                sub_key = "RMSNorm"
             else:
                 sub_key = "Other"
             bucket[sub_key] = bucket.get(sub_key, 0.0) + norm_sq

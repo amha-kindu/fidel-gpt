@@ -160,17 +160,39 @@ class DecoderModule(nn.Module):
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
-        hist_residual: torch.Tensor | float = 0.0,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
             x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
-            x = self.norm1(x + self.dropout(x_update) + hist_residual)
-            x = self.norm2(x + self.dropout(self.feed_forward(x)) + hist_residual)
+            x = self.norm1(x + self.dropout(x_update))
+            x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
             x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
-            x = x + self.dropout(x_update) + hist_residual
-            x = x + self.dropout(self.feed_forward(self.norm2(x))) + hist_residual
+            x = x + self.dropout(x_update)
+            x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
+
+    def forward_depth_mixed(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        is_causal: bool,
+        hidden_states: list[torch.Tensor],
+        block_query: torch.Tensor,
+        block_rmsnorm: nn.RMSNorm,
+        block_attn_scores: torch.Tensor,
+        use_cache: bool = False,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, SlidingKVCache | None]:        
+        x = attentionResOp(x, block_query, block_rmsnorm, block_attn_scores, hidden_states)
+        x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+        x = x + self.dropout(x_update)
+        
+        ffn_input = attentionResOp(x, block_query, block_rmsnorm, block_attn_scores, hidden_states)
+        x = x + self.dropout(self.feed_forward(self.norm2(ffn_input)))
+
+        return x, new_kv
+
 
 class DecoderBlock(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -178,12 +200,12 @@ class DecoderBlock(nn.Module):
         group_size = config.n_decoders // config.n_blocks
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(group_size)])
 
-        self.depth_query: nn.Parameter | None = None
-        self.depth_norm: nn.RMSNorm | None = None
+        self.block_query: nn.Parameter | None = None
+        self.rmsnorm: nn.RMSNorm | None = None
         if getattr(config, "depth_attention", False):
-            self.depth_query = nn.Parameter(torch.empty(config.embed_dim))
-            nn.init.normal_(self.depth_query, std=0.02)
-            self.depth_norm = nn.RMSNorm(config.embed_dim)
+            self.rmsnorm = nn.RMSNorm(config.embed_dim)
+            self.block_query = nn.Parameter(torch.empty(config.embed_dim))
+            nn.init.normal_(self.block_query, std=0.02)
 
     def forward(
         self,
@@ -193,20 +215,31 @@ class DecoderBlock(nn.Module):
         use_cache: bool,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None],
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
-        k_history: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None], torch.Tensor | None]:
-        hist_residual = (
-            combine_depth_signal(self.depth_query, k_history)
-            if self.depth_query is not None else 0.0
-        )
-
+        hidden_states: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
         new_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] = []
-        for decoder, kv_cache in zip(self.decoders, kv_caches):
-            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin, hist_residual)
-            new_kvs.append(new_kv)
-
-        k_block = self.depth_norm(x) if self.depth_norm is not None else None
-        return x, new_kvs, k_block
+        
+        if self.rmsnorm is not None:
+            # (L, N_BATCHES, SEQ_LEN, EMBED_DIM)
+            hs_tensors = torch.stack(hidden_states)
+            hs_keys = self.rmsnorm(hs_tensors)
+            
+            # (L, N_BATCHES, SEQ_LEN)
+            block_attn_scores = torch.einsum("d,lbsd->lbs", self.block_query, hs_keys)
+            
+            for (decoder, kv_cache) in zip(self.decoders, kv_caches):
+                x, new_kv = decoder.forward_depth_mixed(
+                    x, attn_mask, is_causal,
+                    hidden_states, self.block_query, self.rmsnorm, block_attn_scores,
+                    use_cache, kv_cache, rope_cos_sin
+                )
+                new_kvs.append(new_kv)
+        else:
+            for decoder, kv_cache in zip(self.decoders, kv_caches):
+                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+                new_kvs.append(new_kv)
+        
+        return x, new_kvs
 
 
 class ProjectionModule(nn.Module):
@@ -214,20 +247,33 @@ class ProjectionModule(nn.Module):
         super().__init__()
         self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
 
-        self.depth_query: nn.Parameter | None = None
+        self.block_query: nn.Parameter | None = None
+        self.rmsnorm: nn.RMSNorm | None = None
+        self.norm: nn.LayerNorm | None = None
         if getattr(config, "depth_attention", False):
-            self.depth_query = nn.Parameter(torch.empty(config.embed_dim))
-            nn.init.normal_(self.depth_query, std=0.02)
+            self.block_query = nn.Parameter(torch.empty(config.embed_dim))
+            nn.init.normal_(self.block_query, std=0.02)
+            self.rmsnorm = nn.RMSNorm(config.embed_dim)
+            self.norm = nn.LayerNorm(config.embed_dim)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
     def forward(
         self,
         x: torch.Tensor,
-        k_history: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        if self.depth_query is not None:
-            x = x + combine_depth_signal(self.depth_query, k_history or [])
+        hidden_states: list[torch.Tensor] = [],
+    ) -> torch.Tensor:        
+        if self.block_query is not None:
+            # (L, N_BATCHES, SEQ_LEN, EMBED_DIM)
+            hs_tensors = torch.stack(hidden_states)
+            hs_keys = self.rmsnorm(hs_tensors)
+            
+            # (L, N_BATCHES, SEQ_LEN)
+            block_attn_scores = torch.einsum("d,lbsd->lbs", self.block_query, hs_keys)
+            
+            x = self.norm(
+                attentionResOp(x, self.block_query, self.rmsnorm, block_attn_scores, hidden_states)
+            )
         return self.linear(x)
 
 
@@ -245,8 +291,6 @@ class GPTmodel(nn.Module):
         self.decoder_blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         if config.tie_weights:
-            # Tie input embedding and output projection weights (standard for decoder-only LMs).
-            # Both are (vocab_size, embed_dim), sharing one tensor halves that parameter block.
             self.projection.linear.weight = self.embedding.embedding.weight
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
@@ -259,12 +303,12 @@ class GPTmodel(nn.Module):
     def _project(
         self,
         x: torch.Tensor,
-        k_history: list[torch.Tensor] | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.projection(x, k_history)
+        return self.projection(x, hidden_states)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
-    # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM), plus the depth-attention history
+    # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM), plus the hidden-state history
     def _decode(
         self,
         x: torch.Tensor,
@@ -280,9 +324,9 @@ class GPTmodel(nn.Module):
         is_causal = (mask is None) and not in_decode_phase
 
         depth_attention = getattr(self.config, "depth_attention", False)
-        k_history: list[torch.Tensor] = []
-
+        
         n_blocks = len(self.decoder_blocks)
+        hidden_states: list[torch.Tensor] = [x] if depth_attention else []
         for g, block in enumerate(self.decoder_blocks):
             group_size = len(block.decoders)
             if use_cache:
@@ -290,21 +334,19 @@ class GPTmodel(nn.Module):
             else:
                 block_kv_caches = [None] * group_size
 
-            x, new_kvs, k_block = block(
-                x, attn_mask, is_causal, use_cache, block_kv_caches, rope_cos_sin, k_history,
+            x, new_kvs = block(
+                x, attn_mask, is_causal, use_cache, block_kv_caches, rope_cos_sin, hidden_states,
             )
 
             if use_cache:
                 for j, new_kv in enumerate(new_kvs):
                     kv_caches[g * group_size + j].append(new_kv[0], new_kv[1])
 
-            # The last block's output is fed directly into ProjectionModule as x, so
-            # it never needs to be cached for anyone to consume.
             if depth_attention and g < n_blocks - 1:
-                k_history.append(k_block)
+                hidden_states.append(x)
 
         x = self.norm_f(x) if not self.config.post_norm else x
-        return x, k_history
+        return x, hidden_states
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -318,8 +360,8 @@ class GPTmodel(nn.Module):
     ) -> torch.Tensor:
         x = self._embed(x)
         rope_cos_sin = self.rope(x.shape[1], position_offset, x.device, x.dtype)
-        x, k_history = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
-        return self._project(x, k_history)
+        x, hidden_states = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
+        return self._project(x, hidden_states)
 
 
     @staticmethod
@@ -335,11 +377,6 @@ class GPTmodel(nn.Module):
 
         if weights:
             if config.tie_weights and "embedding.embedding.weight" in base_weights:
-                # Finetuned checkpoints saved via named_parameters() deduplicate tied
-                # params and drop projection.linear.weight, so a merged weights dict can
-                # hold a stale projection value. load_state_dict copies projection after
-                # embedding into the one shared tensor, letting the stale value clobber
-                # the finetuned embedding — keep the two keys in sync before loading.
                 base_weights["projection.linear.weight"] = base_weights["embedding.embedding.weight"]
             model.load_state_dict(base_weights, strict=True)
         else:
@@ -369,23 +406,18 @@ class GPTmodel(nn.Module):
         return model
 
 
-# Depth-wise attention residual: combines a query against cached, RMSNorm'd block
-# outputs from earlier blocks. Stateless (holds no parameters of its own) -- the
-# caller (DecoderBlock / ProjectionModule) owns and passes in the learnable query.
-# The same normalized tensor is used for both scoring and the mixed content
-def combine_depth_signal(
-    query: torch.Tensor,
-    k_history: list[torch.Tensor],
-) -> torch.Tensor | float:
-    if not k_history:
-        return 0.0
-
-    # (L, N_BATCHES, SEQ_LEN, EMBED_DIM)
-    all_k = torch.stack(k_history, dim=0)
-
-    # (L, N_BATCHES, SEQ_LEN)
-    score = torch.einsum("d,lbsd->lbs", query, all_k)
-    alpha = F.softmax(score, dim=0)
+def attentionResOp(x: torch.Tensor, block_query: torch.Tensor, rmsnorm: nn.RMSNorm, scores: torch.Tensor, hidden_states: list[torch.Tensor]):
+    x_keys = rmsnorm(x)
+    updated_scores = torch.cat([
+        # (L, N_BATCHES, SEQ_LEN)
+        scores,
+        
+        # (1, N_BATCHES, SEQ_LEN)
+        torch.einsum("d,bsd->bs", block_query, x_keys).unsqueeze(0)
+    ])
+    alpha = F.softmax(updated_scores, dim=0)
+    
+    new_hs = torch.stack(hidden_states + [x])
 
     # (N_BATCHES, SEQ_LEN, EMBED_DIM)
-    return torch.einsum("lbs,lbsd->bsd", alpha, all_k)
+    return torch.einsum("lbs,lbsd->bsd", alpha, new_hs)
