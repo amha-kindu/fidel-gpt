@@ -25,7 +25,7 @@ class GptInferenceEngine:
         # window rather than disabling the cache.
         cache_size = config.kv_cache_size if config.kv_cache_size > 0 else self.max_len
         self.kv_caches = [
-            SlidingKVCache(cache_size) for _ in range(self.model.config.n_blocks)
+            SlidingKVCache(cache_size) for _ in range(self.model.config.n_decoders)
         ]
         
         self.top_k = config.top_k

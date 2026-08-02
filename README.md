@@ -101,7 +101,7 @@ python train.py \
   --stream \
   --seq-len 2048 \
   --embed-dim 1024 \
-  --n-blocks 6 \
+  --n-decoders 6 \
   --vocab-size 25000 \
   --ff-dim 4096 \
   --heads 16 \
@@ -125,7 +125,7 @@ python train.py \
 * `--stream` : enables memory-efficient streaming dataset loader.
 * `--seq-len` : max sequence length.
 * `--embed-dim` : embedding dimension.
-* `--n-blocks` : number of Transformer layers.
+* `--n-decoders` : number of Transformer layers.
 * `--heads` : number of attention heads.
 * `--ff-dim` : feed-forward layer size.
 * `--lr-scheduler` : learning rate schedule (`inverse_sqrt` in pretraining).

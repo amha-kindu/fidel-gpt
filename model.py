@@ -7,7 +7,7 @@ from lora import LoRAdapter
 from cache import SlidingKVCache
 
 
-class Embedding(nn.Module):
+class EmbeddingModule(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.dropout = nn.Dropout(config.dropout)
@@ -19,7 +19,7 @@ class Embedding(nn.Module):
         return self.dropout(self.embedding(x))
 
 
-class RotaryEmbedding(nn.Module):
+class RoPeModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         d_head = config.embed_dim // config.heads
@@ -42,7 +42,7 @@ class RotaryEmbedding(nn.Module):
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
-class MultiHeadAttentionBlock(nn.Module):
+class MultiHeadAttentionModule(nn.Module):
     def __init__(self, config: ModelConfig):
         assert config.embed_dim % config.heads == 0, "EMBED_DIM is not divisible by heads"
 
@@ -107,7 +107,7 @@ class MultiHeadAttentionBlock(nn.Module):
 
         # attn_mask/is_causal are resolved once per forward pass by GPTmodel._decode
         # (identical for every block), instead of rebuilding a float bias here on
-        # every one of the n_blocks calls. SDPA accepts a boolean attn_mask directly.
+        # every one of the n_decoders calls. SDPA accepts a boolean attn_mask directly.
         output = F.scaled_dot_product_attention(
             query, key, value,
             attn_mask=attn_mask,
@@ -124,7 +124,7 @@ class MultiHeadAttentionBlock(nn.Module):
         return self.Wo(output), new_kv
     
 
-class FeedForwardBlock(nn.Module):
+class FeedForwardModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.gelu = nn.GELU()
@@ -148,8 +148,8 @@ class DecoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(config.embed_dim)
         self.norm2 = nn.LayerNorm(config.embed_dim)
 
-        self.feed_forward = FeedForwardBlock(config)
-        self.masked_multihead_attention = MultiHeadAttentionBlock(config)
+        self.feed_forward = FeedForwardModule(config)
+        self.masked_multihead_attention = MultiHeadAttentionModule(config)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -173,7 +173,7 @@ class DecoderBlock(nn.Module):
         return x, new_kv
 
 
-class Projection(nn.Module):
+class ProjectionModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
@@ -189,10 +189,10 @@ class GPTmodel(nn.Module):
         super().__init__()
         self.config: ModelConfig = config
         
-        self.embedding = Embedding(config)
-        self.projection = Projection(config)
-        self.rotary_embedding = RotaryEmbedding(config)
-        self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_blocks)])
+        self.embedding = EmbeddingModule(config)
+        self.projection = ProjectionModule(config)
+        self.rope = RoPeModule(config)
+        self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_decoders)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         if config.tie_weights:
             # Tie input embedding and output projection weights (standard for decoder-only LMs).
@@ -243,7 +243,7 @@ class GPTmodel(nn.Module):
         position_offset: int = 0,
     ) -> torch.Tensor:
         x = self._embed(x)
-        rotary_emb = self.rotary_embedding(x.shape[1], position_offset, x.device, x.dtype)
+        rotary_emb = self.rope(x.shape[1], position_offset, x.device, x.dtype)
         x = self._decode(x, mask, use_cache, kv_caches, rotary_emb)
         return self._project(x)
     
@@ -282,7 +282,7 @@ class GPTmodel(nn.Module):
             
             model.apply(init_weights)
             if config.tie_weights:
-                # apply() is children-first: Embedding gets normal(0, 0.02) then Projection
+                # apply() is children-first: EmbeddingModule gets normal(0, 0.02) then ProjectionModule
                 # overwrites the shared tensor with xavier. Restore normal init.
                 nn.init.normal_(model.embedding.embedding.weight, mean=0.0, std=0.02)
 

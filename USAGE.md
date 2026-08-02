@@ -125,7 +125,7 @@ python train.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--embed-dim` | `512` | Embedding / hidden dimension |
-| `--n-blocks` | `6` | Number of decoder blocks |
+| `--n-decoders` | `6` | Number of decoder blocks |
 | `--heads` | `8` | Number of attention heads |
 | `--vocab-size` | `25000` | Vocabulary size (must match tokenizer) |
 | `--seq-len` | `50` | Context window length |
@@ -181,7 +181,7 @@ python train.py \
   --validation-data data/pretraining/merged/val.jsonl \
   --tokenizer tokenizers/amharic-bpe-tokenizer-25k.model \
   --checkpoint checkpoints/amharic-gpt-small.pt \
-  --stream --seq-len 1024 --embed-dim 512 --n-blocks 12 \
+  --stream --seq-len 1024 --embed-dim 512 --n-decoders 12 \
   --vocab-size 25000 --ff-dim 2048 --heads 8 --dropout 0.1 \
   --init-lr 5e-4 --min-lr 5e-5 --lr-scheduler warmup_cosine \
   --epochs 4 --batch-size 32 --grad-accum-steps 8 \
@@ -207,7 +207,7 @@ python train.py \
   --validate-every 500 --vt-ratio 0.05 \
   --save-every 7000 --dl-workers 4
 ```
-Architecture flags (`--embed-dim`, `--n-blocks`, etc.) are read from the checkpoint and must not be specified.
+Architecture flags (`--embed-dim`, `--n-decoders`, etc.) are read from the checkpoint and must not be specified.
 
 **Resume**
 ```
@@ -530,7 +530,7 @@ python stats.py --file data/train.jsonl --tokenizer tokenizers/my-tokenizer.mode
 # 3. Pretrain
 python train.py --training-data data/train.jsonl --validation-data data/val.jsonl \
   --tokenizer tokenizers/my-tokenizer.model --checkpoint checkpoints/my-model.pt \
-  --stream --seq-len 1024 --embed-dim 512 --n-blocks 12 ...
+  --stream --seq-len 1024 --embed-dim 512 --n-decoders 12 ...
 
 # 4. Finetune
 python finetune.py --checkpoint checkpoints/my-model-21.00K.pt \

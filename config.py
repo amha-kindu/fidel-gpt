@@ -101,7 +101,7 @@ class Config:
 class ModelConfig(Config):
     def __init__(self, **kwargs):
         self.embed_dim: int = kwargs.get("embed_dim", 512)
-        self.n_blocks: int = kwargs.get("n_blocks", 6)
+        self.n_decoders: int = kwargs.get("n_decoders", 6)
         self.vocab_size: int = kwargs.get("vocab_size", 25000)
         self.ff_dim: int = kwargs.get("ff_dim", 2048)
         self.heads: int = kwargs.get("heads", 8)

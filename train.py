@@ -273,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, help="Number of epochs to train the model")
     parser.add_argument("--seq-len", type=int, help="Sequence length of the input")
     parser.add_argument("--embed-dim", type=int, help="Dimensionality of the model")
-    parser.add_argument("--n-blocks", type=int, help="Number of decoder blocks")
+    parser.add_argument("--n-decoders", type=int, help="Number of decoder blocks")
     parser.add_argument("--heads", type=int, help="Number of attention heads")
     parser.add_argument("--vocab-size", type=int, help="Vocabulary size to use")
     parser.add_argument("--dropout", type=float, help="Dropout probability")
