@@ -260,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("--finetuned-checkpoint", default="", type=str, help="Path to finetuning checkpoint")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
     parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple conversations per sequence to eliminate padding waste (default: enabled)")
+    parser.add_argument("--activation-ckpt", action=argparse.BooleanOptionalAction, default=None, help="Trade compute for memory by recomputing decoder activations during backward instead of storing them (default: disabled)")
     parser.add_argument("--reinit-special-tokens", default=False, action="store_true", help="Re-initialize the [USER]/[BOT]/[SYSTEM]/[CONTEXT]/[STOP] embedding rows before training; use on the first finetuning run of a checkpoint that never saw these tokens during pretraining")
 
     args = parser.parse_args()
@@ -362,6 +363,7 @@ if __name__ == "__main__":
     val_dataset = MultiTaskDataset(val_datasets)
     
     model = GPTmodel.build(model_config, weights).to(DEVICE)
+    model.activation_ckpt = training_config.activation_ckpt
 
     if args.reinit_special_tokens:
         # None of these appear in raw-text pretraining data, yet tied embedding/projection weights

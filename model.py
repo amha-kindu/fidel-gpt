@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 
 from config import *
@@ -194,6 +195,7 @@ class GPTmodel(nn.Module):
         self.rope = RoPeModule(config)
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
+        self.activation_ckpt = False
         if config.tie_weights:
             # Tie input embedding and output projection weights (standard for decoder-only LMs).
             # Both are (vocab_size, embed_dim), sharing one tensor halves that parameter block.
@@ -227,7 +229,13 @@ class GPTmodel(nn.Module):
 
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+            if self.training and self.activation_ckpt and not use_cache:
+                x, new_kv = torch.utils.checkpoint.checkpoint(
+                    decoder, x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin,
+                    use_reentrant=False,
+                )
+            else:
+                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x

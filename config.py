@@ -154,6 +154,7 @@ class TrainingConfig(Config):
         self.vt_ratio: float = kwargs.get("vt_ratio", 1.0)
         self.pack_sequences: bool = kwargs.get("pack_sequences", True)
         self.stream: bool = kwargs.get("stream", False)
+        self.activation_ckpt: bool = kwargs.get("activation_ckpt", False)
         
         # training_data/validation_data may be comma-separated lists of files
         for data in (self.training_data, self.validation_data):

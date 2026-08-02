@@ -317,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--dl-workers", type=int, help="Number of subprocesses to use for data loading")
     parser.add_argument("--stream", default=False, action="store_true", help="Stream data from disk")
     parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple documents per sequence to eliminate padding waste (default: enabled)")
+    parser.add_argument("--activation-ckpt", action=argparse.BooleanOptionalAction, default=None, help="Trade compute for memory by recomputing decoder activations during backward instead of storing them (default: disabled)")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()
@@ -397,7 +398,8 @@ if __name__ == "__main__":
     training_config.steps_per_epoch = int(training_config.batches_per_epoch / training_config.grad_accum_steps)
     
     model = GPTmodel.build(model_config, weights).to(DEVICE)
-    
+    model.activation_ckpt = training_config.activation_ckpt
+
     if GLOBAL_RANK == COORDINATOR_RANK:
         numerical_configs = {k: v for k, v in training_config.to_dict().items() if not isinstance(v, str)}
         LOGGER.info(f"Total training samples: {len(train_dataset)}")
