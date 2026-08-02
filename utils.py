@@ -130,7 +130,7 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
             if name.startswith("embedding"):
                 key = "Embedding"
             elif name.startswith("decoders."):
-                key = f"Layer{name.split('.')[1]}"
+                key = f"Decoder{name.split('.')[1]}"
             elif name.startswith("projection"):
                 key = "Projection"
             else:
@@ -150,7 +150,7 @@ def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tens
             if name.startswith("embedding"):
                 key = "Embedding"
             elif name.startswith("decoders."):
-                key = f"Layer{name.split('.')[1]}"
+                key = f"Decoder{name.split('.')[1]}"
             elif name.startswith("projection"):
                 key = "Projection"
             else:

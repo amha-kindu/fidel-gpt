@@ -35,11 +35,11 @@ class RoPeModule(nn.Module):
         positions = torch.arange(offset, offset + seq_len, device=device, dtype=self.inv_freq.dtype)
 
         # (SEQ_LEN, d_head//2)
-        freqs = torch.outer(positions, self.inv_freq)
+        phase_angles = torch.outer(positions, self.inv_freq)
 
         # (SEQ_LEN, d_head)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype), emb.sin().to(dtype)
+        phase_angles = torch.cat((phase_angles, phase_angles), dim=-1)
+        return phase_angles.cos().to(dtype), phase_angles.sin().to(dtype)
 
 
 class MultiHeadAttentionModule(nn.Module):
@@ -77,15 +77,15 @@ class MultiHeadAttentionModule(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
         key: torch.Tensor = self.Wk(x)
         query: torch.Tensor = self.Wq(x)
         value: torch.Tensor = self.Wv(x)
 
-        if rotary_emb is not None:
-            cos, sin = rotary_emb
+        if rope_cos_sin is not None:
+            cos, sin = rope_cos_sin
             query = self._apply_rotary(query, cos, sin)
             key = self._apply_rotary(key, cos, sin)
 
@@ -140,7 +140,7 @@ class FeedForwardModule(nn.Module):
         )
 
 
-class DecoderBlock(nn.Module):
+class DecoderModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.post_norm = config.post_norm
@@ -160,14 +160,14 @@ class DecoderBlock(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
+            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -192,7 +192,7 @@ class GPTmodel(nn.Module):
         self.embedding = EmbeddingModule(config)
         self.projection = ProjectionModule(config)
         self.rope = RoPeModule(config)
-        self.decoders = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_decoders)])
+        self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         if config.tie_weights:
             # Tie input embedding and output projection weights (standard for decoder-only LMs).
@@ -217,7 +217,7 @@ class GPTmodel(nn.Module):
         mask: torch.Tensor,
         use_cache: bool = False,
         kv_caches: list[SlidingKVCache] | None = None,
-        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # During decode (single new token against full KV cache), Q is shorter than K.
         # The cache already enforces causal ordering, so no mask is needed.
@@ -227,7 +227,7 @@ class GPTmodel(nn.Module):
 
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
-            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rotary_emb)
+            x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x
@@ -243,8 +243,8 @@ class GPTmodel(nn.Module):
         position_offset: int = 0,
     ) -> torch.Tensor:
         x = self._embed(x)
-        rotary_emb = self.rope(x.shape[1], position_offset, x.device, x.dtype)
-        x = self._decode(x, mask, use_cache, kv_caches, rotary_emb)
+        rope_cos_sin = self.rope(x.shape[1], position_offset, x.device, x.dtype)
+        x = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
         return self._project(x)
     
 
