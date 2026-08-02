@@ -6,12 +6,11 @@ All scripts are run from the project root. Checkpoints are saved to the `checkpo
 
 ## Table of Contents
 1. [train_tokenizer.py — Train a tokenizer](#1-train_tokenizerpy)
-2. [stats.py — Analyse dataset token lengths](#2-statspy)
-3. [train.py — Pretrain a model](#3-trainpy)
-4. [finetune.py — Finetune a pretrained model](#4-finetunepy)
-5. [package_model.py — Package a checkpoint for deployment](#5-package_modelpy)
-6. [inference.py — Text-completion REPL](#6-inferencepy)
-7. [chatbot.py — Conversational chatbot REPL](#7-chatbotpy)
+2. [train.py — Pretrain a model](#2-trainpy)
+3. [finetune.py — Finetune a pretrained model](#3-finetunepy)
+4. [package_model.py — Package a checkpoint for deployment](#4-package_modelpy)
+5. [inference.py — Text-completion REPL](#5-inferencepy)
+6. [chatbot.py — Conversational chatbot REPL](#6-chatbotpy)
 
 ---
 
@@ -47,40 +46,7 @@ python train_tokenizer.py \
 
 ---
 
-## 2. `stats.py`
-
-Analyses the token-length distribution of a JSONL file and writes a TensorBoard histogram and a PNG plot.
-
-```
-python stats.py \
-  --file <dataset.jsonl> \
-  --tokenizer <tokenizer.model> \
-  [--max-len 256] \
-  [--output-dir ./token_stats] \
-  [--max-samples N]
-```
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--file` | Yes | — | Path to the JSONL dataset |
-| `--tokenizer` | Yes | — | Path to the SentencePiece `.model` file |
-| `--max-len` | No | `256` | Sequence length threshold (truncation line on the plot) |
-| `--output-dir` | No | `./token_stats` | Directory for TensorBoard logs and PNG output |
-| `--max-samples` | No | all | Process only the first N samples |
-
-**Example**
-```
-python stats.py \
-  --file data/pretraining/merged/train.jsonl \
-  --tokenizer tokenizers/amharic-bpe-tokenizer-25k.model \
-  --max-len 1024
-
-tensorboard --logdir=token_stats
-```
-
----
-
-## 3. `train.py`
+## 2. `train.py`
 
 Pretrains a GPT model from scratch, or from weight initialisation taken from an existing checkpoint.
 
@@ -226,7 +192,7 @@ torchrun --nproc-per-node=4 train.py --is-distributed \
 
 ---
 
-## 4. `finetune.py`
+## 3. `finetune.py`
 
 Finetunes a pretrained model on instruction/conversation data. Supports full-parameter finetuning, selective layer finetuning, and LoRA.
 
@@ -326,7 +292,7 @@ python finetune.py --resume \
 
 ---
 
-## 5. `package_model.py`
+## 4. `package_model.py`
 
 Packages a trained checkpoint into a clean, self-contained deployment directory. Strips optimizer state and training metadata. Copies `model.py`, `lora.py` (if LoRA), and a trimmed `config.py` containing `ModelConfig` & `ModelWithLoRAConfig`.
 
@@ -436,7 +402,7 @@ python package_model.py \
 
 ---
 
-## 6. `inference.py`
+## 5. `inference.py`
 
 Interactive text-completion REPL using a base pretrained model.
 
@@ -472,7 +438,7 @@ Type `exit` to quit.
 
 ---
 
-## 7. `chatbot.py`
+## 6. `chatbot.py`
 
 Multi-turn conversational chatbot using a finetuned (or LoRA-adapted) model. Maintains conversation history across turns and applies a system prompt.
 
@@ -524,27 +490,24 @@ Type `exit` to quit.
 # 1. Train a tokenizer
 python train_tokenizer.py --data data/corpus.jsonl --model-prefix tokenizers/my-tokenizer --vocab-size 25000
 
-# 2. Check the data fits the sequence length
-python stats.py --file data/train.jsonl --tokenizer tokenizers/my-tokenizer.model --max-len 1024
-
-# 3. Pretrain
+# 2. Pretrain
 python train.py --training-data data/train.jsonl --validation-data data/val.jsonl \
   --tokenizer tokenizers/my-tokenizer.model --checkpoint checkpoints/my-model.pt \
   --stream --seq-len 1024 --embed-dim 512 --n-decoders 12 ...
 
-# 4. Finetune
+# 3. Finetune
 python finetune.py --checkpoint checkpoints/my-model-21.00K.pt \
   --tokenizer tokenizers/my-tokenizer.model \
   --training-data data/finetune-train.jsonl --validation-data data/finetune-val.jsonl \
   --lora --lora-targets configs/lora_targets.json ...
 
-# 5. Chat
+# 4. Chat
 python chatbot.py \
   --checkpoint checkpoints/my-model-21.00K.pt \
   --lora-checkpoint checkpoints/my-model-21.00K-lora-adapters-16R-32SF-3.50K.pt \
   --tokenizer tokenizers/my-tokenizer.model
 
-# 6. Package for deployment
+# 5. Package for deployment
 python package_model.py \
   --checkpoint checkpoints/my-model.pt \
   --model-name my-model \

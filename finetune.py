@@ -16,7 +16,8 @@ from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from torch.utils.data import RandomSampler
 from dataset import FineTuningDataset, MultiTaskDataset, PackedFineTuningDataset
-from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params, validate
+from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params
+from train import validate
 
 
 def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTaskDataset, val_dataset: MultiTaskDataset, training_state: TrainingState | None = None) -> None:

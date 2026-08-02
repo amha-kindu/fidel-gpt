@@ -1,11 +1,8 @@
 import re
 import torch
-import itertools
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 from config import *
-from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 
 
@@ -160,35 +157,6 @@ def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tens
             tb_logger.log_scalar(f"WeightNorm/{key}", sq ** 0.5, global_step)
 
 
-@torch.no_grad()
-def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntropyLoss, max_batches: int | None = None):
-    batches = 0
-    val_loss = 0.0
-    for batch in itertools.islice(data_loader, max_batches):
-        # (N_BATCHES, SEQ_LEN)
-        decoder_input: torch.Tensor = batch[0].to(DEVICE, non_blocking=True)
-        label: torch.Tensor         = batch[1].to(DEVICE, non_blocking=True)
-
-        # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
-        decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
-        
-        with torch.autocast(DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
-            # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
-            logits: torch.Tensor = model(decoder_input, decoder_mask)
-
-            loss: torch.Tensor = loss_func(
-                # (N_BATCHES, SEQ_LEN, VOCAB_SIZE) --> (N_BATCHES * SEQ_LEN, VOCAB_SIZE)
-                logits.view(-1, model.config.vocab_size),
-
-                # (N_BATCHES, SEQ_LEN) --> (N_BATCHES * SEQ_LEN, )
-                label.view(-1)
-            ) 
-
-        val_loss += loss.item()
-        batches += 1
-
-    return val_loss / batches if batches > 0 else 0.0
-
 @_non_blocking()
 def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, config: TrainingConfig, training_state: TrainingState):
     pattern = re.compile(r"(-(?:\d+\.\d{2})K)?\.pt$")
@@ -210,7 +178,7 @@ def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, 
     )
 
 
-def set_trainable_params(model: GPTmodel, trainable_modules: dict, for_inference: bool = False):
+def set_trainable_params(model: nn.Module, trainable_modules: dict, for_inference: bool = False):
     if trainable_modules is None and not for_inference:
         return  # leave all parameters trainable (full-model finetuning)
     trainables_params = set()

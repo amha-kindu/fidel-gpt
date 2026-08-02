@@ -4,6 +4,7 @@ import math
 import time
 import torch
 import argparse
+import itertools
 import contextlib
 import torch.nn as nn
 from tqdm import tqdm
@@ -13,14 +14,14 @@ import torch.distributed as dist
 from torch.nn.attention import SDPBackend
 
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DistributedSampler, RandomSampler
+from torch.utils.data import DistributedSampler, RandomSampler, DataLoader
 
 from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
-from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint, validate
+from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint
 
 
 def data_size(paths: str) -> int:
@@ -242,6 +243,36 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     if is_distributed:
         dist.barrier()
     tb_logger.close()
+
+
+@torch.no_grad()
+def validate(model: GPTmodel, data_loader: DataLoader, loss_func: nn.CrossEntropyLoss, max_batches: int | None = None):
+    batches = 0
+    val_loss = 0.0
+    for batch in itertools.islice(data_loader, max_batches):
+        # (N_BATCHES, SEQ_LEN)
+        decoder_input: torch.Tensor  = batch[0].to(DEVICE, non_blocking=True)
+        label: torch.Tensor          = batch[1].to(DEVICE, non_blocking=True)
+        
+        # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
+        decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
+                
+        with torch.autocast(DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
+            # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
+            logits: torch.Tensor = model(decoder_input, decoder_mask)
+
+            loss: torch.Tensor = loss_func(
+                # (N_BATCHES, SEQ_LEN, VOCAB_SIZE) --> (N_BATCHES * SEQ_LEN, VOCAB_SIZE)
+                logits.view(-1, model.config.vocab_size),
+
+                # (N_BATCHES, SEQ_LEN) --> (N_BATCHES * SEQ_LEN, )
+                label.view(-1)
+            ) 
+
+        val_loss += loss.item()
+        batches += 1
+
+    return val_loss / batches if batches > 0 else 0.0
 
 
 if __name__ == "__main__":
