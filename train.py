@@ -21,7 +21,7 @@ from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
-from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint
+from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, log_riemannian_metrics, RiemannianMetricProbe, save_checkpoint
 
 
 def data_size(paths: str) -> int:
@@ -67,6 +67,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     initial_epoch = 0
     training_loss = 0
     val_loss = 0
+    riemannian_probe = None
     should_early_stop = False
     if training_state:
         global_step = training_state.global_step + 1
@@ -114,6 +115,12 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
             # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
             decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
 
+            update_weights = ((i + 1) % config.grad_accum_steps) == 0
+            
+            if GLOBAL_RANK == COORDINATOR_RANK and update_weights and global_step % 100 == 0 \
+                and getattr(base_model.config, "riemannian", False):
+                riemannian_probe = RiemannianMetricProbe(base_model)
+
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
                 logits: torch.Tensor = model(decoder_input, decoder_mask)
@@ -126,10 +133,9 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     # (N_BATCHES, SEQ_LEN) --> (N_BATCHES * SEQ_LEN, )
                     label.view(-1)
                 )
-            
+
             training_loss += batch_loss.detach().item() / config.grad_accum_steps
-            update_weights = ((i + 1) % config.grad_accum_steps) == 0
-            
+
             avg_loss = batch_loss / config.grad_accum_steps
             # Skip gradient sync on accumulation steps; only sync on the last step.
             sync_ctx = model.no_sync() if is_distributed and not update_weights else contextlib.nullcontext()
@@ -144,9 +150,16 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                             weight_snapshot[name] = param.detach().cpu()
                             if param.grad is not None:
                                 grad_snapshot[name] = param.grad.detach().cpu()
-                        
+
                         log_gradients(tb_logger, grad_snapshot, global_step)
                         log_weight_norms(tb_logger, weight_snapshot, global_step)
+                    
+                    if riemannian_probe is not None:
+                        riemannian_probe.capture_grads()
+                        log_riemannian_metrics(tb_logger, riemannian_probe.stats, global_step)
+                        riemannian_probe.close()
+                        riemannian_probe = None
+                    
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     scaler.step(optimizer)
                     scaler.update()
@@ -162,9 +175,16 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                             weight_snapshot[name] = param.detach().cpu()
                             if param.grad is not None:
                                 grad_snapshot[name] = param.grad.detach().cpu()
-                        
+
                         log_gradients(tb_logger, grad_snapshot, global_step)
                         log_weight_norms(tb_logger, weight_snapshot, global_step)
+                    
+                    if riemannian_probe is not None:
+                        riemannian_probe.capture_grads()
+                        log_riemannian_metrics(tb_logger, riemannian_probe.stats, global_step)
+                        riemannian_probe.close()
+                        riemannian_probe = None
+                    
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
                     optimizer.step()
                     scheduler.step()
@@ -316,6 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--post-norm", action="store_true", help="Apply layer normalization after each residual block (post-norm Transformer style)")
+    parser.add_argument("--riemannian", action="store_true", help="Apply a learnable per-head Riemannian metric to the attention query (default: disabled)")
     parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=None, help="Tie embedding and projection weights (default: enabled)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")

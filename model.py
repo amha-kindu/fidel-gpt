@@ -38,6 +38,36 @@ class RoPeModule(nn.Module):
         return phase_angles
 
 
+class RiemannianMetric(nn.Module):
+    def __init__(self, head_dim: int, heads: int, epsilon: float = 1e-5):
+        super().__init__()
+        self.head_dim = head_dim
+        self.epsilon = epsilon
+        n_params = head_dim * (head_dim + 1) // 2
+
+        self.weight = nn.Parameter(torch.empty(heads, head_dim, n_params))
+        nn.init.xavier_uniform_(self.weight)
+
+        tril_rows, tril_cols = torch.tril_indices(head_dim, head_dim)
+        self.register_buffer("tril_rows", tril_rows, persistent=False)
+        self.register_buffer("tril_cols", tril_cols, persistent=False)
+        self.register_buffer("diag_idx", torch.arange(head_dim), persistent=False)
+
+    # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+    # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        packed = torch.tanh(
+            torch.einsum("nhsd,hdp->nhsp", x, self.weight)
+        )
+
+        L = packed.new_zeros(*packed.shape[:-1], self.head_dim, self.head_dim)
+        L[..., self.tril_rows, self.tril_cols] = packed
+        L[..., self.diag_idx, self.diag_idx] = (F.softplus(L[..., self.diag_idx, self.diag_idx]) + self.epsilon).to(L.dtype)
+
+        u = torch.einsum("...i,...ij->...j", x, L)
+        return torch.einsum("...i,...ji->...j", u, L)
+
+
 class MultiHeadAttentionModule(nn.Module):
     def __init__(self, config: ModelConfig):
         assert config.embed_dim % config.heads == 0, "EMBED_DIM is not divisible by heads"
@@ -49,6 +79,11 @@ class MultiHeadAttentionModule(nn.Module):
         self.dropout_p: float = config.dropout
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        
+        self.riemannian_metric = (
+            RiemannianMetric(self.d_head, self.heads) if config.riemannian else None
+        )
+        
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
@@ -108,6 +143,9 @@ class MultiHeadAttentionModule(nn.Module):
             key_past, value_past = kv_cache
             key = torch.cat([key_past, key], dim=2)
             value = torch.cat([value_past, value], dim=2)
+
+        if self.riemannian_metric is not None:
+            query = self.riemannian_metric(query)
 
         # attn_mask/is_causal are resolved once per forward pass by GPTmodel._decode
         # (identical for every block), instead of rebuilding a float bias here on

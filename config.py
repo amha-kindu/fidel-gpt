@@ -109,6 +109,7 @@ class ModelConfig(Config):
         self.seq_len: int = kwargs.get("seq_len", 50)
         self.post_norm: bool = kwargs.get("post_norm", False)
         self.tie_weights: bool = kwargs.get("tie_weights", True)
+        self.riemannian: bool = kwargs.get("riemannian", False)
 
 
 class ModelWithLoRAConfig(ModelConfig):

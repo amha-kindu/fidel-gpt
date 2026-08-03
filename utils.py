@@ -1,6 +1,7 @@
 import re
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import *
 from tensorboard_logger import TensorboardLogger
@@ -137,6 +138,61 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
         tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
         for key, sq in component_sq.items():
             tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
+
+
+class RiemannianMetricProbe:
+    
+    def __init__(self, model):
+        self.stats = []
+        self.handles = [
+            dec.masked_multihead_attention.riemannian_metric.register_forward_hook(self._make_hook(i))
+            for i, dec in enumerate(model.decoders)
+            if dec.masked_multihead_attention.riemannian_metric is not None
+        ]
+
+    def _make_hook(self, layer_idx: int):
+        def hook(module, inp, out):
+            with torch.no_grad():
+                x = inp[0].detach().float()
+                raw = torch.einsum("nhsd,hdp->nhsp", x, module.weight.detach().float())
+                diag_mask = module.tril_rows == module.tril_cols
+                diag = F.softplus(torch.tanh(raw)[..., diag_mask])
+                damping = out.detach().float().norm(dim=-1).mean() / (x.norm(dim=-1).mean() + 1e-9)
+                self.stats.append({
+                    "layer": layer_idx,
+                    "module": module,
+                    "damping": damping.item(),
+                    "saturation": (raw.abs() > 2.0).float().mean().item(),
+                    "saturation_max": (raw.abs() > 2.0).float().max().item(),
+                    "diag_min": diag.min().item(),
+                    "diag_max": diag.max().item(),
+                    "diag_mean": diag.mean().item(),
+                })
+        return hook
+
+    def capture_grads(self):
+        for s in self.stats:
+            grad = s["module"].weight.grad
+            s["grad_norm"] = grad.detach().float().norm().item() if grad is not None else 0.0
+            del s["module"]
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+
+@_non_blocking()
+def log_riemannian_metrics(tb_logger: TensorboardLogger, stats: list[dict], global_step: int):
+    if not stats:
+        return
+    with torch.no_grad():
+        for s in stats:
+            tag = f"Decoder{s['layer']}"
+            tb_logger.log_scalar(f"Riemannian/{tag}/Damping", s["damping"], global_step)
+            tb_logger.log_scalars(f"Riemannian/{tag}/Saturation", {"Mean": s["saturation"], "Max": s["saturation_max"]}, global_step)
+            tb_logger.log_scalars(f"Riemannian/{tag}/Diag", {"Min": s["diag_min"], "Mean": s["diag_mean"], "Max": s["diag_max"]}, global_step)
+            tb_logger.log_scalar(f"Riemannian/{tag}/Gradient", s["grad_norm"], global_step)
+
 
 @_non_blocking()
 def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tensor], global_step: int):
