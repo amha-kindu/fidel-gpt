@@ -7,6 +7,12 @@ from config import *
 from lora import LoRAdapter
 from cache import SlidingKVCache
 
+try:
+    from kernels.riemannian_metric import RiemannianMetricKernel
+    _RIEMANNIAN_KERNEL_AVAILABLE = True
+except ImportError:
+    _RIEMANNIAN_KERNEL_AVAILABLE = False
+
 
 class EmbeddingModule(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
@@ -39,10 +45,11 @@ class RoPeModule(nn.Module):
 
 
 class RiemannianMetric(nn.Module):
-    def __init__(self, head_dim: int, heads: int, epsilon: float = 1e-5):
+    def __init__(self, head_dim: int, heads: int, epsilon: float = 1e-5, fused: bool = False):
         super().__init__()
-        self.head_dim = head_dim
+        self.fused = fused
         self.epsilon = epsilon
+        self.head_dim = head_dim
         n_params = head_dim * (head_dim + 1) // 2
 
         self.weight = nn.Parameter(torch.empty(heads, head_dim, n_params))
@@ -56,6 +63,9 @@ class RiemannianMetric(nn.Module):
     # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused:
+            return RiemannianMetricKernel.apply(x, self.weight, self.epsilon)
+        
         packed = torch.tanh(
             torch.einsum("nhsd,hdp->nhsp", x, self.weight)
         )
@@ -80,9 +90,10 @@ class MultiHeadAttentionModule(nn.Module):
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
-        self.riemannian_metric = (
-            RiemannianMetric(self.d_head, self.heads) if config.riemannian else None
-        )
+        self.riemannian_metric = None
+        if config.riemannian:
+            fused = _RIEMANNIAN_KERNEL_AVAILABLE and torch.cuda.is_available()
+            self.riemannian_metric = RiemannianMetric(self.d_head, self.heads, fused=fused)
         
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
