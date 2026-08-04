@@ -26,21 +26,16 @@ class RoPeModule(nn.Module):
         d_head = config.embed_dim // config.heads
         assert d_head % 2 == 0, "RoPE requires an even head dimension"
 
-        # (d_head//2,)
+        # (HEAD_DIM // 2,)
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, d_head, 2, dtype=torch.float) / d_head))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    # Returns cos/sin of shape (SEQ_LEN, d_head), covering absolute positions
-    # [offset, offset + seq_len).
-    def forward(self, seq_len: int, offset: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, seq_len: int, offset: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         positions = torch.arange(offset, offset + seq_len, device=device, dtype=self.inv_freq.dtype)
 
-        # (SEQ_LEN, d_head//2)
+        # (SEQ_LEN, HEAD_DIM // 2)
         phase_angles = torch.outer(positions, self.inv_freq)
-
-        # (SEQ_LEN, d_head)
-        phase_angles = torch.cat((phase_angles, phase_angles), dim=-1)
-        return phase_angles.cos().to(dtype), phase_angles.sin().to(dtype)
+        return phase_angles
 
 
 class MultiHeadAttentionModule(nn.Module):
@@ -55,17 +50,28 @@ class MultiHeadAttentionModule(nn.Module):
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
-    # x: (N_BATCHES, SEQ_LEN, EMBED_DIM); cos/sin: (SEQ_LEN, d_head)
-    # RoPE rotates within each head's d_head slice, so the head boundary must be
-    # exposed, but only via a free reshape (heads are already contiguous d_head
-    # blocks within EMBED_DIM) -- no transpose needed for the rotation itself.
-    def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        n, s, e = x.shape
-        x = x.view(n, s, self.heads, -1)
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        x1, x2 = x.chunk(2, dim=-1)
-        x_rotated = torch.cat((-x2, x1), dim=-1)
-        return (x * cos + x_rotated * sin).view(n, s, e)
+    # Input shape: x -> (N_BATCHES, SEQ_LEN, 2*EMBED_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
+    # Output shape: (N_BATCHES, SEQ_LEN, 2*EMBED_DIM)
+    def _apply_rotary(self, x: torch.Tensor, phase_angles: torch.Tensor):
+        # (SEQ_LEN, 1, HEAD_DIM // 2)
+        cos = phase_angles.cos().to(x.dtype).unsqueeze(1)
+        sin = phase_angles.sin().to(x.dtype).unsqueeze(1)
+        
+        # (N_BATCHES, SEQ_LEN, HEADS, 2*HEAD_DIM)
+        x = x.view(x.shape[0], x.shape[1], self.heads, -1)
+
+        # (N_BATCHES, SEQ_LEN, HEADS, 2*HEAD_DIM) -> tuple[(N_BATCHES, SEQ_LEN, HEADS, HEAD_DIM // 2), ...]
+        x1, x2, x3, x4 = x.chunk(4, dim=-1)
+
+        return torch.cat(
+            [
+                x1 * cos - x2 * sin,
+                x2 * cos + x1 * sin,
+                x3 * cos - x4 * sin,
+                x4 * cos + x3 * sin,
+            ],
+            dim=-1,
+        ).view(x.shape[0], x.shape[1], -1)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -76,20 +82,18 @@ class MultiHeadAttentionModule(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_angles: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM)
         qkv: torch.Tensor = self.Wqkv(x)
         
-        # (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
-        query: torch.Tensor = qkv[..., : x.shape[-1]]
-        key: torch.Tensor = qkv[..., x.shape[-1]: 2*x.shape[-1]]
+        qk: torch.Tensor = qkv[..., : 2*x.shape[-1]]
+        if phase_angles is not None:
+            qk = self._apply_rotary(qk, phase_angles)
+        
+        query: torch.Tensor = qk[..., :x.shape[-1]]
+        key: torch.Tensor = qk[..., x.shape[-1]:]
         value: torch.Tensor = qkv[..., 2*x.shape[-1]:]
-
-        if rope_cos_sin is not None:
-            cos, sin = rope_cos_sin
-            query = self._apply_rotary(query, cos, sin)
-            key = self._apply_rotary(key, cos, sin)
 
         # Cache accumulates past tokens; the model only returns the new KV pairs.
         # Concatenation of past+new is the cache's responsibility. Keys are cached
@@ -162,14 +166,14 @@ class DecoderModule(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_angles: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, phase_angles)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, phase_angles)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -220,7 +224,7 @@ class GPTmodel(nn.Module):
         mask: torch.Tensor,
         use_cache: bool = False,
         kv_caches: list[SlidingKVCache] | None = None,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        phase_angles: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # During decode (single new token against full KV cache), Q is shorter than K.
         # The cache already enforces causal ordering, so no mask is needed.
@@ -232,11 +236,11 @@ class GPTmodel(nn.Module):
             kv_cache = None if not use_cache else kv_caches[i].get()
             if self.training and self.activation_ckpt and not use_cache:
                 x, new_kv = torch.utils.checkpoint.checkpoint(
-                    decoder, x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin,
+                    decoder, x, attn_mask, is_causal, use_cache, kv_cache, phase_angles,
                     use_reentrant=False,
                 )
             else:
-                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, rope_cos_sin)
+                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, phase_angles)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x
@@ -252,8 +256,8 @@ class GPTmodel(nn.Module):
         position_offset: int = 0,
     ) -> torch.Tensor:
         x = self._embed(x)
-        rope_cos_sin = self.rope(x.shape[1], position_offset, x.device, x.dtype)
-        x = self._decode(x, mask, use_cache, kv_caches, rope_cos_sin)
+        phase_angles = self.rope(x.shape[1], position_offset, x.device, x.dtype)
+        x = self._decode(x, mask, use_cache, kv_caches, phase_angles)
         return self._project(x)
     
 
