@@ -141,7 +141,8 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
 
 
 class RiemannianMetricProbe:
-    
+    HISTOGRAM_MAX_SAMPLES = 50_000
+
     def __init__(self, model):
         self.stats = []
         self.handles = [
@@ -150,23 +151,31 @@ class RiemannianMetricProbe:
             if dec.masked_multihead_attention.riemannian_metric is not None
         ]
 
+    @staticmethod
+    def _subsample(t: torch.Tensor, max_n: int) -> torch.Tensor:
+        t = t.flatten()
+        if t.numel() > max_n:
+            idx = torch.randperm(t.numel(), device=t.device)[:max_n]
+            t = t[idx]
+        
+        return t.cpu()
+
     def _make_hook(self, layer_idx: int):
         def hook(module, inp, out):
             with torch.no_grad():
                 x = inp[0].detach().float()
                 raw = torch.einsum("nhsd,hdp->nhsp", x, module.weight.detach().float())
+                packed = torch.tanh(raw)
                 diag_mask = module.tril_rows == module.tril_cols
-                diag = F.softplus(torch.tanh(raw)[..., diag_mask])
+                diag = F.softplus(packed[..., diag_mask]) + module.epsilon
+                off_diag = packed[..., ~diag_mask]
                 damping = out.detach().float().norm(dim=-1).mean() / (x.norm(dim=-1).mean() + 1e-9)
                 self.stats.append({
                     "layer": layer_idx,
                     "module": module,
                     "damping": damping.item(),
-                    "saturation": (raw.abs() > 2.0).float().mean().item(),
-                    "saturation_max": (raw.abs() > 2.0).float().max().item(),
-                    "diag_min": diag.min().item(),
-                    "diag_max": diag.max().item(),
-                    "diag_mean": diag.mean().item(),
+                    "diag": self._subsample(diag, self.HISTOGRAM_MAX_SAMPLES),
+                    "off_diag": self._subsample(off_diag, self.HISTOGRAM_MAX_SAMPLES),
                 })
         return hook
 
@@ -189,8 +198,8 @@ def log_riemannian_metrics(tb_logger: TensorboardLogger, stats: list[dict], glob
         for s in stats:
             tag = f"Decoder{s['layer']}"
             tb_logger.log_scalar(f"Riemannian/{tag}/Damping", s["damping"], global_step)
-            tb_logger.log_scalars(f"Riemannian/{tag}/Saturation", {"Mean": s["saturation"], "Max": s["saturation_max"]}, global_step)
-            tb_logger.log_scalars(f"Riemannian/{tag}/Diag", {"Min": s["diag_min"], "Mean": s["diag_mean"], "Max": s["diag_max"]}, global_step)
+            tb_logger.log_histogram(f"Riemannian/{tag}/Diag", s["diag"], global_step)
+            tb_logger.log_histogram(f"Riemannian/{tag}/OffDiag", s["off_diag"], global_step)
             tb_logger.log_scalar(f"Riemannian/{tag}/Gradient", s["grad_norm"], global_step)
 
 
