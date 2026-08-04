@@ -43,6 +43,12 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     if is_distributed:
         model = DistributedDataParallel(model, device_ids=[LOCAL_RANK])
 
+    if config.compile:
+        if DEVICE.type != "cuda" and GLOBAL_RANK == COORDINATOR_RANK:
+            LOGGER.warning(f"--compile is enabled but DEVICE is '{DEVICE.type}', not 'cuda' -- torch.compile's Triton/Inductor backend is far less mature off CUDA (esp. on Windows); expect possible failures or no speedup.")
+        LOGGER.info(f"Compiling model with torch.compile(mode='{config.compile_mode}')...")
+        model = torch.compile(model, mode=config.compile_mode)
+
     scaler = torch.GradScaler(init_scale=config.grad_scaler_init, device=DEVICE.type) if MIXED_PRECISION_ENABLED else None
 
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
@@ -318,6 +324,8 @@ if __name__ == "__main__":
     parser.add_argument("--stream", default=False, action="store_true", help="Stream data from disk")
     parser.add_argument("--pack-sequences", action=argparse.BooleanOptionalAction, default=None, help="Pack multiple documents per sequence to eliminate padding waste (default: enabled)")
     parser.add_argument("--activation-ckpt", action=argparse.BooleanOptionalAction, default=None, help="Trade compute for memory by recomputing decoder activations during backward instead of storing them (default: disabled)")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None, help="Compile the model with torch.compile for faster training (default: disabled)")
+    parser.add_argument("--compile-mode", type=str, default=None, choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], help="torch.compile mode to use when --compile is set (default: 'default')")
     parser.add_argument("--sdp-kernel", default=None, type=str, choices=[SDPBackend.MATH.name, SDPBackend.EFFICIENT_ATTENTION.name, SDPBackend.CUDNN_ATTENTION.name, SDPBackend.FLASH_ATTENTION.name], help="SDPA kernel to use for attention calculation")
 
     args = parser.parse_args()

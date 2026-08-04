@@ -155,6 +155,8 @@ class TrainingConfig(Config):
         self.pack_sequences: bool = kwargs.get("pack_sequences", True)
         self.stream: bool = kwargs.get("stream", False)
         self.activation_ckpt: bool = kwargs.get("activation_ckpt", False)
+        self.compile: bool = kwargs.get("compile", False)
+        self.compile_mode: str = kwargs.get("compile_mode", "default")
         
         # training_data/validation_data may be comma-separated lists of files
         for data in (self.training_data, self.validation_data):

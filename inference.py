@@ -171,6 +171,8 @@ if __name__ == '__main__':
     parser.add_argument("--kv-cache-size", type=int, default=DEFAULT_INFERENCE_CONFIG.kv_cache_size, help="KV cache size (sliding window). 0 or unset defaults to the model's full context window")
     parser.add_argument("--checkpoint", type=str, required=True, help="File path to load saved checkpoint")
     parser.add_argument("--tokenizer", type=str, required=True, help="File path to load SentencePiece tokenizer")
+    parser.add_argument("--compile", action="store_true", help="Compile the model with torch.compile for faster inference")
+    parser.add_argument("--compile-mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], help="torch.compile mode to use when --compile is set")
 
     args = parser.parse_args()
 
@@ -189,6 +191,13 @@ if __name__ == '__main__':
     model = GPTmodel.build(model_config, checkpoint["weights"]).to(DEVICE)
 
     model.eval()
+    if args.compile:
+        if DEVICE.type != "cuda":
+            LOGGER.warning(f"--compile is enabled but DEVICE is '{DEVICE.type}', not 'cuda' -- torch.compile's Triton/Inductor backend is far less mature off CUDA (esp. on Windows); expect possible failures or no speedup.")
+        LOGGER.info(f"Compiling model with torch.compile(mode='{args.compile_mode}')...")
+        
+        model = torch.compile(model, mode=args.compile_mode, dynamic=True)
+
     total_params = sum(p.numel() for p in model.parameters())
     LOGGER.info(f"Device: {DEVICE}")
     LOGGER.info(f"Total Parameters: {total_params}")
