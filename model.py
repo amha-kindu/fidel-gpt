@@ -52,9 +52,7 @@ class MultiHeadAttentionModule(nn.Module):
         self.d_head: int = config.embed_dim // config.heads
 
         self.dropout_p: float = config.dropout
-        self.Wq: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.Wk: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.Wv: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         
     # x: (N_BATCHES, SEQ_LEN, EMBED_DIM); cos/sin: (SEQ_LEN, d_head)
@@ -80,10 +78,13 @@ class MultiHeadAttentionModule(nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
-        key: torch.Tensor = self.Wk(x)
-        query: torch.Tensor = self.Wq(x)
-        value: torch.Tensor = self.Wv(x)
+        # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM)
+        qkv: torch.Tensor = self.Wqkv(x)
+        
+        # (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, EMBED_DIM)
+        query: torch.Tensor = qkv[..., : x.shape[-1]]
+        key: torch.Tensor = qkv[..., x.shape[-1]: 2*x.shape[-1]]
+        value: torch.Tensor = qkv[..., 2*x.shape[-1]:]
 
         if rope_cos_sin is not None:
             cos, sin = rope_cos_sin

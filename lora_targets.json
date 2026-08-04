@@ -3,9 +3,7 @@
         "type": "ModuleList",
         "indices": [3, 4, 5],
         "submodules": [
-            "masked_multihead_attention.Wk",
-            "masked_multihead_attention.Wq",
-            "masked_multihead_attention.Wv",
+            "masked_multihead_attention.Wqkv",
             "masked_multihead_attention.Wo",
             "feed_forward.linear1",
             "feed_forward.linear2"
