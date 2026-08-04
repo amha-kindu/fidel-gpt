@@ -312,7 +312,7 @@ class RiemannianMetricKernel(torch.autograd.Function):
         n_nh = N * heads
 
         x_c = x.contiguous()
-        weight_c = weight.contiguous()
+        weight_c = weight.contiguous().to(x_c.dtype)
         tril_rows, tril_cols, idx_map, lower_mask, diag_mask = _structural_buffers(head_dim, x.device)
 
         # Floor at 16: tl.dot (used by the two batched-matmul kernels) needs
@@ -362,6 +362,7 @@ class RiemannianMetricKernel(torch.autograd.Function):
         ctx.epsilon = epsilon
         ctx.shapes = (N, heads, S, head_dim, n_params, n_tokens, n_nh)
         ctx.blocks = (BLOCK_D, BLOCK_S, BLOCK_P_TILE)
+        ctx.orig_weight_dtype = weight.dtype
         return out
 
     @staticmethod
@@ -408,4 +409,4 @@ class RiemannianMetricKernel(torch.autograd.Function):
 
         grad_x = grad_x_L + grad_x_w
         grad_weight_f32 = grad_weight_partial.sum(dim=0)
-        return grad_x, grad_weight_f32.to(weight.dtype), None
+        return grad_x, grad_weight_f32.to(ctx.orig_weight_dtype), None

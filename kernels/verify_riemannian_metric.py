@@ -119,6 +119,46 @@ def main():
     # =========================================================================
     print()
     print("=" * 78)
+    print("2b. Mismatched dtypes: x fp16, weight fp32 (mimics real torch.autocast")
+    print("    training, where activations get cast but nn.Parameters don't --")
+    print("    this Triton path isn't an autocast-aware op, unlike the plain")
+    print("    PyTorch fallback, so it needs its own explicit cast)")
+    print("=" * 78)
+    for cfg in [dict(N=2, heads=4, S=8, head_dim=8), dict(N=4, heads=4, S=16, head_dim=64)]:
+        torch.manual_seed(1)
+        ref = RiemannianMetric(cfg["head_dim"], cfg["heads"]).to(device)  # fp32, untouched
+        tri = RiemannianMetric(cfg["head_dim"], cfg["heads"], epsilon=ref.epsilon, fused=True).to(device)  # fp32, untouched
+        tri.weight.data.copy_(ref.weight.data)
+
+        x_ref = torch.randn(cfg["N"], cfg["heads"], cfg["S"], cfg["head_dim"], device=device, dtype=torch.float16, requires_grad=True)
+        x_tri = x_ref.detach().clone().requires_grad_(True)
+
+        try:
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                out_ref = ref(x_ref)
+                out_tri = tri(x_tri)
+
+            # backward() runs outside autocast -- matches train.py's own
+            # structure (forward+loss inside `with torch.autocast(...)`,
+            # `.backward()` after exiting it).
+            grad_out = torch.randn_like(out_ref)
+            out_ref.backward(grad_out)
+            out_tri.backward(grad_out)
+
+            rtol, atol = tol[torch.float16]
+            fwd_ok = torch.allclose(out_ref.float(), out_tri.float(), rtol=rtol, atol=atol)
+            gx_ok = torch.allclose(x_ref.grad.float(), x_tri.grad.float(), rtol=rtol, atol=atol)
+            gw_ok = torch.allclose(ref.weight.grad.float(), tri.weight.grad.float(), rtol=rtol, atol=atol)
+            check(f"mismatched-dtype forward cfg={cfg}", fwd_ok, f"max_abs_diff={(out_ref.float()-out_tri.float()).abs().max().item():.2e}")
+            check(f"mismatched-dtype grad_x  cfg={cfg}", gx_ok, f"max_abs_diff={(x_ref.grad.float()-x_tri.grad.float()).abs().max().item():.2e}")
+            check(f"mismatched-dtype grad_weight cfg={cfg}", gw_ok, f"max_abs_diff={(ref.weight.grad.float()-tri.weight.grad.float()).abs().max().item():.2e}")
+            check(f"mismatched-dtype weight.grad stayed fp32 cfg={cfg}", tri.weight.grad.dtype == torch.float32, f"got {tri.weight.grad.dtype}")
+        except Exception as e:
+            check(f"mismatched-dtype fwd+bwd ran cfg={cfg}", False, f"EXCEPTION: {e}")
+
+    # =========================================================================
+    print()
+    print("=" * 78)
     print("3. End-to-end: swap into an actual GPTmodel, run forward+backward+optimizer step")
     print("=" * 78)
     from config import ModelConfig
