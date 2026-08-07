@@ -49,29 +49,27 @@ class MultiHeadAttentionModule(nn.Module):
         self.dropout_p: float = config.dropout
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        
-    # Input shape: x -> (N_BATCHES, SEQ_LEN, 2*EMBED_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
-    # Output shape: (N_BATCHES, SEQ_LEN, 2*EMBED_DIM)
-    def _apply_rotary(self, x: torch.Tensor, phase_angles: torch.Tensor):
-        # (SEQ_LEN, 1, HEAD_DIM // 2)
-        cos = phase_angles.cos().to(x.dtype).unsqueeze(1)
-        sin = phase_angles.sin().to(x.dtype).unsqueeze(1)
-        
-        # (N_BATCHES, SEQ_LEN, HEADS, 2*HEAD_DIM)
-        x = x.view(x.shape[0], x.shape[1], self.heads, -1)
+    
+    # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
+    # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+    def _apply_rotary(self, x: torch.Tensor, y: torch.Tensor, cos_phase: torch.Tensor, sin_phase: torch.Tensor):        
+        # (1, 1, SEQ_LEN, HEAD_DIM // 2)
+        cos = cos_phase.to(x.dtype).view(1, 1, x.shape[2], -1)
+        sin = sin_phase.to(x.dtype).view(1, 1, x.shape[2], -1)
 
-        # (N_BATCHES, SEQ_LEN, HEADS, 2*HEAD_DIM) -> tuple[(N_BATCHES, SEQ_LEN, HEADS, HEAD_DIM // 2), ...]
-        x1, x2, x3, x4 = x.chunk(4, dim=-1)
+        # (N_BATCHES, HEADS, SEQ_LEN, HEADS, HEAD_DIM) -> 2x tuple[(N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM // 2)]
+        x1, x2 = x.chunk(2, dim=-1)
+        y1, y2 = y.chunk(2, dim=-1)
 
         return torch.cat(
             [
                 x1 * cos - x2 * sin,
                 x2 * cos + x1 * sin,
-                x3 * cos - x4 * sin,
-                x4 * cos + x3 * sin,
+                y1 * cos - y2 * sin,
+                y2 * cos + y1 * sin,
             ],
             dim=-1,
-        ).view(x.shape[0], x.shape[1], -1)
+        ).chunk(2, dim=-1)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -82,18 +80,23 @@ class MultiHeadAttentionModule(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        phase_angles: torch.Tensor | None = None,
+        cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM)
         qkv: torch.Tensor = self.Wqkv(x)
         
-        qk: torch.Tensor = qkv[..., : 2*x.shape[-1]]
-        if phase_angles is not None:
-            qk = self._apply_rotary(qk, phase_angles)
-        
-        query: torch.Tensor = qk[..., :x.shape[-1]]
-        key: torch.Tensor = qk[..., x.shape[-1]:]
+        # (N_BATCHES, SEQ_LEN, EMBED_DIM)
+        query: torch.Tensor = qkv[..., :x.shape[-1]]
+        key: torch.Tensor = qkv[..., x.shape[-1]: 2*x.shape[-1]]
         value: torch.Tensor = qkv[..., 2*x.shape[-1]:]
+        
+        # (N_BATCHES, SEQ_LEN, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, HEADS, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
+        query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
+        key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
+        value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
+        
+        if cos_sin_phases is not None:
+            query, key = self._apply_rotary(query, key, cos_sin_phases[0], cos_sin_phases[1])        
 
         # Cache accumulates past tokens; the model only returns the new KV pairs.
         # Concatenation of past+new is the cache's responsibility. Keys are cached
@@ -103,13 +106,8 @@ class MultiHeadAttentionModule(nn.Module):
         new_kv = (key, value) if use_cache else None
         if use_cache and kv_cache is not None:
             key_past, value_past = kv_cache
-            key = torch.cat([key_past, key], dim=1)
-            value = torch.cat([value_past, value], dim=1)
-
-        # (N_BATCHES, SEQ_LEN, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, HEADS, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
-        query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
+            key = torch.cat([key_past, key], dim=2)
+            value = torch.cat([value_past, value], dim=2)
 
         # attn_mask/is_causal are resolved once per forward pass by GPTmodel._decode
         # (identical for every block), instead of rebuilding a float bias here on
@@ -166,14 +164,14 @@ class DecoderModule(nn.Module):
         is_causal: bool,
         use_cache: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        phase_angles: torch.Tensor | None = None,
+        cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, phase_angles)
+            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, phase_angles)
+            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -231,16 +229,18 @@ class GPTmodel(nn.Module):
         in_decode_phase = use_cache and kv_caches is not None and kv_caches[0].get() is not None
         attn_mask = mask if (mask is not None and not in_decode_phase) else None
         is_causal = (mask is None) and not in_decode_phase
+        
+        cos_sin_phases = phase_angles.cos().to(x.dtype), phase_angles.sin().to(x.dtype)
 
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
             if self.training and self.activation_ckpt and not use_cache:
                 x, new_kv = torch.utils.checkpoint.checkpoint(
-                    decoder, x, attn_mask, is_causal, use_cache, kv_cache, phase_angles,
+                    decoder, x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases,
                     use_reentrant=False,
                 )
             else:
-                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, phase_angles)
+                x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
         return self.norm_f(x) if not self.config.post_norm else x

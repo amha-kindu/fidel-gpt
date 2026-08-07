@@ -28,30 +28,31 @@ class SlidingKVCache:
 
     @torch.no_grad()
     def append(self, new_keys: torch.Tensor, new_values: torch.Tensor) -> None:
-        batch, new_len, embed_dim = new_keys.shape
+        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); the ring buffer slides along SEQ_LEN (dim=2).
+        batch, heads, new_len, head_dim = new_keys.shape
 
         if self.keys is None:
-            self.keys = new_keys.new_zeros(batch, self.size, embed_dim)
-            self.values = new_values.new_zeros(batch, self.size, embed_dim)
+            self.keys = new_keys.new_zeros(batch, heads, self.size, head_dim)
+            self.values = new_values.new_zeros(batch, heads, self.size, head_dim)
 
         if new_len >= self.size:
             # This chunk alone fills (or overflows) the window; keep just the tail.
-            self.keys.copy_(new_keys[:, -self.size:, :])
-            self.values.copy_(new_values[:, -self.size:, :])
+            self.keys.copy_(new_keys[:, :, -self.size:, :])
+            self.values.copy_(new_values[:, :, -self.size:, :])
             self.length = self.size
             self.cursor = 0
             return
 
         end = self.cursor + new_len
         if end <= self.size:
-            self.keys[:, self.cursor:end, :] = new_keys
-            self.values[:, self.cursor:end, :] = new_values
+            self.keys[:, :, self.cursor:end, :] = new_keys
+            self.values[:, :, self.cursor:end, :] = new_values
         else:
             head = self.size - self.cursor
-            self.keys[:, self.cursor:, :] = new_keys[:, :head, :]
-            self.values[:, self.cursor:, :] = new_values[:, :head, :]
-            self.keys[:, :end - self.size, :] = new_keys[:, head:, :]
-            self.values[:, :end - self.size, :] = new_values[:, head:, :]
+            self.keys[:, :, self.cursor:, :] = new_keys[:, :, :head, :]
+            self.values[:, :, self.cursor:, :] = new_values[:, :, :head, :]
+            self.keys[:, :, :end - self.size, :] = new_keys[:, :, head:, :]
+            self.values[:, :, :end - self.size, :] = new_values[:, :, head:, :]
 
         self.cursor = end % self.size
         self.length = min(self.length + new_len, self.size)
@@ -60,5 +61,5 @@ class SlidingKVCache:
         if self.length == 0:
             return None
         if self.length < self.size:
-            return self.keys[:, :self.length, :], self.values[:, :self.length, :]
+            return self.keys[:, :, :self.length, :], self.values[:, :, :self.length, :]
         return self.keys, self.values
