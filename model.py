@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
@@ -45,37 +46,45 @@ class RoPeModule(nn.Module):
 
 
 class RiemannianMetric(nn.Module):
-    def __init__(self, head_dim: int, heads: int, epsilon: float = 1e-5, fused: bool = False):
+    def __init__(self, heads: int, head_dim: int, fused: bool = False):
         super().__init__()
         self.fused = fused
-        self.epsilon = epsilon
         self.head_dim = head_dim
+        self.temperature = head_dim ** 0.5
+        self.diag_baseline = math.log1p(math.log(2.0))
         n_params = head_dim * (head_dim + 1) // 2
 
-        self.weight = nn.Parameter(torch.empty(heads, head_dim, n_params))
-        nn.init.xavier_uniform_(self.weight)
+        self.weight = nn.Parameter(torch.zeros(heads, head_dim, n_params))
 
         tril_rows, tril_cols = torch.tril_indices(head_dim, head_dim)
         self.register_buffer("tril_rows", tril_rows, persistent=False)
         self.register_buffer("tril_cols", tril_cols, persistent=False)
-        self.register_buffer("diag_idx", torch.arange(head_dim), persistent=False)
+        self.register_buffer("diag_mask", tril_rows == tril_cols, persistent=False)
 
     # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused:
-            return RiemannianMetricKernel.apply(x, self.weight, self.epsilon)
-        
-        packed = torch.tanh(
-            torch.einsum("nhsd,hdp->nhsp", x, self.weight)
+            return RiemannianMetricKernel.apply(x, self.weight, self.temperature)
+
+        # (N_BATCHES, HEADS, SEQ_LEN, PARAMS)
+        raw = torch.einsum("nhsd,hdp->nhsp", x, self.weight) / self.temperature
+
+        packed = torch.where(
+            self.diag_mask,
+            1 + torch.log1p(F.softplus(raw)) - self.diag_baseline,
+            torch.asinh(raw),
         )
 
+        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)
         L = packed.new_zeros(*packed.shape[:-1], self.head_dim, self.head_dim)
         L[..., self.tril_rows, self.tril_cols] = packed
-        L[..., self.diag_idx, self.diag_idx] = (F.softplus(L[..., self.diag_idx, self.diag_idx]) + self.epsilon).to(L.dtype)
 
-        u = torch.einsum("...i,...ij->...j", x, L)
-        return torch.einsum("...i,...ji->...j", u, L)
+        # U_j = ∑_i x_i . L_ij  ->  U = x.L  ---  (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+        u = torch.einsum("nhsd,nhsdj->nhsj", x, L)
+
+        # O_i = ∑_j U_j . L_ij  -> O = U.L_T ---  (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+        return torch.einsum("nhsi,nhsji->nhsj", u, L)
 
 
 class MultiHeadAttentionModule(nn.Module):
@@ -93,7 +102,7 @@ class MultiHeadAttentionModule(nn.Module):
         self.riemannian_metric = None
         if config.riemannian:
             fused = _RIEMANNIAN_KERNEL_AVAILABLE and torch.cuda.is_available()
-            self.riemannian_metric = RiemannianMetric(self.d_head, self.heads, fused=fused)
+            self.riemannian_metric = RiemannianMetric(self.heads, self.d_head, fused=fused)
         
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
@@ -140,9 +149,12 @@ class MultiHeadAttentionModule(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
-        
+
+        if self.riemannian_metric is not None:
+            key = self.riemannian_metric(key)
+
         if cos_sin_phases is not None:
-            query, key = self._apply_rotary(query, key, cos_sin_phases[0], cos_sin_phases[1])        
+            query, key = self._apply_rotary(query, key, cos_sin_phases[0], cos_sin_phases[1])
 
         # Cache accumulates past tokens; the model only returns the new KV pairs.
         # Concatenation of past+new is the cache's responsibility. Keys are cached
@@ -154,9 +166,6 @@ class MultiHeadAttentionModule(nn.Module):
             key_past, value_past = kv_cache
             key = torch.cat([key_past, key], dim=2)
             value = torch.cat([value_past, value], dim=2)
-
-        if self.riemannian_metric is not None:
-            query = self.riemannian_metric(query)
 
         # attn_mask/is_causal are resolved once per forward pass by GPTmodel._decode
         # (identical for every block), instead of rebuilding a float bias here on
