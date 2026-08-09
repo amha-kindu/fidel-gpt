@@ -1,4 +1,5 @@
 import re
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -141,48 +142,59 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
 
 
 class RiemannianMetricProbe:
-    HISTOGRAM_MAX_SAMPLES = 50_000
-
     def __init__(self, model):
         self.stats = []
+        self.diag_baseline = math.log1p(math.log(2.0))
         self.handles = [
             dec.masked_multihead_attention.riemannian_metric.register_forward_hook(self._make_hook(i))
             for i, dec in enumerate(model.decoders)
             if dec.masked_multihead_attention.riemannian_metric is not None
         ]
 
-    @staticmethod
-    def _subsample(t: torch.Tensor, max_n: int) -> torch.Tensor:
-        t = t.flatten()
-        if t.numel() > max_n:
-            idx = torch.randperm(t.numel(), device=t.device)[:max_n]
-            t = t[idx]
-        
-        return t.cpu()
-
     def _make_hook(self, layer_idx: int):
         def hook(module, inp, out):
             with torch.no_grad():
-                x = inp[0].detach().float()
-                raw = torch.einsum("nhsd,hdp->nhsp", x, module.weight.detach().float())
-                packed = torch.tanh(raw)
-                diag_mask = module.tril_rows == module.tril_cols
-                diag = F.softplus(packed[..., diag_mask]) + module.epsilon
-                off_diag = packed[..., ~diag_mask]
-                damping = out.detach().float().norm(dim=-1).mean() / (x.norm(dim=-1).mean() + 1e-9)
+                x_in = inp[0].detach().float()
+                raw = torch.einsum("nhsd,hdp->nhsp", x_in, module.weight.detach().float()) / module.temperature
+                diag_mask = module.diag_mask
+                packed_diag = torch.log1p(F.softplus(raw[..., diag_mask])) - self.diag_baseline
+                packed_off_diag = torch.asinh(raw[..., ~diag_mask])
+
+                diag = 1.0 + packed_diag
+                off_diag = packed_off_diag
+
+                # trace(M) = ||L||_F^2 = sum of squares over the WHOLE lower triangle (diag + off-diag) --
+                # M's total "energy", = head_dim at the identity init.
+                trace_M = diag.pow(2).sum(-1) + off_diag.pow(2).sum(-1)   # (N,H,S)
+
+                # det(M) = det(L)^2 = (prod of L's diagonal)^2 -- off-diagonal entries don't affect
+                # volume, only orientation/coupling.
+                log_det_M = 2.0 * diag.clamp_min(1e-12).log().sum(-1)   # (N,H,S)
+                
+                trace_per_head = (trace_M / module.head_dim).mean(dim=(0, 2))       # (H,) arithmetic mean eigenvalue -- ~1 at init
+                log_det_per_head = (log_det_M / module.head_dim).mean(dim=(0, 2))   # (H,) log of geometric mean eigenvalue -- ~0 at init
+
+                # Isotropy = geometric_mean(eigenvalues) / arithmetic_mean(eigenvalues) in (0, 1],
+                # by AM-GM. It equals 1 iff the metric is a scalar multiple of the identity(perfectly
+                # isotropic), and approaches 0 as the metric becomes singular/ill-conditioned
+                # (collapses some direction toward singular).
+                # Unlike trace, this detects anisotropy rather than just overall scale.
+                isotropy_per_head = log_det_per_head.exp() / trace_per_head.clamp_min(1e-12)   # (H,)
+                
                 self.stats.append({
                     "layer": layer_idx,
                     "module": module,
-                    "damping": damping.item(),
-                    "diag": self._subsample(diag, self.HISTOGRAM_MAX_SAMPLES),
-                    "off_diag": self._subsample(off_diag, self.HISTOGRAM_MAX_SAMPLES),
+                    "trace_per_head": trace_per_head.tolist(),
+                    "log_det_per_head": log_det_per_head.tolist(),
+                    "isotropy_per_head": isotropy_per_head.tolist(),
                 })
         return hook
 
     def capture_grads(self):
         for s in self.stats:
-            grad = s["module"].weight.grad
-            s["grad_norm"] = grad.detach().float().norm().item() if grad is not None else 0.0
+            module = s["module"]
+            weight_grad = module.weight.grad
+            s["grad_norm"] = weight_grad.detach().float().norm().item() if weight_grad is not None else 0.0
             del s["module"]
 
     def close(self):
@@ -197,10 +209,10 @@ def log_riemannian_metrics(tb_logger: TensorboardLogger, stats: list[dict], glob
     with torch.no_grad():
         for s in stats:
             tag = f"Decoder{s['layer']}"
-            tb_logger.log_scalar(f"Riemannian/{tag}/Damping", s["damping"], global_step)
-            tb_logger.log_histogram(f"Riemannian/{tag}/Diag", s["diag"], global_step)
-            tb_logger.log_histogram(f"Riemannian/{tag}/OffDiag", s["off_diag"], global_step)
-            tb_logger.log_scalar(f"Riemannian/{tag}/Gradient", s["grad_norm"], global_step)
+            tb_logger.log_scalars(f"Metrics/{tag}/Trace", {f"Head{h}": v for h, v in enumerate(s["trace_per_head"])}, global_step)
+            tb_logger.log_scalars(f"Metrics/{tag}/LogDet", {f"Head{h}": v for h, v in enumerate(s["log_det_per_head"])}, global_step)
+            tb_logger.log_scalars(f"Metrics/{tag}/Isotropy", {f"Head{h}": v for h, v in enumerate(s["isotropy_per_head"])}, global_step)
+            tb_logger.log_scalar(f"Metrics/{tag}/Gradient", s["grad_norm"], global_step)
 
 
 @_non_blocking()
@@ -277,4 +289,3 @@ def set_trainable_params(model: nn.Module, trainable_modules: dict, for_inferenc
         param.requires_grad = any(
             param_name == p or param_name.startswith(p + ".") for p in trainables_params
         )
-   
