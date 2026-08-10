@@ -46,39 +46,47 @@ class RoPeModule(nn.Module):
 
 
 class RiemannianMetric(nn.Module):
-    def __init__(self, heads: int, head_dim: int, fused: bool = False):
+    def __init__(self, heads: int, head_dim: int, rank: int, fused: bool = False):
         super().__init__()
         self.fused = fused
+        self.heads = heads
         self.head_dim = head_dim
-        self.temperature = head_dim ** 0.5
+        self.scale = head_dim ** 0.5
+        self.rank = min(rank, head_dim)
         self.diag_baseline = math.log1p(math.log(2.0))
-        n_params = head_dim * (head_dim + 1) // 2
 
-        self.weight = nn.Parameter(torch.zeros(heads, head_dim, n_params))
+        self.weight_diag = nn.Parameter(torch.zeros(heads, head_dim))
+        self.weight_W = nn.Parameter(torch.zeros(heads, head_dim, self.rank))
+        self.weight_U = nn.Parameter(torch.empty(heads, head_dim, self.rank))
+        self.weight_V = nn.Parameter(torch.empty(heads, head_dim, self.rank))
+        nn.init.normal_(self.weight_U, mean=0.0, std=head_dim ** -0.5)
+        nn.init.normal_(self.weight_V, mean=0.0, std=head_dim ** -0.5)
 
-        tril_rows, tril_cols = torch.tril_indices(head_dim, head_dim)
-        self.register_buffer("tril_rows", tril_rows, persistent=False)
-        self.register_buffer("tril_cols", tril_cols, persistent=False)
-        self.register_buffer("diag_mask", tril_rows == tril_cols, persistent=False)
+        row = torch.arange(head_dim).view(head_dim, 1)
+        col = torch.arange(head_dim).view(1, head_dim)
+        self.register_buffer("lower_mask", row > col, persistent=False)
 
     # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused:
-            return RiemannianMetricKernel.apply(x, self.weight, self.temperature)
+            return RiemannianMetricKernel.apply(
+                x, self.weight_diag, self.weight_W, self.weight_U, self.weight_V, self.scale,
+            )
 
-        # (N_BATCHES, HEADS, SEQ_LEN, PARAMS)
-        raw = torch.einsum("nhsd,hdp->nhsp", x, self.weight) / self.temperature
+        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+        raw_diag = x * self.weight_diag.view(1, self.heads, 1, self.head_dim)
+        L_diag = 1.0 + torch.log1p(F.softplus(raw_diag)) - self.diag_baseline
 
-        packed = torch.where(
-            self.diag_mask,
-            1 + torch.log1p(F.softplus(raw)) - self.diag_baseline,
-            torch.asinh(raw),
+        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM) @ (HEADS, HEAD_DIM, RANK) -> (N_BATCHES, HEADS, SEQ_LEN, RANK)
+        gate = torch.asinh(
+            torch.einsum("nhsd,hdr->nhsr", x, self.weight_W) / self.scale
         )
 
         # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)
-        L = packed.new_zeros(*packed.shape[:-1], self.head_dim, self.head_dim)
-        L[..., self.tril_rows, self.tril_cols] = packed
+        L_offdiag = torch.einsum("nhsr,hir,hjr->nhsij", gate, self.weight_U, self.weight_V) / (self.rank ** 0.5)
+        L_offdiag = torch.where(self.lower_mask, L_offdiag, torch.zeros_like(L_offdiag))
+        L = L_offdiag + torch.diag_embed(L_diag)
 
         # U_j = ∑_i x_i . L_ij  ->  U = x.L  ---  (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
         u = torch.einsum("nhsd,nhsdj->nhsj", x, L)
@@ -102,7 +110,8 @@ class MultiHeadAttentionModule(nn.Module):
         self.riemannian_metric = None
         if config.riemannian:
             fused = _RIEMANNIAN_KERNEL_AVAILABLE and torch.cuda.is_available()
-            self.riemannian_metric = RiemannianMetric(self.heads, self.d_head, fused=fused)
+            rank = getattr(config, "metric_rank", None) or self.d_head
+            self.riemannian_metric = RiemannianMetric(self.heads, self.d_head, rank, fused=fused)
         
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
