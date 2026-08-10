@@ -337,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--post-norm", action="store_true", help="Apply layer normalization after each residual block (post-norm Transformer style)")
     parser.add_argument("--riemannian", action="store_true", help="Apply a learnable per-head Riemannian metric to the attention query (default: disabled)")
+    parser.add_argument("--metric-rank", type=int, help="Rank of the low-rank coupling term per head for the Riemannian metric's off-diagonal (default: head_dim)")
     parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=None, help="Tie embedding and projection weights (default: enabled)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
