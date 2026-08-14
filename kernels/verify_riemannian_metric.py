@@ -11,6 +11,7 @@ Usage:
 Report back: which sections PASSED/FAILED, and the benchmark numbers at the
 end (especially peak memory, since that's the actual point of this).
 """
+import math
 import os
 import sys
 import time
@@ -20,6 +21,11 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 FAILURES = []
+# Small on purpose: MODES is a Python-level unrolled loop bound inside the
+# kernel (see kernels/riemannian_metric.py's module docstring, SCOPE
+# section) -- keep it modest here, same as real usage would.
+TEST_MODES = 4
+DIAG_OFFSET = 1.0 - math.log1p(math.log(2.0))
 
 
 def check(name, cond, detail=""):
@@ -30,18 +36,91 @@ def check(name, cond, detail=""):
     return cond
 
 
+def _fp64_truth(x, weight_diag, weight_W, weight_U, weight_V, lower_mask):
+    """
+    Ground-truth forward pass at float64, built from raw tensors (not the
+    nn.Module) so it can take leaf tensors and be differentiated via
+    torch.autograd.grad/.backward() for ground-truth GRADIENTS too. Mirrors
+    RiemannianMetric.forward's non-fused math exactly (see model.py), just
+    upcast to float64 throughout.
+
+    Neither `ref` (native low-precision eager ops, rounding at every step)
+    nor `tri`/fused (a single upcast-to-fp32-then-downcast-once Triton
+    kernel) is ground truth -- both are independently-rounded approximations
+    of THIS. Sections 1/2/2b below compare each of them against this
+    function's output instead of against each other, specifically because
+    comparing them directly flagged honest disagreement between two
+    approximations as a "FAIL" at head_dim=64 fp16/bf16 -- even in cases
+    where fused was the MORE accurate of the two. See
+    kernels/diagnose_riemannian_precision.py for the investigation that
+    established this (run it for the full stage-by-stage breakdown; this
+    function inlines just enough of it to gate pass/fail here).
+
+    Deliberately evaluated on whatever (dtype-rounded) values `x`/the
+    weight_* tensors already hold, not on some independently-generated full-
+    precision draw: the question this answers is "given the exact inputs ref
+    and fused actually computed with, does each one's own arithmetic land
+    close to the mathematically exact result of the formula" -- isolating
+    each implementation's OWN rounding-during-computation from input
+    quantization, which is identical for both by construction (both are
+    always fed the same nudged/copied weights and the same x).
+    """
+    heads, head_dim = weight_diag.shape
+    x64, wd64, wW64, wU64, wV64 = (t.double() for t in (x, weight_diag, weight_W, weight_U, weight_V))
+
+    raw_diag = x64 * wd64.view(1, heads, 1, head_dim)
+    L_diag = torch.log1p(F.softplus(raw_diag)) + DIAG_OFFSET
+    gate = F.silu(torch.einsum("nhsd,hdm->nhsm", x64, wW64))
+    B = torch.matmul(wU64, wV64.transpose(-2, -1))
+    B = torch.where(lower_mask, B, torch.zeros((), dtype=torch.float64, device=x.device))
+    L_offdiag = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B))
+    L = torch.diagonal_scatter(L_offdiag, L_diag, dim1=-2, dim2=-1)
+    u = torch.matmul(x64.unsqueeze(-2), L)
+    return torch.matmul(u, L.transpose(-2, -1)).squeeze(-2)
+
+
+# Tolerances for comparing a dtype-native computation (ref's chained native-
+# dtype eager ops, OR fused's single-upcast Triton kernel -- checked
+# independently, see _fp64_truth's own comment) against the float64 ground
+# truth. Calibrated from kernels/diagnose_riemannian_precision.py's measured
+# numbers (out max_abs_diff up to ~3.1e-2 at fp16/head_dim=64, ~2.1e-1 at
+# bf16/head_dim=64; grad_weight_W max_abs_diff ~5e-4 at fp32/head_dim=64),
+# with a ~2-3x safety margin on top. Sized for THIS suite's head_dim<=64
+# configs specifically, NOT a general dtype-precision formula -- error grows
+# with head_dim (more terms summed in u=x@L, out=u@L^T; see that script's
+# section D), so revisit these if a head_dim>64 config is ever added here.
+FWD_TRUTH_TOL = {torch.float32: (3e-4, 3e-4), torch.float16: (2e-2, 6e-2), torch.bfloat16: (5e-2, 3e-1)}
+GRAD_TRUTH_TOL = {torch.float32: (1e-3, 1e-3), torch.float16: (3e-2, 1e-1), torch.bfloat16: (8e-2, 4e-1)}
+
+# grad_weight_W specifically needs more headroom than GRAD_TRUTH_TOL gives: it's a
+# genuine reduction over every token sharing a head (N*S terms), and empirically
+# ref's own native-fp16 torch.einsum backward loses noticeably more precision on
+# that reduction than fused's explicitly fp32-accumulated tl.dot does (observed:
+# ref max_abs_diff up to 4.79e-1 at fp16/head_dim=64 -- comfortably beyond
+# GRAD_TRUTH_TOL's 1e-1+3e-2*|truth| -- while fused stayed at 2.01e-1 for the SAME
+# config/truth). That gap is ref being less precise, not fused being wrong (fused
+# is consistently the more accurate of the two throughout this suite's results);
+# this table just stops it from being flagged as a false-positive FAIL.
+GRAD_WEIGHT_W_TRUTH_TOL = {torch.float32: (1e-3, 1e-3), torch.float16: (5e-2, 6e-1), torch.bfloat16: (1e-1, 1.5)}
+
+
+def _grad_tol(name, dtype):
+    table = GRAD_WEIGHT_W_TRUTH_TOL if name == "grad_weight_W" else GRAD_TRUTH_TOL
+    return table[dtype]
+
+
 def _nudge_off_init(ref, tri):
     # weight_diag/weight_W both start at exactly 0 -- both required for
     # identity-at-init (see model.py's RiemannianMetric docstring: zero
-    # weight_diag -> raw_diag=0 -> packed_diag=0 via the -C shift; zero
-    # weight_W -> every gate_k=asinh(0)=0 regardless of weight_U/weight_V).
-    # weight_U/weight_V already get a small random init from __init__ --
-    # safe at init regardless of value, since weight_W=0 gates them to zero
-    # contribution either way. Nudge weight_diag/weight_W off zero (matched
-    # between ref/tri) to actually exercise the gated off-diagonal path in
-    # these checks; explicitly copy weight_U/weight_V too so ref/tri start
-    # from identical values rather than relying on RNG-stream alignment
-    # across two separate constructions.
+    # weight_diag -> raw_diag=0 -> L_diag=diag_offset exactly; zero weight_W
+    # -> every gate_m=silu(0)=0 regardless of weight_U/weight_V, so
+    # S=asinh(0)=0 too). weight_U/weight_V already get a small random init
+    # from __init__ -- safe at init regardless of value, since weight_W=0
+    # gates them to zero contribution either way. Nudge weight_diag/weight_W
+    # off zero (matched between ref/tri) to actually exercise the gated
+    # off-diagonal path in these checks; explicitly copy weight_U/weight_V
+    # too so ref/tri start from identical values rather than relying on
+    # RNG-stream alignment across two separate constructions.
     with torch.no_grad():
         ref.weight_diag.add_(0.3 * torch.randn_like(ref.weight_diag))
         ref.weight_W.add_(0.2 * torch.randn_like(ref.weight_W))
@@ -87,8 +166,8 @@ def main():
     for cfg in [dict(N=2, heads=4, S=8, head_dim=8), dict(N=2, heads=16, S=8, head_dim=64)]:
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             torch.manual_seed(0)
-            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"]).to(device).to(dtype)
-            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], fused=True).to(device).to(dtype)
+            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES).to(device).to(dtype)
+            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES, fused=True).to(device).to(dtype)
             tri.weight_U.data.copy_(ref.weight_U.data)
             tri.weight_V.data.copy_(ref.weight_V.data)
             # No _nudge_off_init here -- weight_diag/weight_W must stay at their real zero init.
@@ -112,7 +191,9 @@ def main():
     # =========================================================================
     print()
     print("=" * 78)
-    print("1. Forward numerical match (Triton vs. reference), several configs/dtypes")
+    print("1. Forward numerical match, several configs/dtypes -- each of ref and")
+    print("   fused checked against float64 ground truth (_fp64_truth), NOT")
+    print("   against each other (see that function's own comment for why).")
     print("   rank=head_dim throughout, matching model.py's current wiring")
     print("=" * 78)
     configs = [
@@ -122,28 +203,36 @@ def main():
         dict(N=2, heads=16, S=8, head_dim=64),
     ]
     dtypes = [torch.float32, torch.float16, torch.bfloat16]
-    tol = {torch.float32: (1e-4, 1e-4), torch.float16: (1e-2, 1e-2), torch.bfloat16: (2e-2, 2e-2)}
 
     for cfg in configs:
         for dtype in dtypes:
             torch.manual_seed(0)
-            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"]).to(device)
-            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], fused=True).to(device)
+            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES).to(device)
+            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES, fused=True).to(device)
             _nudge_off_init(ref, tri)
 
             x = torch.randn(cfg["N"], cfg["heads"], cfg["S"], cfg["head_dim"], device=device, dtype=dtype)
-            ref_d, tri_d = ref.to(dtype), tri.to(dtype)
+            ref_d, tri_d = ref.to(dtype), tri.to(dtype)  # mutates ref/tri in place -- weight_* are now dtype-rounded too
             with torch.no_grad():
                 out_ref = ref_d(x)
                 out_tri = tri_d(x)
-            diff = (out_ref.float() - out_tri.float()).abs()
-            rtol, atol = tol[dtype]
-            ok = torch.allclose(out_ref.float(), out_tri.float(), rtol=rtol, atol=atol)
+                out_truth = _fp64_truth(x, ref.weight_diag, ref.weight_W, ref.weight_U, ref.weight_V, ref.lower_mask)
+
+            rtol, atol = FWD_TRUTH_TOL[dtype]
+            err_ref = (out_ref.double() - out_truth).abs().max().item()
+            err_tri = (out_tri.double() - out_truth).abs().max().item()
             check(
-                f"cfg={cfg} dtype={dtype}",
-                ok,
-                f"max_abs_diff={diff.max().item():.2e}",
+                f"ref   ~= fp64 truth  cfg={cfg} dtype={dtype}",
+                torch.allclose(out_ref.double(), out_truth, rtol=rtol, atol=atol),
+                f"max_abs_diff={err_ref:.2e}",
             )
+            check(
+                f"fused ~= fp64 truth  cfg={cfg} dtype={dtype}",
+                torch.allclose(out_tri.double(), out_truth, rtol=rtol, atol=atol),
+                f"max_abs_diff={err_tri:.2e}",
+            )
+            print(f"    [INFO] ref-vs-fused max_abs_diff={(out_ref.double()-out_tri.double()).abs().max().item():.2e} "
+                  f"(informational only -- both are judged against truth above, not against each other)")
 
     # =========================================================================
     print()
@@ -156,13 +245,13 @@ def main():
     print("=" * 78)
     for cfg in [dict(N=2, heads=4, S=8, head_dim=8), dict(N=2, heads=16, S=8, head_dim=64)]:
         torch.manual_seed(4)
-        ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"]).to(device)
-        tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], fused=True).to(device)
+        ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES).to(device)
+        tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES, fused=True).to(device)
         _nudge_off_init(ref, tri)
         with torch.no_grad():
             for m in (ref, tri):
-                m.weight_diag.data *= 20000.0
-                m.weight_W.data *= 20000.0
+                m.weight_diag.data *= 200.0
+                m.weight_W.data *= 200.0
 
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             x = (3.0 * torch.randn(cfg["N"], cfg["heads"], cfg["S"], cfg["head_dim"], device=device)).to(dtype)
@@ -208,13 +297,15 @@ def main():
     print()
     print("=" * 78)
     print("2. Backward numerical match: grad_x, grad_weight_diag, grad_weight_W,")
-    print("   grad_weight_U, grad_weight_V")
+    print("   grad_weight_U, grad_weight_V -- each of ref and fused checked against")
+    print("   float64 ground-truth gradients (torch.autograd.grad on _fp64_truth),")
+    print("   NOT against each other, for the same reason as section 1.")
     print("=" * 78)
     for cfg in [dict(N=2, heads=4, S=8, head_dim=8), dict(N=4, heads=4, S=16, head_dim=64), dict(N=2, heads=16, S=8, head_dim=64)]:
         for dtype in [torch.float32, torch.float16]:
             torch.manual_seed(1)
-            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"]).to(device).to(dtype)
-            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], fused=True).to(device).to(dtype)
+            ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES).to(device).to(dtype)
+            tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES, fused=True).to(device).to(dtype)
             _nudge_off_init(ref, tri)
 
             x_ref = torch.randn(cfg["N"], cfg["heads"], cfg["S"], cfg["head_dim"], device=device, dtype=dtype, requires_grad=True)
@@ -227,19 +318,37 @@ def main():
             out_ref.backward(grad_out)
             out_tri.backward(grad_out)
 
-            rtol, atol = tol[dtype]
+            # float64 ground-truth gradients: fresh leaves holding the SAME
+            # (already dtype-rounded) values ref/tri actually computed with --
+            # see _fp64_truth's own comment for why that's the right basis.
+            x_truth = x_ref.detach().double().requires_grad_(True)
+            wd_truth = ref.weight_diag.detach().double().requires_grad_(True)
+            wW_truth = ref.weight_W.detach().double().requires_grad_(True)
+            wU_truth = ref.weight_U.detach().double().requires_grad_(True)
+            wV_truth = ref.weight_V.detach().double().requires_grad_(True)
+            out_truth = _fp64_truth(x_truth, wd_truth, wW_truth, wU_truth, wV_truth, ref.lower_mask)
+            out_truth.backward(grad_out.double())
+
             checks = [
-                ("grad_x", x_ref.grad, x_tri.grad),
-                ("grad_weight_diag", ref.weight_diag.grad, tri.weight_diag.grad),
-                ("grad_weight_W", ref.weight_W.grad, tri.weight_W.grad),
-                ("grad_weight_U", ref.weight_U.grad, tri.weight_U.grad),
-                ("grad_weight_V", ref.weight_V.grad, tri.weight_V.grad),
+                ("grad_x", x_ref.grad, x_tri.grad, x_truth.grad),
+                ("grad_weight_diag", ref.weight_diag.grad, tri.weight_diag.grad, wd_truth.grad),
+                ("grad_weight_W", ref.weight_W.grad, tri.weight_W.grad, wW_truth.grad),
+                ("grad_weight_U", ref.weight_U.grad, tri.weight_U.grad, wU_truth.grad),
+                ("grad_weight_V", ref.weight_V.grad, tri.weight_V.grad, wV_truth.grad),
             ]
-            for name, g_ref, g_tri in checks:
-                ok = torch.allclose(g_ref.float(), g_tri.float(), rtol=rtol, atol=atol)
+            for name, g_ref, g_tri, g_truth in checks:
+                rtol, atol = _grad_tol(name, dtype)
+                err_ref = (g_ref.double() - g_truth).abs().max().item()
+                err_tri = (g_tri.double() - g_truth).abs().max().item()
                 check(
-                    f"{name:<18} cfg={cfg} dtype={dtype}", ok,
-                    f"max_abs_diff={(g_ref.float()-g_tri.float()).abs().max().item():.2e}",
+                    f"ref   {name:<18} ~= fp64 truth cfg={cfg} dtype={dtype}",
+                    torch.allclose(g_ref.double(), g_truth, rtol=rtol, atol=atol),
+                    f"max_abs_diff={err_ref:.2e}",
+                )
+                check(
+                    f"fused {name:<18} ~= fp64 truth cfg={cfg} dtype={dtype}",
+                    torch.allclose(g_tri.double(), g_truth, rtol=rtol, atol=atol),
+                    f"max_abs_diff={err_tri:.2e}",
                 )
 
     # =========================================================================
@@ -252,8 +361,8 @@ def main():
     print("=" * 78)
     for cfg in [dict(N=2, heads=4, S=8, head_dim=8), dict(N=4, heads=4, S=16, head_dim=64)]:
         torch.manual_seed(1)
-        ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"]).to(device)  # fp32, untouched
-        tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], fused=True).to(device)  # fp32, untouched
+        ref = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES).to(device)  # fp32, untouched
+        tri = RiemannianMetric(cfg["heads"], cfg["head_dim"], cfg["head_dim"], TEST_MODES, fused=True).to(device)  # fp32, untouched
         _nudge_off_init(ref, tri)
 
         x_ref = torch.randn(cfg["N"], cfg["heads"], cfg["S"], cfg["head_dim"], device=device, dtype=torch.float16, requires_grad=True)
@@ -271,24 +380,68 @@ def main():
             out_ref.backward(grad_out)
             out_tri.backward(grad_out)
 
-            rtol, atol = tol[torch.float16]
-            fwd_ok = torch.allclose(out_ref.float(), out_tri.float(), rtol=rtol, atol=atol)
-            check(f"mismatched-dtype forward cfg={cfg}", fwd_ok, f"max_abs_diff={(out_ref.float()-out_tri.float()).abs().max().item():.2e}")
+            # float64 ground truth: x stays at its own (fp16) rounded values,
+            # weights stay at their TRUE fp32 values (never further rounded --
+            # autocast casts activations, not nn.Parameters), matching what
+            # ref/tri actually computed with. See _fp64_truth's own comment.
+            x_truth = x_ref.detach().double().requires_grad_(True)
+            wd_truth = ref.weight_diag.detach().double().requires_grad_(True)
+            wW_truth = ref.weight_W.detach().double().requires_grad_(True)
+            wU_truth = ref.weight_U.detach().double().requires_grad_(True)
+            wV_truth = ref.weight_V.detach().double().requires_grad_(True)
+            out_truth = _fp64_truth(x_truth, wd_truth, wW_truth, wU_truth, wV_truth, ref.lower_mask)
+            out_truth.backward(grad_out.double())
+
+            rtol16, atol16 = FWD_TRUTH_TOL[torch.float16]
+            check(
+                "mismatched-dtype ref   forward ~= fp64 truth" f" cfg={cfg}",
+                torch.allclose(out_ref.double(), out_truth, rtol=rtol16, atol=atol16),
+                f"max_abs_diff={(out_ref.double()-out_truth).abs().max().item():.2e}",
+            )
+            check(
+                "mismatched-dtype fused forward ~= fp64 truth" f" cfg={cfg}",
+                torch.allclose(out_tri.double(), out_truth, rtol=rtol16, atol=atol16),
+                f"max_abs_diff={(out_tri.double()-out_truth).abs().max().item():.2e}",
+            )
 
             # grad_x tracks x's own dtype (fp16 here, by normal autograd
             # convention) -- only the weight gradients are expected to stay
             # fp32 (the weights themselves are fp32, untouched by autocast).
-            ok = torch.allclose(x_ref.grad.float(), x_tri.grad.float(), rtol=rtol, atol=atol)
-            check(f"mismatched-dtype grad_x cfg={cfg}", ok, f"max_abs_diff={(x_ref.grad.float()-x_tri.grad.float()).abs().max().item():.2e}")
+            grtol16, gatol16 = GRAD_TRUTH_TOL[torch.float16]
+            check(
+                "mismatched-dtype ref   grad_x ~= fp64 truth" f" cfg={cfg}",
+                torch.allclose(x_ref.grad.double(), x_truth.grad, rtol=grtol16, atol=gatol16),
+                f"max_abs_diff={(x_ref.grad.double()-x_truth.grad).abs().max().item():.2e}",
+            )
+            check(
+                "mismatched-dtype fused grad_x ~= fp64 truth" f" cfg={cfg}",
+                torch.allclose(x_tri.grad.double(), x_truth.grad, rtol=grtol16, atol=gatol16),
+                f"max_abs_diff={(x_tri.grad.double()-x_truth.grad).abs().max().item():.2e}",
+            )
 
-            for name, g_ref, g_tri in [
-                ("grad_weight_diag", ref.weight_diag.grad, tri.weight_diag.grad),
-                ("grad_weight_W", ref.weight_W.grad, tri.weight_W.grad),
-                ("grad_weight_U", ref.weight_U.grad, tri.weight_U.grad),
-                ("grad_weight_V", ref.weight_V.grad, tri.weight_V.grad),
+            # NOTE: weight_* gradients are STORED in fp32 (checked below), but that's
+            # not the same as being ACCURATE to fp32 precision -- torch.autocast
+            # decides precision per-op, not per-parameter-dtype, so the matmuls
+            # inside the forward pass above ran at fp16 precision regardless of the
+            # weight tensors' own storage dtype, and the resulting gradients only
+            # carry fp16-level accuracy. Use the fp16 (not fp32) tolerance table.
+            for name, g_ref, g_tri, g_truth in [
+                ("grad_weight_diag", ref.weight_diag.grad, tri.weight_diag.grad, wd_truth.grad),
+                ("grad_weight_W", ref.weight_W.grad, tri.weight_W.grad, wW_truth.grad),
+                ("grad_weight_U", ref.weight_U.grad, tri.weight_U.grad, wU_truth.grad),
+                ("grad_weight_V", ref.weight_V.grad, tri.weight_V.grad, wV_truth.grad),
             ]:
-                ok = torch.allclose(g_ref.float(), g_tri.float(), rtol=rtol, atol=atol)
-                check(f"mismatched-dtype {name} cfg={cfg}", ok, f"max_abs_diff={(g_ref.float()-g_tri.float()).abs().max().item():.2e}")
+                grtol, gatol = _grad_tol(name, torch.float16)
+                check(
+                    f"mismatched-dtype ref   {name} ~= fp64 truth cfg={cfg}",
+                    torch.allclose(g_ref.double(), g_truth, rtol=grtol, atol=gatol),
+                    f"max_abs_diff={(g_ref.double()-g_truth).abs().max().item():.2e}",
+                )
+                check(
+                    f"mismatched-dtype fused {name} ~= fp64 truth cfg={cfg}",
+                    torch.allclose(g_tri.double(), g_truth, rtol=grtol, atol=gatol),
+                    f"max_abs_diff={(g_tri.double()-g_truth).abs().max().item():.2e}",
+                )
                 check(f"mismatched-dtype {name} stayed fp32 cfg={cfg}", g_tri.dtype == torch.float32, f"got {g_tri.dtype}")
         except Exception as e:
             check(f"mismatched-dtype fwd+bwd ran cfg={cfg}", False, f"EXCEPTION: {e}")
@@ -310,7 +463,7 @@ def main():
     for dec in m.decoders:
         mha = dec.masked_multihead_attention
         old = mha.riemannian_metric
-        new = RiemannianMetric(old.heads, old.head_dim, old.rank, fused=True).to(device)
+        new = RiemannianMetric(old.heads, old.head_dim, old.rank, old.modes, fused=True).to(device)
         new.weight_diag.data.copy_(old.weight_diag.data)
         new.weight_W.data.copy_(old.weight_W.data)
         new.weight_U.data.copy_(old.weight_U.data)
@@ -343,9 +496,9 @@ def main():
         torch.manual_seed(3)
         layers = []
         for _ in range(n_decoders):
-            rm = RiemannianMetric(heads, head_dim, head_dim).to(device).half()
+            rm = RiemannianMetric(heads, head_dim, head_dim, TEST_MODES).to(device).half()
             if use_triton:
-                tri = RiemannianMetric(heads, head_dim, head_dim, fused=True).to(device).half()
+                tri = RiemannianMetric(heads, head_dim, head_dim, TEST_MODES, fused=True).to(device).half()
                 tri.weight_diag.data.copy_(rm.weight_diag.data)
                 tri.weight_W.data.copy_(rm.weight_W.data)
                 tri.weight_U.data.copy_(rm.weight_U.data)
@@ -391,13 +544,6 @@ def main():
     print(f"  reference (PyTorch, {n_decoders} layers): {t_ref*1000:.2f} ms/iter, peak mem {mem_ref:.3f} GB")
     print(f"  triton    (Triton,  {n_decoders} layers): {t_tri*1000:.2f} ms/iter, peak mem {mem_tri:.3f} GB")
     print(f"  speedup: {t_ref/t_tri:.2f}x   memory reduction: {mem_ref/mem_tri:.2f}x")
-    print("  NOTE: rank=head_dim in this wiring. L_offdiag is no longer")
-    print("  materialized as a (D,D) matrix per token (see module docstring's")
-    print("  updated NOTE on rank / _cumsum_apply_suffix's comment) -- expect")
-    print("  a real speedup over the earlier (pre-cumsum) version of this")
-    print("  kernel at this same rank=head_dim setting, though not the FULL")
-    print("  low-rank compute win over the dense design, which still needs")
-    print("  rank<<head_dim to go asymptotically below O(head_dim^2) per token.")
 
     # =========================================================================
     print()

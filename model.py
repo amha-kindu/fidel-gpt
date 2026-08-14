@@ -46,53 +46,55 @@ class RoPeModule(nn.Module):
 
 
 class RiemannianMetric(nn.Module):
-    def __init__(self, heads: int, head_dim: int, rank: int, fused: bool = False):
+    def __init__(self, heads: int, head_dim: int, rank: int, modes: int, fused: bool = False):
         super().__init__()
+        self.rank = rank
+        self.modes = modes
         self.fused = fused
         self.heads = heads
         self.head_dim = head_dim
-        self.scale = head_dim ** 0.5
-        self.rank = min(rank, head_dim)
-        self.diag_baseline = math.log1p(math.log(2.0))
 
         self.weight_diag = nn.Parameter(torch.zeros(heads, head_dim))
-        self.weight_W = nn.Parameter(torch.zeros(heads, head_dim, self.rank))
-        self.weight_U = nn.Parameter(torch.empty(heads, head_dim, self.rank))
-        self.weight_V = nn.Parameter(torch.empty(heads, head_dim, self.rank))
+        self.weight_W = nn.Parameter(torch.zeros(heads, head_dim, self.modes))
+        self.weight_U = nn.Parameter(torch.empty(heads, self.modes, head_dim, self.rank))
+        self.weight_V = nn.Parameter(torch.empty(heads, self.modes, head_dim, self.rank))
         nn.init.normal_(self.weight_U, mean=0.0, std=head_dim ** -0.5)
         nn.init.normal_(self.weight_V, mean=0.0, std=head_dim ** -0.5)
 
         row = torch.arange(head_dim).view(head_dim, 1)
         col = torch.arange(head_dim).view(1, head_dim)
         self.register_buffer("lower_mask", row > col, persistent=False)
-
+        
+        self.diag_offset = 1.0 - math.log1p(math.log(2.0))
+    
     # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused:
-            return RiemannianMetricKernel.apply(
-                x, self.weight_diag, self.weight_W, self.weight_U, self.weight_V, self.scale,
-            )
+            return RiemannianMetricKernel.apply(x, self.weight_diag, self.weight_W, self.weight_U, self.weight_V)
+
+        # (HEADS, MODES, HEAD_DIM, RANK) @ (HEADS, MODES, RANK, HEAD_DIM) -> (HEADS, MODES, HEAD_DIM, HEAD_DIM)
+        B = torch.matmul(self.weight_U, self.weight_V.transpose(-2, -1))
+        B = torch.where(self.lower_mask, B, 0.0)
 
         # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
         raw_diag = x * self.weight_diag.view(1, self.heads, 1, self.head_dim)
-        L_diag = 1.0 + torch.log1p(F.softplus(raw_diag)) - self.diag_baseline
+        L_diag = torch.log1p(F.softplus(raw_diag)) + self.diag_offset
 
-        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM) @ (HEADS, HEAD_DIM, RANK) -> (N_BATCHES, HEADS, SEQ_LEN, RANK)
-        gate = torch.asinh(
-            torch.einsum("nhsd,hdr->nhsr", x, self.weight_W) / self.scale
+        # Extract non-linear features
+        gate = F.silu(
+            torch.einsum("nhsd,hdm->nhsm", x, self.weight_W)
         )
 
         # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)
-        L_offdiag = torch.einsum("nhsr,hir,hjr->nhsij", gate, self.weight_U, self.weight_V) / (self.rank ** 0.5)
-        L_offdiag = torch.where(self.lower_mask, L_offdiag, torch.zeros_like(L_offdiag))
-        L = L_offdiag + torch.diag_embed(L_diag)
+        L_offdiag = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B))
+        L = torch.diagonal_scatter(L_offdiag, L_diag, dim1=-2, dim2=-1)
 
-        # U_j = ∑_i x_i . L_ij  ->  U = x.L  ---  (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
-        u = torch.einsum("nhsd,nhsdj->nhsj", x, L)
+        # (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM) @ (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM) -> (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM)
+        u = torch.matmul(x.unsqueeze(-2), L)
 
-        # O_i = ∑_j U_j . L_ij  -> O = U.L_T ---  (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
-        return torch.einsum("nhsi,nhsji->nhsj", u, L)
+        # (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM) @ (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)* -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
+        return torch.matmul(u, L.transpose(-2, -1)).squeeze(-2)
 
 
 class MultiHeadAttentionModule(nn.Module):
@@ -111,7 +113,8 @@ class MultiHeadAttentionModule(nn.Module):
         if config.riemannian:
             fused = _RIEMANNIAN_KERNEL_AVAILABLE and torch.cuda.is_available()
             rank = getattr(config, "metric_rank", None) or self.d_head
-            self.riemannian_metric = RiemannianMetric(self.heads, self.d_head, rank, fused=fused)
+            modes = getattr(config, "metric_modes", None) or 1
+            self.riemannian_metric = RiemannianMetric(self.heads, self.d_head, rank, modes, fused=fused)
         
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)

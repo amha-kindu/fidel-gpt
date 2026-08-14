@@ -111,6 +111,7 @@ class ModelConfig(Config):
         self.tie_weights: bool = kwargs.get("tie_weights", True)
         self.riemannian: bool = kwargs.get("riemannian", False)
         self.metric_rank: int | None = kwargs.get("metric_rank", None)
+        self.metric_modes: int | None = kwargs.get("metric_modes", None)
 
 
 class ModelWithLoRAConfig(ModelConfig):
