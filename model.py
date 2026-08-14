@@ -66,7 +66,15 @@ class RiemannianMetric(nn.Module):
         self.register_buffer("lower_mask", row > col, persistent=False)
         
         self.diag_offset = 1.0 - math.log1p(math.log(2.0))
-    
+
+        # Variance-preserving normalization: without these, raw_gate/B/S's scale drifts with head_dim/
+        # rank/modes respectively, which couples "how big is this metric" to
+        # "what learning rate does it need" in a way that makes those three
+        # hyperparameters hard to scale independently.
+        self.gate_scale = head_dim ** -0.5
+        self.B_scale = self.rank ** -0.5
+        self.S_scale = self.modes ** -0.5
+
     # Input shape: x -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -74,7 +82,7 @@ class RiemannianMetric(nn.Module):
             return RiemannianMetricKernel.apply(x, self.weight_diag, self.weight_W, self.weight_U, self.weight_V)
 
         # (HEADS, MODES, HEAD_DIM, RANK) @ (HEADS, MODES, RANK, HEAD_DIM) -> (HEADS, MODES, HEAD_DIM, HEAD_DIM)
-        B = torch.matmul(self.weight_U, self.weight_V.transpose(-2, -1))
+        B = torch.matmul(self.weight_U, self.weight_V.transpose(-2, -1)) * self.B_scale
         B = torch.where(self.lower_mask, B, 0.0)
 
         # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
@@ -83,11 +91,12 @@ class RiemannianMetric(nn.Module):
 
         # Extract non-linear features
         gate = F.silu(
-            torch.einsum("nhsd,hdm->nhsm", x, self.weight_W)
+            torch.einsum("nhsd,hdm->nhsm", x, self.weight_W) * self.gate_scale
         )
 
         # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)
-        L_offdiag = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B))
+        S = torch.einsum("nhsm,hmij->nhsij", gate, B) * self.S_scale
+        L_offdiag = torch.asinh(S)
         L = torch.diagonal_scatter(L_offdiag, L_diag, dim1=-2, dim2=-1)
 
         # (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM) @ (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM) -> (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM)

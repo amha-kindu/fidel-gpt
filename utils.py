@@ -159,13 +159,13 @@ class RiemannianMetricProbe:
                 raw_diag = x_in * module.weight_diag.detach().float().view(1, module.heads, 1, module.head_dim)
                 diag = 1.0 + torch.log1p(F.softplus(raw_diag)) - self.diag_baseline  # L's diagonal, (N,H,S,head_dim)
 
-                raw_gate = torch.einsum("nhsd,hdm->nhsm", x_in, module.weight_W.detach().float())
+                raw_gate = torch.einsum("nhsd,hdm->nhsm", x_in, module.weight_W.detach().float()) * module.gate_scale
                 gate = F.silu(raw_gate)  # (N,H,S,modes)
 
                 U = module.weight_U.detach().float()
                 V = module.weight_V.detach().float()
-                B = torch.einsum("hmir,hmjr->hmij", U, V)  # (H,modes,head_dim,head_dim)
-                L_offdiag_full = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B))
+                B = torch.einsum("hmir,hmjr->hmij", U, V) * module.B_scale  # (H,modes,head_dim,head_dim)
+                L_offdiag_full = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B) * module.S_scale)
                 L_offdiag = torch.where(module.lower_mask, L_offdiag_full, torch.zeros_like(L_offdiag_full))
                 off_diag_sumsq = L_offdiag.pow(2).sum(dim=(-2, -1))  # (N,H,S)
 

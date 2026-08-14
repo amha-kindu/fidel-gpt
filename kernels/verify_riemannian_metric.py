@@ -66,14 +66,20 @@ def _fp64_truth(x, weight_diag, weight_W, weight_U, weight_V, lower_mask):
     always fed the same nudged/copied weights and the same x).
     """
     heads, head_dim = weight_diag.shape
+    modes = weight_W.shape[-1]
+    rank = weight_U.shape[-1]
+
+    gate_scale = head_dim ** -0.5
+    B_scale = rank ** -0.5
+    S_scale = modes ** -0.5
     x64, wd64, wW64, wU64, wV64 = (t.double() for t in (x, weight_diag, weight_W, weight_U, weight_V))
 
     raw_diag = x64 * wd64.view(1, heads, 1, head_dim)
     L_diag = torch.log1p(F.softplus(raw_diag)) + DIAG_OFFSET
-    gate = F.silu(torch.einsum("nhsd,hdm->nhsm", x64, wW64))
-    B = torch.matmul(wU64, wV64.transpose(-2, -1))
+    gate = F.silu(torch.einsum("nhsd,hdm->nhsm", x64, wW64) * gate_scale)
+    B = torch.matmul(wU64, wV64.transpose(-2, -1)) * B_scale
     B = torch.where(lower_mask, B, torch.zeros((), dtype=torch.float64, device=x.device))
-    L_offdiag = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B))
+    L_offdiag = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B) * S_scale)
     L = torch.diagonal_scatter(L_offdiag, L_diag, dim1=-2, dim2=-1)
     u = torch.matmul(x64.unsqueeze(-2), L)
     return torch.matmul(u, L.transpose(-2, -1)).squeeze(-2)
