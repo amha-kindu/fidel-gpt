@@ -53,10 +53,21 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
+    decay_params, no_decay_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "riemannian_metric" in name and name.rsplit(".", 1)[-1] in ("weight_W", "weight_U", "weight_V"):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+
     optimizer = torch.optim.AdamW(
-        params=[p for p in model.parameters() if p.requires_grad],
+        params=[
+            {"params": decay_params, "weight_decay": config.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
         lr=config.init_lr,
-        weight_decay=config.weight_decay,
         betas=(config.beta1, config.beta2),
         eps=config.epsilon
     )
@@ -199,7 +210,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
                 tb_logger.log_scalars("Loss/Curves", {"Train": training_loss}, global_step)
                 tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
-                
+
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
                     if isinstance(val_dataset, PackedTextStreamDataset):
                         val_dataset.set_epoch(global_step // config.validate_every)

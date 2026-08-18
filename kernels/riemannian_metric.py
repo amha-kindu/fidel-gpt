@@ -4,64 +4,42 @@ Triton forward+backward kernels for RiemannianMetric.
 MATH
     forward (per head h, per token -- x_h is the key/query itself, self-referential):
 
-        DIAGONAL (head_dim values -- guarantees non-singularity):
-            raw_diag[i]  = x_h[i] * weight_diag_h[i]              (element-wise)
-            L_diag[i]    = log1p(softplus(raw_diag[i])) + diag_offset
-                        diag_offset = 1 - log1p(log(2)), so L_diag > diag_offset
-                        always (>= ~0.4734)
+        raw_gate[m]  = x_h . weight_W_h[:, m]      (one scalar per mode m)
+        gate[m]      = silu(raw_gate[m])
+                        = raw_gate[m] * sigmoid(raw_gate[m])
 
-        OFF-DIAGONAL:
-            raw_gate[m]  = (x_h . weight_W_h[:, m]) / sqrt(head_dim)
-                        (scaled dot-product, one scalar per mode m -- /sqrt(head_dim)
-                        keeps raw_gate's pre-activation scale invariant to head_dim
-            gate[m]      = silu(raw_gate[m])
-                         = raw_gate[m] * sigmoid(raw_gate[m])
-
-            B_hm[i,j]    = (sum_r weight_U[h,m,i,r] * weight_V[h,m,j,r]) / sqrt(rank)
-                        restricted to strictly-lower-triangular (i,j) -- /sqrt(rank)
-                        keeps B_hm's scale invariant to rank (a sum of `rank` iid
-                        low-rank terms would otherwise grow B_hm's variance linearly
-                        in rank)
-            S[i,j]       = (sum_m gate[m] * B_hm[i,j]) / sqrt(modes)
-                        (gate-weighted mode sum -- /sqrt(modes) keeps S's scale
-                        invariant to how many modes are summed)
-            L_offdiag[i,j] = asinh(S[i,j])
+        B_hm[i,j]    = (sum_r weight_U[h,m,i,r] * weight_V[h,m,j,r]) / sqrt(rank)
+                    restricted to lower-triangular(including i>=j) -- /sqrt(rank) keeps B_hm's scale invariant to
+                    rank (a sum of `rank` iid low-rank terms would
+                    otherwise grow B_hm's variance linearly in rank)
+        S[i,j]       = (sum_m gate[m] * B_hm[i,j]) / sqrt(modes)
+                    (gate-weighted mode sum -- /sqrt(modes) keeps S's scale
+                    invariant to how many modes are summed)
+        L[i,j]       = asinh(S[i,j])
 
     FINAL:
-        L   = L_offdiag with its diagonal overwritten by L_diag
         u   = x_h @ L       u[j] = sum_i x_h[i] * L[i,j]
-        out = u @ L^T       out[k] = sum_j u[j] * L[k,j]
+        out = x_h + u @ L^T       out[k] = x_h[k] + sum_j u[j] * L[k,j]
 
     backward (per head h, per token; grad_out given):
+        grad_x  += grad_out[k]                           (direct, from the +x_h residual)
         grad_u        = grad_out @ L                    (same form as u = x@L)
-        grad_x_from_u = grad_u @ L^T                     (same form as out = u@L^T)
+        grad_x_from_u = grad_u @ L^T                     (same form as the u@L^T term of out)
         grad_L[p,q]   = grad_out[p]*u[q] + x[p]*grad_u[q]
-        grad_L_diag[i]   = grad_L[i,i]
-        grad_L_offdiag   = grad_L off the diagonal (upper triangle discarded
-
-        DIAGONAL:
-            grad_raw_diag[i] = grad_L_diag[i] * sigmoid(raw_diag[i]) / (1 + softplus(raw_diag[i]))
-            grad_x  += grad_raw_diag[i] * weight_diag_h[i]
-            grad_weight_diag_h[i] += grad_raw_diag[i] * x_h[i]
-
-        OFF-DIAGONAL:
-            grad_S[i,j]   = grad_L_offdiag[i,j] / sqrt(1 + S[i,j]^2)    (d(asinh)/dS,
-                          S here is the already-scaled S from MATH above)
-            grad_gate[m]  = (sum_ij grad_S[i,j] * B_hm[i,j]) / sqrt(modes)
-                          (chain rule through S's own /sqrt(modes))
-            grad_B_hm[i,j] += gate[m] * grad_S[i,j] / sqrt(modes)      (same chain rule)
-            grad_raw_gate[m] = grad_gate[m] * silu'(raw_gate[m])
-                              silu'(z) = sigmoid(z) * (1 + z*(1 - sigmoid(z)))
-            grad_x  += sum_m grad_raw_gate[m] * weight_W_h[i,m] / sqrt(head_dim)
-                          (chain rule through raw_gate's own /sqrt(head_dim))
-            grad_weight_W_h[i,m] += grad_raw_gate[m] * x_h[i] / sqrt(head_dim)    (same)
+        grad_S[i,j]   = grad_L[i,j] / sqrt(1 + S[i,j]^2)
+        grad_gate[m]  = (sum_ij grad_S[i,j] * B_hm[i,j]) / sqrt(modes)
+                      (chain rule through S's own /sqrt(modes))
+        grad_B_hm[i,j] += gate[m] * grad_S[i,j] / sqrt(modes)      (same chain rule)
+        grad_raw_gate[m] = grad_gate[m] * silu'(raw_gate[m])
+                          silu'(z) = sigmoid(z) * (1 + z*(1 - sigmoid(z)))
+        grad_x  += sum_m grad_raw_gate[m] * weight_W_h[i,m]
+        grad_weight_W_h[i,m] += grad_raw_gate[m] * x_h[i]
 
         Once grad_B_hm has been summed over every token sharing a head (see
-        "grad_weight_diag and grad_B" below), converting it to grad_weight_U/
-        grad_weight_V is plain matrix calculus, done OUTSIDE the per-token
-        kernels entirely (see RiemannianMetricKernel.backward()'s own comment
-        for why):
-            grad_B_hm[i,j], masked to strictly-lower-triangular (i,j) first --
+        "grad_B" below), converting it to grad_weight_U/grad_weight_V is
+        plain matrix calculus, done OUTSIDE the per-token kernels entirely
+        (see RiemannianMetricKernel.backward()'s own comment for why):
+            grad_B_hm[i,j], masked to lower-triangular-INCLUSIVE (i,j) first --
                 B_hm is exactly zero outside that region, so its raw
                 (unmasked) dot-product value never reached the loss; skipping
                 this mask would leak a numerically real but semantically
@@ -171,21 +149,21 @@ DESIGN:
         B_hm chunks (and S/L chunks) end up recomputed twice per kernel
         invocation (once in each of the two row-chunk passes) rather than
         cached -- consistent with this file's established "recompute rather
-        than save" preference (see kernel #3's own comment on why raw_gate/
-        L_diag are recomputed, not saved, across the forward/backward
-        boundary) and cheap now that the recomputation itself is a tensor-
-        core GEMM rather than a scalar loop.
+        than save" preference (see kernel #3's own comment on why raw_gate is
+        recomputed, not saved, across the forward/backward boundary) and
+        cheap now that the recomputation itself is a tensor-core GEMM rather
+        than a scalar loop.
 
     Four kernels:
         1. _riemannian_project_kernel: BATCHED across tokens (one real
            tl.dot GEMM per (head, seq-tile) block: x_block @ weight_W_h)
            computes raw_gate for every token (saved UNACTIVATED -- see MATH's
-           note on why silu needs raw_gate, not gate, in backward), plus the
-           (cheap, element-wise) diagonal L_diag. Both stored to scratch.
-           Directly analogous to the design this replaced's own projection
-           kernel, with modes standing in for rank and no asinh here (gate's
-           own activation now happens in kernel 2/3, right where it's used,
-           since only ONE of those kernels needs the unactivated value too).
+           note on why silu needs raw_gate, not gate, in backward), stored to
+           scratch. Directly analogous to the design this replaced's own
+           projection kernel, with modes standing in for rank and no asinh
+           here (gate's own activation now happens in kernel 2/3, right
+           where it's used, since only ONE of those kernels needs the
+           unactivated value too).
            Unchanged by the row-chunked rewrite above -- this kernel never had
            a per-token loop to begin with.
 
@@ -195,9 +173,11 @@ DESIGN:
            BLOCK_I)`:
                Pass 1 (i-chunks): computes u = x@L, accumulating across
                    chunks (u depends on ALL rows of L).
-               Pass 2 (k-chunks): computes out = u@L^T and stores it
-                   directly per chunk (out's k-th chunk is independent of
-                   every other chunk, no accumulation needed).
+               Pass 2 (k-chunks): computes out = x + u@L^T (the +x is
+                   model.py's own explicit residual, see module docstring's
+                   MATH section) and stores it directly per chunk (out's
+                   k-th chunk is independent of every other chunk, no
+                   accumulation needed).
            Each chunk reloads its own (MODES,BLOCK_I,BLOCK_D) slice of B_hm
            (small -- tens of KB, not the (MODES,BLOCK_D,BLOCK_D) full tensor
            an earlier version of this kernel held live for its whole
@@ -220,13 +200,12 @@ DESIGN:
            existed as this class's own inputs.
 
         3. _riemannian_grad_per_token_kernel: same row-chunked structure as
-           #2, for the same reason. Recomputes S/L/u from scratch (gate,
-           L_diag) rather than saving them from forward -- same "recompute
-           rather than save" call the design this replaced made after
-           measuring the memory-vs-recompute tradeoff on real hardware (see
-           that design's own backward() comment; not re-measured here, but
-           there's no structural reason this tradeoff would flip). Two
-           passes:
+           #2, for the same reason. Recomputes S/L/u from scratch (gate)
+           rather than saving them from forward -- same "recompute rather
+           than save" call the design this replaced made after measuring the
+           memory-vs-recompute tradeoff on real hardware (see that design's
+           own backward() comment; not re-measured here, but there's no
+           structural reason this tradeoff would flip). Two passes:
                Pass 1 (i-chunks): computes u AND grad_u together (same index
                    structure -- u=x@L, grad_u=grad_out@L -- so they share the
                    same L_chunk per chunk, halving the recomputation this
@@ -234,17 +213,15 @@ DESIGN:
                Pass 2 (p-chunks): recomputes L a second time (this row range
                    is what pass 1 called `i`, renamed `p` here to match
                    MATH's grad_L[p,q] notation) to derive, per chunk:
-                     - grad_x (diagonal branch's grad_x_diag + grad_u@L^T's
-                       grad_x_L for this chunk's rows) -- stored directly,
-                       no cross-chunk accumulation needed (disjoint rows).
-                     - grad_weight_diag_h's slice for this chunk's rows --
-                       a genuine reduction over tokens (sum over s), done via
-                       tl.sum then atomic_add-ed directly (chunks are
-                       disjoint in the row axis, so unlike the OLD per-token
-                       design, no register accumulator across chunks is
-                       needed here to avoid redundant atomics -- there's
-                       nothing redundant to avoid: every chunk's atomic_add
-                       already targets a different address range).
+                     - grad_x (grad_u@L^T's grad_x_L for this chunk's rows,
+                       the ONLY per-chunk contribution now that there's no
+                       separate diagonal branch) -- stored directly, no
+                       cross-chunk accumulation needed (disjoint rows). The
+                       +x residual's OWN direct contribution (grad_out
+                       itself, since d(x)/dx=I) is NOT computed in here --
+                       it's added once, outside any kernel, in
+                       RiemannianMetricKernel.backward()'s own final
+                       grad_x_total combination.
                      - grad_gate's contribution from this chunk -- a REAL
                        tl.dot GEMM (grad_S_chunk_flat @ B_chunk_flat^T),
                        accumulated across chunks (grad_gate sums over the
@@ -267,34 +244,32 @@ DESIGN:
 
         4. _riemannian_weight_w_and_gradxw_kernel: BATCHED (mirrors #1):
            grad_weight_W (genuine reduction over tokens -> grouped
-           atomic_add, same convention as grad_weight_diag/grad_B below) and
-           grad_x's gate-branch contribution (grad_raw_gate @ weight_W_h^T --
-           NOT a reduction across kernel programs in this design, since
-           modes is never tiled across the grid here, so a direct per-token
-           store suffices; this is the one place this kernel's lack of a
+           atomic_add, same convention as grad_B below) and grad_x's
+           gate-branch contribution (grad_raw_gate @ weight_W_h^T -- NOT a
+           reduction across kernel programs in this design, since modes is
+           never tiled across the grid here, so a direct per-token store
+           suffices; this is the one place this kernel's lack of a
            rank/modes tiling axis makes it strictly simpler than the design
            it replaces, which needed atomics here specifically because ITS
            rank axis COULD span multiple grid tiles). Unchanged by the
            row-chunked rewrite above -- this kernel never had a per-token
-           loop either.
+           loop either, and never touched the (now-removed) diagonal branch.
 
-    grad_weight_diag and grad_B are genuine reductions (summed over every
-    token sharing a head), accumulated via grouped tl.atomic_add into small
-    (NUM_GROUPS, ...) buffers -- same pattern and same reasoning (spreading
-    atomic contention across up to 32 buckets) as the design this replaced
-    used for its own grad_weight/grad_U/grad_V. Both are now derived, per
-    row-chunk, from operations that already sum over every token in the
-    program BEFORE the atomic_add fires (a plain tl.sum reduction for
-    grad_weight_diag, a real tl.dot GEMM contracting the token axis for
-    grad_B -- see kernel #3's own comment) -- so each row-chunk's atomic_add
-    is a single, non-redundant, disjoint-address write, a structural
-    improvement over an earlier version of this kernel where EVERY token
-    (and, before that, every (token,mode) pair) issued its own atomic_add to
-    the exact same address. grad_B is then converted to grad_weight_U/
-    grad_weight_V by two small torch.matmul calls in
-    RiemannianMetricKernel.backward() -- see that method's own comment, and
-    _build_B's, for why this conversion (like B's own construction)
-    deliberately happens OUTSIDE any @triton.jit kernel.
+    grad_B is a genuine reduction (summed over every token sharing a head),
+    accumulated via grouped tl.atomic_add into a small (NUM_GROUPS, ...)
+    buffer -- same pattern and same reasoning (spreading atomic contention
+    across up to 32 buckets) as the design this replaced used for its own
+    grad_weight/grad_U/grad_V. It's derived, per row-chunk, from a real
+    tl.dot GEMM contracting the token axis (see kernel #3's own comment) --
+    already summed over every token in the program BEFORE the atomic_add
+    fires -- so each row-chunk's atomic_add is a single, non-redundant,
+    disjoint-address write, a structural improvement over an earlier version
+    of this kernel where EVERY token (and, before that, every (token,mode)
+    pair) issued its own atomic_add to the exact same address. grad_B is
+    then converted to grad_weight_U/grad_weight_V by two small torch.matmul
+    calls in RiemannianMetricKernel.backward() -- see that method's own
+    comment, and _build_B's, for why this conversion (like B's own
+    construction) deliberately happens OUTSIDE any @triton.jit kernel.
 
     SCOPE / LIMITATIONS (deliberately not handled, unlike the design this
     replaced's rank-tiling):
@@ -325,36 +300,19 @@ DESIGN:
           Triton kernels, work that is wasted almost everywhere it ran since
           neither quantity depends on token or seq-tile position. model.py
           never builds B either way (fused or eager) -- for the fused path it
-          calls RiemannianMetricKernel.apply(x, weight_diag, weight_W,
-          weight_U, weight_V) directly; the only PyTorch autograd.Function
-          this file exposes takes weight_U/weight_V as first-class inputs and
-          returns grad_weight_U/grad_weight_V as first-class outputs.
+          calls RiemannianMetricKernel.apply(x, weight_W, weight_U, weight_V)
+          directly; the only PyTorch autograd.Function this file exposes
+          takes weight_U/weight_V as first-class inputs and returns
+          grad_weight_U/grad_weight_V as first-class outputs.
 """
 
-import math
 import torch
 import triton
 import triton.language as tl
 
-_DIAG_OFFSET = tl.constexpr(1.0 - math.log1p(math.log(2.0)))
-
-
-@triton.jit
-def _softplus(x):
-    # tl.exp/tl.log require fp32/fp64 in this Triton build (a real
-    # hardware/libdevice constraint, not a numerical choice, per the design
-    # this replaced), so upcast for the computation and cast back after.
-    x32 = x.to(tl.float32)
-    result = tl.maximum(x32, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x32)))
-    return result.to(x.dtype)
-
-
-@triton.jit
-def _log_softplus(x):
-    # log(1 + softplus(x)) -- see model.py's RiemannianMetric docstring.
-    x32 = x.to(tl.float32)
-    result = tl.log(1.0 + _softplus(x32))
-    return result.to(x.dtype)
+# tl.exp/tl.log require fp32/fp64 in this Triton build (a real hardware/
+# libdevice constraint, not a numerical choice) -- every helper below upcasts
+# for its computation and casts back after, same as this file always has.
 
 
 @triton.jit
@@ -391,8 +349,8 @@ def _asinh(x):
 
 @triton.jit
 def _riemannian_project_kernel(
-    x_ptr, weight_W_ptr, weight_diag_ptr, raw_gate_scratch_ptr, L_diag_scratch_ptr,
-    seq_len, heads, head_dim, modes, gate_scale,
+    x_ptr, weight_W_ptr, raw_gate_scratch_ptr,
+    seq_len, heads, head_dim, modes,
     BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_M: tl.constexpr,
 ):
     nh = tl.program_id(0)          # flat (batch, head) index: n * heads + h
@@ -422,14 +380,8 @@ def _riemannian_project_kernel(
         w_base + d_off[:, None] * modes + m_off[None, :],
         mask=d_mask[:, None] & m_mask[None, :], other=0.0,
     )  # (BLOCK_D, BLOCK_M)
-    # gate_scale = 1/sqrt(head_dim) -- see module docstring's MATH section.
-    # Applied ONCE, here, at the point raw_gate is created and stored to
-    # scratch -- every downstream reader of raw_gate_scratch (kernels 2/3's
-    # gate=silu(raw_gate), kernel 4's silu'(raw_gate)) then sees the already-
-    # scaled value with no further changes needed. Only kernel 4 (which
-    # differentiates raw_gate back through to x/weight_W) needs an explicit
-    # extra gate_scale factor of its own -- see that kernel's own comment.
-    raw_gate_tile = tl.dot(x_block, w_tile, allow_tf32=False) * gate_scale  # (BLOCK_S, BLOCK_M), fp32 accumulate
+    
+    raw_gate_tile = tl.dot(x_block, w_tile, allow_tf32=False)    # (BLOCK_S, BLOCK_M), fp32 accumulate
     raw_gate_tile = tl.where(m_mask[None, :], raw_gate_tile, 0.0)
     tl.store(
         raw_gate_scratch_ptr + token_off[:, None] * modes + m_off[None, :],
@@ -437,22 +389,10 @@ def _riemannian_project_kernel(
         mask=s_mask[:, None] & m_mask[None, :],
     )
 
-    # --- diagonal: element-wise, no matmul needed. ---
-    diag_base = weight_diag_ptr + head_id * head_dim
-    weight_diag_tile = tl.load(diag_base + d_off, mask=d_mask, other=0.0).to(tl.float32)  # (BLOCK_D,)
-    raw_diag_tile = x_block.to(tl.float32) * weight_diag_tile[None, :]  # (BLOCK_S, BLOCK_D)
-    L_diag_tile = _log_softplus(raw_diag_tile) + _DIAG_OFFSET
-    L_diag_tile = tl.where(d_mask[None, :], L_diag_tile, 0.0)
-    tl.store(
-        L_diag_scratch_ptr + token_off[:, None] * head_dim + d_off[None, :],
-        L_diag_tile,
-        mask=s_mask[:, None] & d_mask[None, :],
-    )
-
 
 @triton.jit
 def _riemannian_apply_fwd_kernel(
-    x_ptr, out_ptr, raw_gate_scratch_ptr, L_diag_scratch_ptr, B_ptr,
+    x_ptr, out_ptr, raw_gate_scratch_ptr, B_ptr,
     seq_len, heads, head_dim, modes, S_scale,
     BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
     USE_TF32: tl.constexpr,
@@ -515,14 +455,7 @@ def _riemannian_apply_fwd_kernel(
         # docstring's MATH section.
         S_flat = tl.dot(gate_block, B_chunk_flat, allow_tf32=USE_TF32) * S_scale  # (BLOCK_S, BLOCK_I*BLOCK_D), fp32
         S_chunk = tl.reshape(S_flat, (BLOCK_S, BLOCK_I, BLOCK_D))
-        Loff_chunk = _asinh(S_chunk)  # diagonal of this is exactly 0 (see module docstring)
-
-        L_diag_chunk = tl.load(
-            L_diag_scratch_ptr + token_off[:, None] * head_dim + i_off[None, :],
-            mask=s_mask[:, None] & i_mask[None, :], other=0.0,
-        )  # (BLOCK_S, BLOCK_I), fp32
-        eye_chunk = i_off[:, None] == d_off[None, :]  # (BLOCK_I, BLOCK_D)
-        L_chunk = tl.where(eye_chunk[None, :, :], L_diag_chunk[:, :, None], Loff_chunk)  # (BLOCK_S,BLOCK_I,BLOCK_D)
+        L_chunk = _asinh(S_chunk)
 
         x_chunk = tl.load(
             x_ptr + nh * seq_len * head_dim + s_off[:, None] * head_dim + i_off[None, :],
@@ -535,9 +468,9 @@ def _riemannian_apply_fwd_kernel(
         # across chunks (unlike out below, u genuinely needs every row of L).
         u_block += tl.sum(x_chunk[:, :, None] * L_chunk, axis=1)  # (BLOCK_S, BLOCK_D)
 
-    # --- pass 2: out = u @ L^T, each row-chunk of L's first index (k) stored
-    # directly -- no accumulation needed since out[:,k_chunk] doesn't depend
-    # on any other k-chunk. ---
+    # --- pass 2: out = x + u @ L^T, each row-chunk of L's first index (k)
+    # stored directly -- no accumulation needed since out[:,k_chunk] doesn't
+    # depend on any other k-chunk.
     for k0 in range(0, BLOCK_D, BLOCK_I):
         k_off = k0 + tl.arange(0, BLOCK_I)
         k_mask = k_off < head_dim
@@ -550,16 +483,14 @@ def _riemannian_apply_fwd_kernel(
         B_chunk_flat = tl.reshape(B_chunk, (BLOCK_M, BLOCK_I * BLOCK_D))
         S_flat = tl.dot(gate_block, B_chunk_flat, allow_tf32=USE_TF32) * S_scale
         S_chunk = tl.reshape(S_flat, (BLOCK_S, BLOCK_I, BLOCK_D))
-        Loff_chunk = _asinh(S_chunk)
+        L_chunk = _asinh(S_chunk)  # L[s,k_local,j], uniform (see pass 1's identical comment)
 
-        L_diag_chunk = tl.load(
-            L_diag_scratch_ptr + token_off[:, None] * head_dim + k_off[None, :],
+        x_k_chunk = tl.load(
+            x_ptr + nh * seq_len * head_dim + s_off[:, None] * head_dim + k_off[None, :],
             mask=s_mask[:, None] & k_mask[None, :], other=0.0,
-        )
-        eye_chunk = k_off[:, None] == d_off[None, :]
-        L_chunk = tl.where(eye_chunk[None, :, :], L_diag_chunk[:, :, None], Loff_chunk)  # L[s,k_local,j]
+        ).to(tl.float32)  # (BLOCK_S, BLOCK_I)
 
-        out_chunk = tl.sum(u_block[:, None, :] * L_chunk, axis=2)  # (BLOCK_S, BLOCK_I)
+        out_chunk = x_k_chunk + tl.sum(u_block[:, None, :] * L_chunk, axis=2)  # (BLOCK_S, BLOCK_I)
         tl.store(
             out_ptr + token_off[:, None] * head_dim + k_off[None, :],
             out_chunk.to(out_dtype),
@@ -571,18 +502,18 @@ def _riemannian_apply_fwd_kernel(
 def _riemannian_grad_per_token_kernel(
     x_ptr, grad_out_ptr,
     grad_x_ptr, grad_gate_scratch_ptr,
-    grad_weight_diag_partial_ptr, grad_B_partial_ptr,
-    raw_gate_scratch_ptr, L_diag_scratch_ptr, B_ptr, weight_diag_ptr,
+    grad_B_partial_ptr,
+    raw_gate_scratch_ptr, B_ptr,
     seq_len, heads, head_dim, modes, S_scale,
     BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
     NUM_GROUPS: tl.constexpr, USE_TF32: tl.constexpr,
 ):
     # Same row-chunked structure as _riemannian_apply_fwd_kernel, for the
     # same reasons (see module docstring's DESIGN section) -- no per-token
-    # loop. Recomputes S/L/u (and now grad_u) from gate/L_diag rather than
-    # saving them from forward, same "recompute rather than save" call the
-    # design this replaced made after measuring the memory-vs-recompute
-    # tradeoff on real hardware.
+    # loop. Recomputes S/L/u (and now grad_u) from gate rather than saving
+    # them from forward, same "recompute rather than save" call the design
+    # this replaced made after measuring the memory-vs-recompute tradeoff on
+    # real hardware.
     #
     # grad_gate is stored here UNACTIVATED-derivative-applied -- i.e. this
     # kernel stores grad_gate (d(loss)/d(gate)), and
@@ -632,14 +563,7 @@ def _riemannian_grad_per_token_kernel(
         B_chunk_flat = tl.reshape(B_chunk, (BLOCK_M, BLOCK_I * BLOCK_D))
         S_flat = tl.dot(gate_block, B_chunk_flat, allow_tf32=USE_TF32) * S_scale
         S_chunk = tl.reshape(S_flat, (BLOCK_S, BLOCK_I, BLOCK_D))
-        Loff_chunk = _asinh(S_chunk)
-
-        L_diag_chunk = tl.load(
-            L_diag_scratch_ptr + token_off[:, None] * head_dim + i_off[None, :],
-            mask=s_mask[:, None] & i_mask[None, :], other=0.0,
-        )
-        eye_chunk = i_off[:, None] == d_off[None, :]
-        L_chunk = tl.where(eye_chunk[None, :, :], L_diag_chunk[:, :, None], Loff_chunk)
+        L_chunk = _asinh(S_chunk)  # uniform -- B_hm's own mask now includes the diagonal, see module docstring
 
         x_chunk = tl.load(
             x_ptr + nh * seq_len * head_dim + s_off[:, None] * head_dim + i_off[None, :],
@@ -654,12 +578,14 @@ def _riemannian_grad_per_token_kernel(
         grad_u_block += tl.sum(grad_out_chunk[:, :, None] * L_chunk, axis=1)
 
     # --- pass 2: recompute L a second time per row-chunk (p, matching MATH's
-    # grad_L[p,q] notation) to derive grad_x, grad_weight_diag, grad_gate,
-    # grad_B for that chunk's rows. grad_x/grad_weight_diag are stored/
-    # atomic_add-ed directly per chunk (disjoint rows -> no cross-chunk
-    # accumulator needed); grad_gate is accumulated across chunks (it sums
-    # over the FULL (i,j) domain); grad_B's token-axis reduction happens
-    # INSIDE the tl.dot below, so its atomic_add is also direct-per-chunk. ---
+    # grad_L[p,q] notation) to derive grad_x, grad_gate, grad_B for that
+    # chunk's rows. grad_x is stored directly per chunk (disjoint rows -> no
+    # cross-chunk accumulator needed); grad_gate is accumulated across
+    # chunks (it sums over the FULL (i,j) domain); grad_B's token-axis
+    # reduction happens INSIDE the tl.dot below, so its atomic_add is also
+    # direct-per-chunk. No diagonal/off-diagonal split anywhere in here --
+    # B_hm's own mask already includes the diagonal (see module docstring's
+    # MATH section), so grad_S is derived uniformly from the FULL grad_L. ---
     grad_gate_acc = tl.zeros((BLOCK_S, BLOCK_M), dtype=tl.float32)
     for p0 in range(0, BLOCK_D, BLOCK_I):
         p_off = p0 + tl.arange(0, BLOCK_I)
@@ -673,15 +599,7 @@ def _riemannian_grad_per_token_kernel(
         B_chunk_flat = tl.reshape(B_chunk, (BLOCK_M, BLOCK_I * BLOCK_D))
         S_flat = tl.dot(gate_block, B_chunk_flat, allow_tf32=USE_TF32) * S_scale
         S_chunk = tl.reshape(S_flat, (BLOCK_S, BLOCK_I, BLOCK_D))
-        Loff_chunk = _asinh(S_chunk)
-
-        L_diag_chunk = tl.load(
-            L_diag_scratch_ptr + token_off[:, None] * head_dim + p_off[None, :],
-            mask=s_mask[:, None] & p_mask[None, :], other=0.0,
-        )
-        eye_chunk = p_off[:, None] == d_off[None, :]  # (BLOCK_I, BLOCK_D)
-        not_eye_chunk = eye_chunk == 0
-        L_chunk = tl.where(eye_chunk[None, :, :], L_diag_chunk[:, :, None], Loff_chunk)
+        L_chunk = _asinh(S_chunk)  # uniform (see pass 1's identical comment)
 
         x_chunk = tl.load(
             x_ptr + nh * seq_len * head_dim + s_off[:, None] * head_dim + p_off[None, :],
@@ -698,29 +616,6 @@ def _riemannian_grad_per_token_kernel(
             + x_chunk[:, :, None] * grad_u_block[:, None, :]
         )  # (BLOCK_S, BLOCK_I, BLOCK_D)
 
-        # --- diagonal branch ---
-        grad_L_diag_chunk = tl.sum(tl.where(eye_chunk[None, :, :], grad_L_chunk, 0.0), axis=2)  # (BLOCK_S,BLOCK_I)
-        weight_diag_chunk = tl.load(
-            weight_diag_ptr + head_id * head_dim + p_off, mask=p_mask, other=0.0,
-        ).to(tl.float32)  # (BLOCK_I,)
-        raw_diag_chunk = x_chunk * weight_diag_chunk[None, :]
-        packed_chunk = _softplus(raw_diag_chunk)
-        d_Ldiag_d_rawdiag_chunk = _sigmoid(raw_diag_chunk) / (1.0 + packed_chunk)
-        grad_raw_diag_chunk = grad_L_diag_chunk * d_Ldiag_d_rawdiag_chunk
-
-        grad_x_diag_chunk = grad_raw_diag_chunk * weight_diag_chunk[None, :]
-        # grad_weight_diag_h[p] = sum_s grad_raw_diag[s,p]*x[s,p] -- a genuine
-        # reduction over every token in this program, done via tl.sum BEFORE
-        # the atomic_add fires (not accumulated token-by-token via repeated
-        # atomics the way an earlier version of this kernel did it).
-        grad_weight_diag_chunk = tl.sum(grad_raw_diag_chunk * x_chunk, axis=0)  # (BLOCK_I,)
-        tl.atomic_add(
-            grad_weight_diag_partial_ptr + group_id * heads * head_dim + head_id * head_dim + p_off,
-            grad_weight_diag_chunk, mask=p_mask,
-        )
-
-        # --- off-diagonal branch ---
-        grad_Loff_chunk = tl.where(not_eye_chunk[None, :, :], grad_L_chunk, 0.0)  # upper triangle discarded too (see module docstring)
         # grad_S_chunk here is d(loss)/d(S) -- S being the already-scaled S from
         # module docstring's MATH section (S_chunk IS that S, per the S_scale
         # multiply above). The extra `* S_scale` below is the chain-rule step
@@ -728,7 +623,7 @@ def _riemannian_grad_per_token_kernel(
         # UNSCALED gate-weighted sum) -- which is what grad_gate_acc/
         # grad_B_chunk_flat below are actually differentiating through (see
         # module docstring's backward MATH section).
-        grad_S_chunk = grad_Loff_chunk / tl.sqrt(1.0 + S_chunk * S_chunk) * S_scale  # asinh'(S) = 1/sqrt(1+S^2)
+        grad_S_chunk = grad_L_chunk / tl.sqrt(1.0 + S_chunk * S_chunk) * S_scale  # asinh'(S) = 1/sqrt(1+S^2)
         grad_S_chunk_flat = tl.reshape(grad_S_chunk, (BLOCK_S, BLOCK_I * BLOCK_D))
 
         # grad_gate[s,m] += sum_{p_local,j} grad_S[s,p_local,j]*B[m,p_local,j]
@@ -755,9 +650,10 @@ def _riemannian_grad_per_token_kernel(
             mask=m_mask[:, None, None] & p_mask[None, :, None] & d_mask[None, None, :],
         )
 
-        # --- grad_x: L-application term (grad_u@L^T, this chunk's rows) + diagonal term ---
-        grad_x_L_chunk = tl.sum(grad_u_block[:, None, :] * L_chunk, axis=2)  # (BLOCK_S, BLOCK_I)
-        grad_x_chunk = grad_x_L_chunk + grad_x_diag_chunk
+        # --- grad_x: L-application term (grad_u@L^T, this chunk's rows) --
+        # the ONLY per-chunk contribution now that there's no separate
+        # diagonal branch (see this kernel's own comment above pass 2). ---
+        grad_x_chunk = tl.sum(grad_u_block[:, None, :] * L_chunk, axis=2)  # (BLOCK_S, BLOCK_I)
         tl.store(
             grad_x_ptr + token_off[:, None] * head_dim + p_off[None, :],
             grad_x_chunk.to(out_dtype), mask=s_mask[:, None] & p_mask[None, :],
@@ -773,23 +669,21 @@ def _riemannian_grad_per_token_kernel(
 def _riemannian_weight_w_and_gradxw_kernel(
     x_ptr, weight_W_ptr, raw_gate_scratch_ptr, grad_gate_scratch_ptr,
     grad_x_w_ptr, grad_weight_W_partial_ptr,
-    seq_len, heads, head_dim, modes, gate_scale,
+    seq_len, heads, head_dim, modes,
     BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_M: tl.constexpr, NUM_GROUPS: tl.constexpr,
 ):
     # Batched matmul mirror of _riemannian_project_kernel, on the backward
     # side -- identical structure to the design this replaced's own
     # weight-and-gradxw kernel, modes standing in for rank:
     #     grad_raw_gate[s,m]  = grad_gate[s,m] * silu'(raw_gate[s,m])   (elementwise, computed HERE;
-    #                            raw_gate here is the already-/sqrt(head_dim)-scaled value kernel #1
-    #                            stored -- see that kernel's own comment)
-    #     grad_weight_W_h[d,m] = sum_s x[s,d]*grad_raw_gate[s,m] / sqrt(head_dim)  (x_block^T @ grad_raw_gate_block,
-    #                            /sqrt(head_dim) is the chain-rule step through raw_gate's OWN
-    #                            /sqrt(head_dim) -- see module docstring's MATH section)
-    #     grad_x_w[s,d]        = sum_m grad_raw_gate[s,m]*weight_W_h[d,m] / sqrt(head_dim)  (grad_raw_gate_block @ weight_W_h^T, same chain rule)
+    #                            raw_gate here is the unscaled value kernel #1 stored -- see that
+    #                            kernel's own comment)
+    #     grad_weight_W_h[d,m] = sum_s x[s,d]*grad_raw_gate[s,m]  (x_block^T @ grad_raw_gate_block)
+    #     grad_x_w[s,d]        = sum_m grad_raw_gate[s,m]*weight_W_h[d,m]  (grad_raw_gate_block @ weight_W_h^T)
     #
     # grad_weight_W is a genuine reduction over every token sharing a head
     # (every seq-tile program contributes a partial sum), so it's accumulated
-    # via grouped atomic_add, same convention as grad_weight_diag/grad_B in
+    # via grouped atomic_add, same convention as grad_B in
     # _riemannian_grad_per_token_kernel. grad_x_w is NOT a reduction across
     # kernel programs in this design (unlike the design this replaced, whose
     # rank axis could span multiple grid tiles) -- modes is never tiled
@@ -838,18 +732,13 @@ def _riemannian_weight_w_and_gradxw_kernel(
         mask=d_mask[:, None] & m_mask[None, :], other=0.0,
     ).to(tl.float32)  # (BLOCK_D, BLOCK_M)
 
-    # * gate_scale on both dots below: chain rule through raw_gate's own
-    # /sqrt(head_dim) (see module docstring's MATH section) -- grad_raw_gate_block
-    # is d(loss)/d(raw_gate) (raw_gate already scaled), but x/weight_W's OWN
-    # gradients need one more factor of gate_scale to account for how raw_gate
-    # itself depends on them.
-    grad_x_w = tl.dot(grad_raw_gate_block, tl.trans(w_tile), allow_tf32=False) * gate_scale  # (BLOCK_S, BLOCK_D), fp32
+    grad_x_w = tl.dot(grad_raw_gate_block, tl.trans(w_tile), allow_tf32=False)   # (BLOCK_S, BLOCK_D), fp32
     tl.store(
         grad_x_w_ptr + token_off[:, None] * head_dim + d_off[None, :], grad_x_w.to(out_dtype),
         mask=s_mask[:, None] & d_mask[None, :],
     )
 
-    gw_tile = tl.dot(tl.trans(x_block), grad_raw_gate_block, allow_tf32=False) * gate_scale  # (BLOCK_D, BLOCK_M), fp32
+    gw_tile = tl.dot(tl.trans(x_block), grad_raw_gate_block, allow_tf32=False)   # (BLOCK_D, BLOCK_M), fp32
     gw_base = grad_weight_W_partial_ptr + (group_id * heads + head_id) * head_dim * modes
     tl.atomic_add(
         gw_base + d_off[:, None] * modes + m_off[None, :], gw_tile,
@@ -872,8 +761,10 @@ def _block_i(block_s, block_d, cap):
 
 
 class RiemannianMetricKernel(torch.autograd.Function):
-    # Inputs: x (N,H,S,D), weight_diag (H,D), weight_W (H,D,M), weight_U (H,M,D,R),
-    # weight_V (H,M,D,R). B_hm = mask(weight_U @ weight_V^T) is built by ONE plain
+    # Inputs: x (N,H,S,D), weight_W (H,D,M), weight_U (H,M,D,R), weight_V (H,M,D,R).
+    # No weight_diag -- see module docstring's MATH section for why (B_hm's own
+    # mask now includes the diagonal, so weight_U/weight_V build it too).
+    # B_hm = mask(weight_U @ weight_V^T) is built by ONE plain
     # torch.matmul call inside forward()/backward() below -- NOT inside the
     # per-(head,seq-tile)/per-token Triton kernels (that was tried and reverted
     # for being catastrophically slow, see _build_B()'s own comment and the
@@ -911,28 +802,27 @@ class RiemannianMetricKernel(torch.autograd.Function):
         B_scale = float(rank) ** -0.5
         row = torch.arange(head_dim, device=weight_U_c.device).view(head_dim, 1)
         col = torch.arange(head_dim, device=weight_U_c.device).view(1, head_dim)
-        lower_mask = row > col  # (D, D), strictly-lower-triangular -- same convention as model.py's own lower_mask
+        # row >= col (INCLUDING the diagonal), not strictly-lower-triangular --
+        # same convention as model.py's own lower_mask. This is what lets
+        # weight_U/weight_V build L's diagonal too, see module docstring's MATH
+        # section -- there's no separate weight_diag parameter in this design.
+        lower_mask = row >= col  # (D, D)
         B = torch.matmul(weight_U_c, weight_V_c.transpose(-2, -1)) * B_scale
         return torch.where(lower_mask, B, 0.0), lower_mask, B_scale
 
     @staticmethod
-    def forward(ctx, x, weight_diag, weight_W, weight_U, weight_V):
+    def forward(ctx, x, weight_W, weight_U, weight_V):
         N, heads, S, head_dim = x.shape
         modes = weight_W.shape[-1]
         n_tokens = N * heads * S
         n_nh = N * heads
 
         x_c = x.contiguous()
-        weight_diag_c = weight_diag.contiguous().to(x_c.dtype)
         weight_W_c = weight_W.contiguous().to(x_c.dtype)
         weight_U_c = weight_U.contiguous().to(x_c.dtype)
         weight_V_c = weight_V.contiguous().to(x_c.dtype)
         B_c, _, _ = RiemannianMetricKernel._build_B(weight_U_c, weight_V_c, head_dim)
-        # gate_scale/S_scale: see module docstring's MATH section. B_scale is
-        # already baked into B_c above by _build_B -- forward doesn't need its
-        # own copy of it (only backward()'s grad_weight_U/grad_weight_V
-        # conversion does, see that method's own comment).
-        gate_scale = float(head_dim) ** -0.5
+
         S_scale = float(modes) ** -0.5
 
         # tl.dot needs every operand dimension >= 16 (tensor-core constraint).
@@ -994,11 +884,10 @@ class RiemannianMetricKernel(torch.autograd.Function):
         USE_TF32 = x_c.dtype != torch.float32
 
         raw_gate_scratch = torch.empty(n_tokens, modes, dtype=torch.float32, device=x.device)
-        L_diag_scratch = torch.empty(n_tokens, head_dim, dtype=torch.float32, device=x.device)
         grid = (n_nh, triton.cdiv(S, BLOCK_S))
         _riemannian_project_kernel[grid](
-            x_c.view(n_tokens, head_dim), weight_W_c, weight_diag_c, raw_gate_scratch, L_diag_scratch,
-            S, heads, head_dim, modes, gate_scale,
+            x_c.view(n_tokens, head_dim), weight_W_c, raw_gate_scratch,
+            S, heads, head_dim, modes,
             BLOCK_D=BLOCK_D, BLOCK_S=BLOCK_S, BLOCK_M=BLOCK_M,
             num_warps=8,
         )
@@ -1012,33 +901,33 @@ class RiemannianMetricKernel(torch.autograd.Function):
         # uncontrolled shared-memory growth on top of the BLOCK_I sizing above.
         _riemannian_apply_fwd_kernel[grid](
             x_c.view(n_tokens, head_dim), out.view(n_tokens, head_dim),
-            raw_gate_scratch, L_diag_scratch, B_c,
+            raw_gate_scratch, B_c,
             S, heads, head_dim, modes, S_scale,
             BLOCK_D=BLOCK_D, BLOCK_S=BLOCK_S, BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I_FWD, USE_TF32=USE_TF32,
             num_warps=8, num_stages=2,
         )
 
-        # raw_gate_scratch/L_diag_scratch/B_c NOT saved -- all three recomputed
-        # in backward instead. raw_gate_scratch/L_diag_scratch: same recompute-
-        # not-save call the design this replaced made after measuring the
-        # memory-vs-recompute tradeoff on real hardware (see that design's own
-        # backward() comment; not re-measured here, but there's no structural
-        # reason it would flip for this design). B_c: recomputing costs one
-        # tiny matmul (see _build_B), cheaper than saving a second (heads,modes,
-        # D,D) tensor across the forward/backward boundary for no real benefit.
-        ctx.save_for_backward(x_c, weight_diag_c, weight_W_c, weight_U_c, weight_V_c)
+        # raw_gate_scratch/B_c NOT saved -- both recomputed in backward instead.
+        # raw_gate_scratch: same recompute-not-save call the design this
+        # replaced made after measuring the memory-vs-recompute tradeoff on
+        # real hardware (see that design's own backward() comment; not
+        # re-measured here, but there's no structural reason it would flip for
+        # this design). B_c: recomputing costs one tiny matmul (see _build_B),
+        # cheaper than saving a second (heads,modes,D,D) tensor across the
+        # forward/backward boundary for no real benefit.
+        ctx.save_for_backward(x_c, weight_W_c, weight_U_c, weight_V_c)
         ctx.shapes = (N, heads, S, head_dim, modes, n_tokens, n_nh)
         # BLOCK_I NOT stored -- forward's and backward's row-chunked kernels use
         # DIFFERENT caps (see _block_i's own comment), so each recomputes its own
         # from BLOCK_D/BLOCK_S below rather than one being derived from a value
         # the other picked.
         ctx.blocks = (BLOCK_D, BLOCK_S, BLOCK_M)
-        ctx.orig_dtypes = (weight_diag.dtype, weight_W.dtype, weight_U.dtype, weight_V.dtype)
+        ctx.orig_dtypes = (weight_W.dtype, weight_U.dtype, weight_V.dtype)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, weight_diag, weight_W, weight_U, weight_V = ctx.saved_tensors
+        x, weight_W, weight_U, weight_V = ctx.saved_tensors
         N, heads, S, head_dim, modes, n_tokens, n_nh = ctx.shapes
         BLOCK_D, BLOCK_S, BLOCK_M = ctx.blocks
         # cap=4096, same as forward's -- CONFIRMED at this cap: originally
@@ -1058,22 +947,16 @@ class RiemannianMetricKernel(torch.autograd.Function):
         # not evidence to keep raising it further on reasoning alone.
         BLOCK_I_BWD = _block_i(BLOCK_S, BLOCK_D, 4096)
         USE_TF32 = x.dtype != torch.float32
-        # gate_scale/S_scale: derived fresh from head_dim/modes (already in
-        # ctx.shapes), same as forward() -- not stored on ctx separately since
-        # they're pure functions of values already there. B_scale comes back
-        # from _build_B below (needed for the grad_weight_U/grad_weight_V
-        # conversion at the end of this method).
-        gate_scale = float(head_dim) ** -0.5
+        
         S_scale = float(modes) ** -0.5
         grad_out_c = grad_out.contiguous()
         B_c, lower_mask, B_scale = RiemannianMetricKernel._build_B(weight_U, weight_V, head_dim)
 
         raw_gate_scratch = torch.empty(n_tokens, modes, dtype=torch.float32, device=x.device)
-        L_diag_scratch = torch.empty(n_tokens, head_dim, dtype=torch.float32, device=x.device)
         grid = (n_nh, triton.cdiv(S, BLOCK_S))
         _riemannian_project_kernel[grid](
-            x.view(n_tokens, head_dim), weight_W, weight_diag, raw_gate_scratch, L_diag_scratch,
-            S, heads, head_dim, modes, gate_scale,
+            x.view(n_tokens, head_dim), weight_W, raw_gate_scratch,
+            S, heads, head_dim, modes,
             BLOCK_D=BLOCK_D, BLOCK_S=BLOCK_S, BLOCK_M=BLOCK_M,
             num_warps=8,
         )
@@ -1083,7 +966,6 @@ class RiemannianMetricKernel(torch.autograd.Function):
 
         grad_x = torch.empty_like(x)
         grad_gate_scratch = torch.empty(n_tokens, modes, dtype=x.dtype, device=x.device)
-        grad_weight_diag_partial = torch.zeros(NUM_GROUPS, heads, head_dim, dtype=torch.float32, device=x.device)
         grad_B_partial = torch.zeros(NUM_GROUPS, heads, modes, head_dim, head_dim, dtype=torch.float32, device=x.device)
 
         # num_stages=2 pinned here too -- see the matching comment on
@@ -1091,8 +973,8 @@ class RiemannianMetricKernel(torch.autograd.Function):
         _riemannian_grad_per_token_kernel[grid](
             x.view(n_tokens, head_dim), grad_out_c.view(n_tokens, head_dim),
             grad_x.view(n_tokens, head_dim), grad_gate_scratch,
-            grad_weight_diag_partial, grad_B_partial,
-            raw_gate_scratch, L_diag_scratch, B_c, weight_diag,
+            grad_B_partial,
+            raw_gate_scratch, B_c,
             S, heads, head_dim, modes, S_scale,
             BLOCK_D=BLOCK_D, BLOCK_S=BLOCK_S, BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I_BWD, USE_TF32=USE_TF32,
             NUM_GROUPS=NUM_GROUPS,
@@ -1104,13 +986,12 @@ class RiemannianMetricKernel(torch.autograd.Function):
         _riemannian_weight_w_and_gradxw_kernel[grid](
             x.view(n_tokens, head_dim), weight_W, raw_gate_scratch, grad_gate_scratch,
             grad_x_w.view(n_tokens, head_dim), grad_weight_W_partial,
-            S, heads, head_dim, modes, gate_scale,
+            S, heads, head_dim, modes,
             BLOCK_D=BLOCK_D, BLOCK_S=BLOCK_S, BLOCK_M=BLOCK_M, NUM_GROUPS=NUM_GROUPS,
             num_warps=8,
         )
 
-        grad_x_total = grad_x + grad_x_w.to(x.dtype)
-        grad_weight_diag_f32 = grad_weight_diag_partial.sum(dim=0)
+        grad_x_total = grad_out_c + grad_x + grad_x_w.to(x.dtype)
         grad_weight_W_f32 = grad_weight_W_partial.sum(dim=0)
         grad_B_f32 = grad_B_partial.sum(dim=0)
 
@@ -1134,10 +1015,9 @@ class RiemannianMetricKernel(torch.autograd.Function):
         # grad_weight_V_h[m,j,r] = sum_i grad_B_hm[i,j]*weight_U_h[m,i,r] / sqrt(rank)
         grad_weight_V_f32 = torch.matmul(grad_B_masked_f32.transpose(-2, -1), weight_U.to(torch.float32)) * B_scale
 
-        orig_diag_dtype, orig_W_dtype, orig_U_dtype, orig_V_dtype = ctx.orig_dtypes
+        orig_W_dtype, orig_U_dtype, orig_V_dtype = ctx.orig_dtypes
         return (
             grad_x_total,
-            grad_weight_diag_f32.to(orig_diag_dtype),
             grad_weight_W_f32.to(orig_W_dtype),
             grad_weight_U_f32.to(orig_U_dtype),
             grad_weight_V_f32.to(orig_V_dtype),

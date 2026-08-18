@@ -1,5 +1,4 @@
 import re
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -141,10 +140,23 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
             tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
 
 
+def _cosine_gram(vecs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    norm = vecs.norm(dim=-1)
+    vecs_norm = vecs / norm.clamp_min(1e-12).unsqueeze(-1)  # eps: divide-by-exact-zero guard only
+    gram = torch.matmul(vecs_norm, vecs_norm.transpose(-2, -1)).pow(2)
+    return gram, norm
+
+
+def _mode_gram(module) -> tuple[torch.Tensor, torch.Tensor]:
+    B = torch.matmul(module.weight_U, module.weight_V.transpose(-2, -1)) * module.B_scale
+    B = torch.where(module.lower_mask, B, 0.0)
+    B_flat = B.reshape(module.heads, module.modes, -1)
+    return _cosine_gram(B_flat)
+
+
 class RiemannianMetricProbe:
     def __init__(self, model):
         self.stats = []
-        self.diag_baseline = math.log1p(math.log(2.0))
         self.handles = [
             dec.masked_multihead_attention.riemannian_metric.register_forward_hook(self._make_hook(i))
             for i, dec in enumerate(model.decoders)
@@ -153,45 +165,78 @@ class RiemannianMetricProbe:
 
     def _make_hook(self, layer_idx: int):
         def hook(module, inp, out):
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type=inp[0].device.type, enabled=False):
                 x_in = inp[0].detach().float()
 
-                raw_diag = x_in * module.weight_diag.detach().float().view(1, module.heads, 1, module.head_dim)
-                diag = 1.0 + torch.log1p(F.softplus(raw_diag)) - self.diag_baseline  # L's diagonal, (N,H,S,head_dim)
-
-                raw_gate = torch.einsum("nhsd,hdm->nhsm", x_in, module.weight_W.detach().float()) * module.gate_scale
+                raw_gate = torch.einsum("nhsd,hdm->nhsm", x_in, module.weight_W.detach().float())
                 gate = F.silu(raw_gate)  # (N,H,S,modes)
 
                 U = module.weight_U.detach().float()
                 V = module.weight_V.detach().float()
                 B = torch.einsum("hmir,hmjr->hmij", U, V) * module.B_scale  # (H,modes,head_dim,head_dim)
-                L_offdiag_full = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B) * module.S_scale)
-                L_offdiag = torch.where(module.lower_mask, L_offdiag_full, torch.zeros_like(L_offdiag_full))
-                off_diag_sumsq = L_offdiag.pow(2).sum(dim=(-2, -1))  # (N,H,S)
+                B = torch.where(module.lower_mask, B, torch.zeros_like(B))
+                L = torch.asinh(torch.einsum("nhsm,hmij->nhsij", gate, B) * module.S_scale)  # (N,H,S,head_dim,head_dim)
 
-                # trace(M) = ||L||_F^2 = sum of squares over the WHOLE lower triangle (diag + off-diag) --
-                # M's total "energy", = head_dim at the identity init.
-                trace_M = diag.pow(2).sum(-1) + off_diag_sumsq   # (N,H,S)
+                # G = I + L@L^T is the metric actually APPLIED to x (out = x @ G)
+                trace_G = module.head_dim + L.pow(2).sum(dim=(-2, -1))   # (N,H,S) == trace(G) exactly
 
-                # det(M) = det(L)^2 = (prod of L's diagonal)^2 -- off-diagonal entries don't affect
-                # volume, only orientation/coupling.
-                log_det_M = 2.0 * diag.clamp_min(1e-12).log().sum(-1)   # (N,H,S)
-                
-                trace_per_head = (trace_M / module.head_dim).mean(dim=(0, 2))       # (H,) arithmetic mean eigenvalue -- ~1 at init
-                log_det_per_head = (log_det_M / module.head_dim).mean(dim=(0, 2))   # (H,) log of geometric mean eigenvalue -- ~0 at init
+                eye = torch.eye(module.head_dim, device=x_in.device, dtype=L.dtype)
+                G = eye + torch.matmul(L, L.transpose(-2, -1))  # (N,H,S,head_dim,head_dim), symmetric PD
+                C = torch.linalg.cholesky(G)   # (N,H,S,head_dim,head_dim), lower-triangular, G = C @ C^T
+                diag_C = torch.diagonal(C, dim1=-2, dim2=-1)
+                # clamp_min is a pure fp-roundoff guard (G's eigenvalues are >=1 by construction, so
+                # C's diagonal should stay well away from 0 too) -- not a masked-singularity floor,
+                # since G can't be singular in the first place.
+                log_det_G = 2.0 * diag_C.clamp_min(1e-12).log().sum(-1)   # (N,H,S) == log det(G) exactly
+
+                trace_per_head = (trace_G / module.head_dim).mean(dim=(0, 2))       # (H,) arithmetic mean eigenvalue -- 1 at L=0 (G=I)
+                log_det_per_head = (log_det_G / module.head_dim).mean(dim=(0, 2))   # (H,) log of geometric mean eigenvalue -- 0 at L=0 (G=I)
 
                 # Isotropy = geometric_mean(eigenvalues) / arithmetic_mean(eigenvalues) in (0, 1],
-                # by AM-GM. It equals 1 iff the metric is a scalar multiple of the identity(perfectly
-                # isotropic), and approaches 0 as the metric becomes singular/ill-conditioned
-                # (collapses some direction toward singular).
-                # Unlike trace, this detects anisotropy rather than just overall scale.
+                # by AM-GM -- computed here purely from the trace/log-det AGGREGATES above, without
+                # ever needing G's individual eigenvalues. It equals 1 iff the metric is a scalar
+                # multiple of the identity (perfectly isotropic), and approaches 0 as the metric
+                # becomes ill-conditioned (some direction's eigenvalue dominates the others) -- NOT
+                # "singular" anymore, since G's eigenvalues are bounded away from 0 by construction
+                # (>=1). Unlike trace, this detects anisotropy rather than just overall scale.
                 isotropy_per_head = log_det_per_head.exp() / trace_per_head.clamp_min(1e-12)   # (H,)
+
+                mode_diagnostics = {}
+                if module.modes >= 2:
+                    off_diag_mask = ~torch.eye(module.modes, dtype=torch.bool, device=x_in.device)
+
+                    # Structural/weight-space redundancy: do two modes' B_hm point the same
+                    # direction in (head_dim*head_dim)-space? See _mode_gram's own comment.
+                    weight_gram, weight_norm = _mode_gram(module)
+                    weight_redundancy = weight_gram[:, off_diag_mask].mean().item()
+
+                    # Behavioral/usage redundancy+balance: same squared-cosine-Gram idea, but
+                    # over each mode's actual per-token gate activation THIS BATCH, not its
+                    # weights -- catches two modes firing on the same tokens even if their
+                    # B_hm are orthogonal, and separately (via the min/mean norm ratio below)
+                    # catches a mode that's just gone dead (near-zero for everyone), which
+                    # weight-space orthogonality has no way to see at all.
+                    gate_flat = gate.permute(1, 3, 0, 2).reshape(module.heads, module.modes, -1)  # (H,modes,N*S)
+                    gate_gram, gate_norm = _cosine_gram(gate_flat)
+                    gate_redundancy = gate_gram[:, off_diag_mask].mean().item()
+                    # 1.0 = every mode in every head fires with the same average magnitude;
+                    # ->0 = at least one mode has gone (near-)dead in at least one head.
+                    gate_balance = (gate_norm.min(dim=-1).values / gate_norm.mean(dim=-1).clamp_min(1e-12)).mean().item()
+
+                    mode_diagnostics = {
+                        "weight_redundancy": weight_redundancy,
+                        "weight_norm": weight_norm.mean().item(),
+                        "gate_redundancy": gate_redundancy,
+                        "gate_balance": gate_balance,
+                    }
+
                 self.stats.append({
                     "layer": layer_idx,
                     "module": module,
                     "trace_per_head": trace_per_head.tolist(),
                     "log_det_per_head": log_det_per_head.tolist(),
                     "isotropy_per_head": isotropy_per_head.tolist(),
+                    "mode_diagnostics": mode_diagnostics,
                 })
         return hook
 
@@ -200,7 +245,7 @@ class RiemannianMetricProbe:
             module = s.pop("module")
             
             grad_norms = {}
-            for name, key in (("weight_diag", "Diag"), ("weight_W", "Gate"), ("weight_U", "U"), ("weight_V", "V")):
+            for name, key in (("weight_W", "Gate"), ("weight_U", "U"), ("weight_V", "V")):
                 param = getattr(module, name, None)
                 if param is not None and param.grad is not None:
                     grad_norms[key] = torch.linalg.vector_norm(param.grad.detach().float()).item()
@@ -224,6 +269,15 @@ def log_riemannian_metrics(tb_logger: TensorboardLogger, stats: list[dict], glob
             tb_logger.log_scalars(f"Metrics/{tag}/LogDet", {f"Head{h}": v for h, v in enumerate(s["log_det_per_head"])}, global_step)
             tb_logger.log_scalars(f"Metrics/{tag}/Isotropy", {f"Head{h}": v for h, v in enumerate(s["isotropy_per_head"])}, global_step)
             tb_logger.log_scalars(f"Metrics/{tag}/Gradient", s["grad_norms"], global_step)
+
+            md = s.get("mode_diagnostics")
+            if md:
+                tb_logger.log_scalars(f"Metrics/{tag}/ModeCollapse", {
+                    "UVRedundancy": md["weight_redundancy"],
+                    "UVNorm": md["weight_norm"],
+                    "GateRedundancy": md["gate_redundancy"],
+                    "GateBalance": md["gate_balance"],
+                }, global_step)
 
 
 @_non_blocking()

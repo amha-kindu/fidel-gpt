@@ -54,24 +54,21 @@ class RiemannianMetric(nn.Module):
         self.heads = heads
         self.head_dim = head_dim
 
-        self.weight_diag = nn.Parameter(torch.zeros(heads, head_dim))
-        self.weight_W = nn.Parameter(torch.zeros(heads, head_dim, self.modes))
+        self.weight_W = nn.Parameter(torch.empty(heads, head_dim, self.modes))
         self.weight_U = nn.Parameter(torch.empty(heads, self.modes, head_dim, self.rank))
         self.weight_V = nn.Parameter(torch.empty(heads, self.modes, head_dim, self.rank))
+        nn.init.normal_(self.weight_W, mean=0.0, std=head_dim ** -0.5)
         nn.init.normal_(self.weight_U, mean=0.0, std=head_dim ** -0.5)
         nn.init.normal_(self.weight_V, mean=0.0, std=head_dim ** -0.5)
 
         row = torch.arange(head_dim).view(head_dim, 1)
         col = torch.arange(head_dim).view(1, head_dim)
-        self.register_buffer("lower_mask", row > col, persistent=False)
+        self.register_buffer("lower_mask", row >= col, persistent=False)
         
-        self.diag_offset = 1.0 - math.log1p(math.log(2.0))
-
         # Variance-preserving normalization: without these, raw_gate/B/S's scale drifts with head_dim/
         # rank/modes respectively, which couples "how big is this metric" to
         # "what learning rate does it need" in a way that makes those three
         # hyperparameters hard to scale independently.
-        self.gate_scale = head_dim ** -0.5
         self.B_scale = self.rank ** -0.5
         self.S_scale = self.modes ** -0.5
 
@@ -79,31 +76,25 @@ class RiemannianMetric(nn.Module):
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fused:
-            return RiemannianMetricKernel.apply(x, self.weight_diag, self.weight_W, self.weight_U, self.weight_V)
+            return RiemannianMetricKernel.apply(x, self.weight_W, self.weight_U, self.weight_V)
 
-        # (HEADS, MODES, HEAD_DIM, RANK) @ (HEADS, MODES, RANK, HEAD_DIM) -> (HEADS, MODES, HEAD_DIM, HEAD_DIM)
         B = torch.matmul(self.weight_U, self.weight_V.transpose(-2, -1)) * self.B_scale
         B = torch.where(self.lower_mask, B, 0.0)
-
-        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
-        raw_diag = x * self.weight_diag.view(1, self.heads, 1, self.head_dim)
-        L_diag = torch.log1p(F.softplus(raw_diag)) + self.diag_offset
-
+        
         # Extract non-linear features
         gate = F.silu(
-            torch.einsum("nhsd,hdm->nhsm", x, self.weight_W) * self.gate_scale
+            torch.einsum("nhsd,hdm->nhsm", x, self.weight_W)
+        )
+        
+        L = torch.asinh(
+            torch.einsum("nhsm,hmij->nhsij", gate, B) * self.S_scale
         )
 
-        # (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)
-        S = torch.einsum("nhsm,hmij->nhsij", gate, B) * self.S_scale
-        L_offdiag = torch.asinh(S)
-        L = torch.diagonal_scatter(L_offdiag, L_diag, dim1=-2, dim2=-1)
-
-        # (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM) @ (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM) -> (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM)
+        # (..., 1, HEAD_DIM) @ (..., HEAD_DIM, HEAD_DIM) -> (..., 1, HEAD_DIM)
+        # out = x + xLL_T, where the metric G = I + LL_T, so the module learns M = LL_T,
+        # a.k.a the raw deviation from flatness
         u = torch.matmul(x.unsqueeze(-2), L)
-
-        # (N_BATCHES, HEADS, SEQ_LEN, 1, HEAD_DIM) @ (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM, HEAD_DIM)* -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
-        return torch.matmul(u, L.transpose(-2, -1)).squeeze(-2)
+        return x + torch.matmul(u, L.transpose(-2, -1)).squeeze(-2)
 
 
 class MultiHeadAttentionModule(nn.Module):
