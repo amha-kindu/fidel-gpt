@@ -14,6 +14,7 @@ This project provides the full training and fine-tuning pipeline for a **custom 
 - **Tokenizer training** (`tokenizers/train_tokenizer.py`) to create a SentencePiece model with custom symbols and Amharic script coverage.
 - **Inference and chatbot scripts** (`inference.py`, `chatbot.py`) for interactive or batch text generation.
 - Utilities for **learning rate schedules**, **logging to TensorBoard**, and **LoRA parameter configuration**.
+- **Attention A/B harness** (`compare_attention.py`) that trains variants on byte-identical data and reports per-layer attention health — see [`DIAGNOSTICS.md`](DIAGNOSTICS.md) for what each metric means.
 
 ### 📊 Corpus & Training setup
 - **Corpus size**: 12+ GB raw Amharic text from multiple sources (books, Wikipedia, news, etc.).
