@@ -21,19 +21,18 @@ class EmbeddingModule(nn.Module):
 
 
 class RoPeModule(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, dim: torch.Tensor):
         super().__init__()
-        d_head = config.embed_dim // config.heads
-        assert d_head % 2 == 0, "RoPE requires an even head dimension"
+        assert dim % 2 == 0, "RoPE requires an even head dimension"
 
-        # (HEAD_DIM // 2,)
-        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, d_head, 2, dtype=torch.float) / d_head))
+        # (DIM // 2,)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seq_len: int, offset: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         positions = torch.arange(offset, offset + seq_len, device=device, dtype=self.inv_freq.dtype)
 
-        # (SEQ_LEN, HEAD_DIM // 2)
+        # (SEQ_LEN, DIM // 2)
         phase_angles = torch.outer(positions, self.inv_freq)
         return phase_angles
 
@@ -128,21 +127,23 @@ class MultiHeadAttentionModule(nn.Module):
         return self.Wo(output), new_kv
     
 
-class FeedForwardModule(nn.Module):
+class GatedFeedForwardModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.gelu = nn.GELU()
         self.dropout = nn.Dropout(config.dropout)
-        self.linear1 = nn.Linear(config.embed_dim, config.ff_dim)
-        self.linear2 = nn.Linear(config.ff_dim, config.embed_dim)
+        self.Wug = nn.Linear(config.embed_dim, 2 * config.ff_dim)
+        self.Wd = nn.Linear(config.ff_dim, config.embed_dim)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(
-            self.dropout(self.gelu(self.linear1(x)))
+        up, gate = self.Wug(x).chunk(2, dim=-1)
+        
+        return self.Wd(
+            self.dropout(
+                F.silu(gate) * up
+            )
         )
-
 
 class DecoderModule(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -152,8 +153,8 @@ class DecoderModule(nn.Module):
         self.norm1 = nn.LayerNorm(config.embed_dim)
         self.norm2 = nn.LayerNorm(config.embed_dim)
 
-        self.feed_forward = FeedForwardModule(config)
-        self.masked_multihead_attention = MultiHeadAttentionModule(config)
+        self.feed_forward = GatedFeedForwardModule(config)
+        self.attention = MultiHeadAttentionModule(config)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), attn_mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -167,11 +168,11 @@ class DecoderModule(nn.Module):
         cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
         if self.post_norm:
-            x_update, new_kv = self.masked_multihead_attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
+            x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
         else:
-            x_update, new_kv = self.masked_multihead_attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
+            x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = x + self.dropout(x_update)
             x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x, new_kv
@@ -195,7 +196,7 @@ class GPTmodel(nn.Module):
         
         self.embedding = EmbeddingModule(config)
         self.projection = ProjectionModule(config)
-        self.rope = RoPeModule(config)
+        self.rope = RoPeModule(config.embed_dim // config.heads)
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         self.activation_ckpt = False
@@ -261,12 +262,13 @@ class GPTmodel(nn.Module):
         return self._project(x)
     
 
-    @staticmethod
+    @classmethod
     def build(
+        cls,
         config: ModelConfig | ModelWithLoRAConfig,
         weights: dict | None = None,
     ):
-        model = GPTmodel(config)
+        model = cls(config)
         weights = weights or {}
 
         lora_weights = {k: v for k, v in weights.items() if isinstance(config, ModelWithLoRAConfig) and k in LoRAdapter.get_lora_param_names(config.lora_targets)}
