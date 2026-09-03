@@ -114,6 +114,23 @@ def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, g
         tb_logger.log_scalar("Confidence/MaxProb", max_prob, global_step)
         tb_logger.log_scalar("Confidence/LogitStd", logit_std, global_step)
 
+def component_key(name: str) -> str:
+    """Parameter name -> the component its norms are reported under.
+
+    One rule, used by the gradient and weight-norm logging below and imported by
+    compare_models.py, so that Gradients/Decoder3 covers the same parameters in a
+    training run and in a comparison run. Anything that is not the embedding, the
+    projection or a decoder block falls into NormF -- that is norm_f alone in
+    GPTmodel, but a subclass with its own top-level layers lands there too.
+    """
+    if name.startswith("embedding"):
+        return "Embedding"
+    if name.startswith("decoders."):
+        return f"Decoder{name.split('.')[1]}"
+    if name.startswith("projection"):
+        return "Projection"
+    return "NormF"
+
 @_non_blocking()
 def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int):
     with torch.no_grad():
@@ -124,16 +141,9 @@ def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], 
                 continue
             norm_sq = torch.linalg.vector_norm(grad.float().view(-1)).item() ** 2
             global_sq += norm_sq
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
+            key = component_key(name)
             component_sq[key] = component_sq.get(key, 0.0) + norm_sq
-        
+
         tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
         for key, sq in component_sq.items():
             tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
@@ -144,14 +154,7 @@ def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tens
         component_sq: dict[str, float] = {}
         for name, param in weights.items():
             norm_sq = torch.linalg.vector_norm(param.float().view(-1)).item() ** 2
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
+            key = component_key(name)
             component_sq[key] = component_sq.get(key, 0.0) + norm_sq
         for key, sq in component_sq.items():
             tb_logger.log_scalar(f"WeightNorm/{key}", sq ** 0.5, global_step)
