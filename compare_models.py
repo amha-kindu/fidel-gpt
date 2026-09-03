@@ -11,6 +11,12 @@ come from the variant itself (see DataPlan). What gets reported:
   * validation loss vs step       -- quality per unit of learning
   * validation loss vs wall-clock -- quality per unit of compute, the honest
     axis when the variants differ in speed by 20-30%
+  * area under the loss curve     -- each of the two above reduced to one
+    number, so an arm that led for the whole run is not scored on its last
+    evaluation alone (see aulc)
+  * train/val generalisation gap  -- how much of an arm's win is fit to the
+    batches it trained on rather than learning, read off the two loss curves
+    above as loss/gap
   * per-layer attention health    -- how the sublayer is behaving in each decoder
     block, not averaged into a single scalar that hides the one bad layer
   * per-layer gradient norms      -- Gradients/Global and Gradients/<component>,
@@ -659,6 +665,61 @@ def validate(model: torch.nn.Module, batches: BatchSet, pad: int, causal: torch.
     return total.item() / max(batches.total_labels, 1)
 
 
+def aulc(curve: list[tuple[int, float, float]], axis: int, cutoff: float | None = None) -> float:
+    """Area under the validation loss curve, normalised back to a mean loss.
+
+    `final val` is one measurement at one step, and this script's own val set is
+    sized where a 0.05 nat difference is at the edge of resolvable -- so at a few
+    hundred steps an arm can take the last column on a draw of the validation
+    set. This integrates every evaluation instead, by the trapezoidal rule over
+    (x, val_loss), and divides by the span covered. Dividing is what makes it
+    readable: the raw area is in nats*steps and compares to nothing, the mean is
+    in nats and compares to the loss columns beside it.
+
+    Two things it sees that the final loss cannot:
+
+      * how FAST an arm got there. Two variants converging to the same place are
+        a tie on the last point; the one that was lower the whole way has the
+        lower area.
+      * an unstable run. A curve that spikes and recovers ends wherever it ends
+        -- the area carries the excursion.
+
+    `axis` selects the x to integrate over: 0 for steps (learning per unit of
+    data), 1 for elapsed seconds (learning per unit of compute). `cutoff`
+    truncates there, interpolating the loss at exactly that x. That is what makes
+    the seconds axis meaningful at all -- variants reach different elapsed times
+    at the same step, so their areas are only comparable over a span all of them
+    covered, and report() truncates at the largest such span.
+
+    Deliberately reported ALONGSIDE the final loss and not instead of it. The
+    area is weighted toward early training, where the loss is largest and falling
+    fastest, so an arm that merely starts better can hold the lower AULC and
+    still end up worse. The pair disagreeing is the finding, not a contradiction:
+    it says the arms differ in convergence SPEED rather than in where they land.
+    """
+    points = [(float(point[axis]), point[2]) for point in curve]
+    if cutoff is not None:
+        within = [point for point in points if point[0] <= cutoff]
+        # Interpolated at the cutoff rather than stopped at the last evaluation
+        # before it. Evaluations land at a different elapsed time in every
+        # variant, so truncating to whichever one happens to fall inside would
+        # give each arm a slightly different span -- the exact thing a shared
+        # cutoff exists to prevent. The next point is strictly past the cutoff
+        # and this one is at or before it, so the gap below is never zero.
+        if within and len(within) < len(points):
+            (x0, y0), (x1, y1) = within[-1], points[len(within)]
+            within.append((cutoff, y0 + (y1 - y0) * (cutoff - x0) / (x1 - x0)))
+        points = within or points[:1]
+    span = points[-1][0] - points[0][0]
+    if span <= 0:
+        # One evaluation, or a cutoff before the first: the mean over a single
+        # point is that point, which is the right limit rather than a failure.
+        return points[-1][1]
+    area = sum(0.5 * (y0 + y1) * (x1 - x0)
+               for (x0, y0), (x1, y1) in zip(points, points[1:]))
+    return area / span
+
+
 def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Squared gradient norm per component, bucketed by utils.component_key.
 
@@ -823,6 +884,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
     loss_count, grad_totals = 0, {}
     gradients: dict[str, float] = {}
+    gap = float("nan")
     diag_index = 0
 
     # walltime is anchored so that every variant's first point sits at the same
@@ -880,11 +942,19 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             train_loss = (loss_sum / max(loss_count, 1)).item()
             loss_sum.zero_()
             loss_count = 0
+            gap = val_loss - train_loss
             curve.append((step, elapsed, val_loss))
             walltime = anchor + elapsed
 
             writer.add_scalar("loss/val", val_loss, step, walltime=walltime)
             writer.add_scalar("loss/train", train_loss, step, walltime=walltime)
+            writer.add_scalar("loss/gap", gap, step, walltime=walltime)
+            # Running AULC over steps: at each evaluation, the mean val loss of
+            # the run SO FAR. Charted rather than only summarised because the
+            # step it crosses another variant's trace is the step that arm's
+            # lead actually began, which a single end-of-run scalar cannot say.
+            # Cheap, and the clock is stopped here (see the window above).
+            writer.add_scalar("loss/aulc", aulc(curve, 0), step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
             # Gradients/Global + Gradients/<component>, the tags and the decomposition
             # train.py writes, so a variant's per-layer gradient trace can be read
@@ -918,6 +988,11 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     final = diagnose(model, attentions, data.diag, pad, causal)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
+    # Over steps, which every arm shares by construction, so this one is
+    # comparable as it stands. The seconds-axis area is NOT computed here: it is
+    # only meaningful against a budget every variant reached, and that is not
+    # known until they have all run, so report() derives it from `curve`.
+    aulc_steps = aulc(curve, 0)
 
     # run_name="." keeps the hparams in this run's own directory; the default
     # would nest a fresh timestamped run underneath and split the variant in two.
@@ -931,8 +1006,9 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
          "embed_dim": config.embed_dim, "heads": config.heads,
          "n_decoders": config.n_decoders, "seq_len": config.seq_len, "lr": args.lr,
          "compile": args.compile_mode if args.compile else "off"},
-        {"hparam/final_val": curve[-1][2], "hparam/sec": elapsed,
-         "hparam/warmup_sec": warmup_sec,
+        {"hparam/final_val": curve[-1][2], "hparam/aulc": aulc_steps,
+         "hparam/gap": gap,
+         "hparam/sec": elapsed, "hparam/warmup_sec": warmup_sec,
          "hparam/collapse_mean": final.get("collapse/output/mean", float("nan"))},
         run_name=".")
     writer.close()
@@ -946,6 +1022,8 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         "attn_params": attn_params,
         "total_params": total_params,
         "curve": curve,
+        "aulc": aulc_steps,
+        "gap": gap,
         "sec": elapsed,
         "warmup_sec": warmup_sec,
         "peak_mb": peak_mb,
@@ -969,7 +1047,11 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
     # when every arm shares one. A table of numbers that does not say what was
     # trained is a table that gets pasted somewhere and misread later.
     model_width = max(max((len(r["model"]) for r in results.values()), default=5), 5) + 2
-    rule = "=" * (width + model_width + 81)
+    # Summed from the numeric column widths below rather than restated at each
+    # separator: the three copies of this arithmetic had drifted 12 characters
+    # short of the row they were meant to underline.
+    columns = width + model_width + 13 + 12 + 11 + 9 + 12 + 9 + 9 + 14 + 8 + 8 + 10 + 10
+    rule = "=" * columns
     base = args.base_config
 
     print("\n" + rule)
@@ -988,9 +1070,10 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
     precision = 0 if budget >= 10 else 1
 
     print(f"\n{'variant':{width}s}{'model':{model_width}s}{'attn params':>13}{'params':>12}"
-          f"{'final val':>11}{'d base':>9}{'val @ %.*fs' % (precision, budget):>12}{'sec':>8}"
+          f"{'final val':>11}{'d base':>9}{'val @ %.*fs' % (precision, budget):>12}"
+          f"{'gap':>9}{'aulc':>9}{'aulc @ %.*fs' % (precision, budget):>14}{'sec':>8}"
           f"{'x base':>8}{'tok/s':>10}{'peak MB':>10}")
-    print("-" * (width + model_width + 81))
+    print("-" * columns)
     for label, r in results.items():
         within = [point for point in r["curve"] if point[1] <= budget] or r["curve"][:1]
         delta = r["curve"][-1][2] - baseline["curve"][-1][2]
@@ -998,8 +1081,21 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
         print(f"{label:{width}s}{r['model']:{model_width}s}{r['attn_params']:>13}"
               f"{r['total_params']:>12}"
               f"{r['curve'][-1][2]:>11.4f}{delta:>+9.4f}{within[-1][2]:>12.4f}"
+              f"{r['gap']:>9.4f}{r['aulc']:>9.4f}{aulc(r['curve'], 1, budget):>14.4f}"
               f"{r['sec']:>8.1f}{speed:>8.2f}{r['tokens_per_sec']:>10.0f}{r['peak_mb']:>10.0f}")
     print(f"\n  d base < 0 is better than {baseline['label']}; x base > 1 is faster than it.")
+    print("  aulc is the mean val loss over the whole run, i.e. the area under the loss curve:")
+    print("  lower means an arm was ahead THROUGHOUT, not only at the evaluation that happened")
+    print(f"  to be last. 'aulc @' integrates against seconds rather than steps, cut at "
+          f"{budget:.{precision}f}s so")
+    print("  every arm is scored over a span it reached -- learning per unit of compute.")
+    print("  Read both WITH final val, not instead of it: the area is weighted toward early")
+    print("  training, so disagreement means the arms differ in convergence speed, not endpoint.")
+    print("  gap is final val minus final train loss. Wider than the baseline's is an arm buying")
+    print("  its win by fitting the batch list harder rather than by learning -- check it against")
+    print("  'params' before crediting the architecture. The train side is a window mean taken in")
+    print("  training mode, so compare gaps BETWEEN arms and watch loss/gap move; the absolute")
+    print("  value reads low, and early in a run it can be negative.")
     print(f"  all variants verified against data fingerprint {fingerprint}: same batches,")
     print(f"  same order, same validation set.")
     if len({r["model"] for r in results.values()}) > 1:
@@ -1008,7 +1104,7 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
         print("  architecture that wins while holding more parameters has not won yet.")
 
     print("\nper-layer token similarity after each block (mean pairwise cosine; -> 1 means collapsed)")
-    print("-" * (width + model_width + 81))
+    print("-" * columns)
     for label, r in results.items():
         start = " ".join(f"{value:5.2f}" for value in r["collapse_start"])
         end = " ".join(f"{value:5.2f}" for value in r["collapse_end"])
@@ -1224,7 +1320,8 @@ def main() -> None:
     if epochs > 3:
         LOGGER.warning(f"{epochs:.1f} passes over the same data -- every variant will "
                        "overfit, which flatters whichever has less effective capacity. "
-                       "Raise --max-samples or lower --steps to compare generalisation.")
+                       "Raise --max-samples or lower --steps to compare generalisation, "
+                       "or watch loss/gap to see which arm gets there first.")
     LOGGER.info(f"device {DEVICE} "
                 f"({torch.cuda.get_device_name(DEVICE) if DEVICE.type == 'cuda' else 'cpu'}), "
                 f"mixed precision {'on' if args.amp else 'off'}, "
