@@ -1,4 +1,4 @@
-"""Short-run A/B of the attention variants on real data.
+"""Short-run A/B of model architectures and attention variants on real data.
 
 Trains one model per VARIANT from identical seeds on identical batches and
 reports the three things that actually decide the question.
@@ -13,43 +13,56 @@ come from the variant itself (see DataPlan). What gets reported:
     axis when the variants differ in speed by 20-30%
   * per-layer attention health    -- how the sublayer is behaving in each decoder
     block, not averaged into a single scalar that hides the one bad layer
+  * per-layer gradient norms      -- Gradients/Global and Gradients/<component>,
+    the same decomposition train.py logs (it shares the bucketing rule, see
+    utils.component_key), so a variant's gradient trace here reads directly
+    against a real training run's
 
 The first variant is the baseline every other one is reported against. It is the
-model the flags describe -- standard multi-head attention -- unless you put
-something else first.
+model the flags describe -- model.GPTmodel, standard multi-head attention --
+unless you put something else first.
 
-A variant is just a name plus a set of ModelConfig overrides, given on the
-command line:
+A variant is a name, optionally a model class, and a set of ModelConfig
+overrides, given on the command line:
 
     --variant base:                     # the flags as they stand, no overrides
-    --variant wide:heads=16
+    --variant wide:heads=16             # same class, different config
     --variant post:post_norm=true,ff_dim=2048
+    --variant flat:model=model2.GPTWide           # a DIFFERENT architecture
+    --variant flat6:model=model2.GPTWide,n_decoders=6
 
-so any ModelConfig field can be ablated without touching this file, and no field
-name is hardcoded anywhere in it. `--config` sets the shared base every variant
-starts from.
+`model=` is the one key that is not a ModelConfig field: it names an importable
+nn.Module subclass ('module.Class', or a bare 'Class' from model.py), and
+`--model` sets the default for variants that do not name one. So the comparison
+is between arbitrary architectures, not only between configurations of one -- and
+neither a class name nor a config field name is hardcoded anywhere in this file.
+`--config` sets the shared config base every variant starts from.
 
-Nothing in this script knows what is inside an attention module. The health
-diagnostics are taken from forward hooks -- the tensor the sublayer reads, the
-update it writes and the block's output -- so every tag means the same thing for
-every variant, which is the only way two of them can honestly share a chart. Any
-attention implementation that fits GPTmodel is measurable here as-is.
+Nothing in this script knows what is inside a model beyond two structural
+assumptions, both of which GPTmodel subclasses satisfy for free: the blocks live
+in `model.decoders`, and each block holds exactly one attention submodule whose
+attribute name says so. Everything else is read off forward hooks -- the tensor
+the sublayer reads, the update it writes and the block's output -- so every tag
+means the same thing for every variant, which is the only way two of them can
+honestly share a chart.
 
 Defaults are sized for a CPU smoke run. On a GPU, scale up -- the comparison is
 only meaningful once the model is big enough to be data-bound rather than
 noise-bound:
 
-    python compare_attention.py --steps 4000 --embed-dim 512 --n-decoders 6 \
+    python compare_models.py --steps 4000 --embed-dim 512 --n-decoders 6 \
         --seq-len 512 --batch-size 32 --training-data <path> --validation-data <path>
 """
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import os
 import random
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -61,8 +74,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
-from model import GPTmodel
-from utils import get_causal_mask
+from utils import component_key, get_causal_mask
+
+# model classes are NOT imported here: every arm names its own, and resolve_model
+# imports it at parse time (see DEFAULT_MODEL).
 
 # Norms are clamped here rather than at finfo.tiny: dividing by 1e-38 produces
 # inf, which then poisons an entire masked mean. These are diagnostics, so a
@@ -70,11 +85,25 @@ from utils import get_causal_mask
 FLOOR = 1e-12
 
 # name:key=value,... -- the model exactly as the flags configure it, and nothing
-# else. Naming a second variant here would mean naming a ModelConfig field, and a
-# default that hardcodes a field is a default that breaks the day that field is
-# renamed or removed. Every comparison arm comes from --variant on the command
-# line; this is only the baseline they are measured against.
+# else. Naming a second variant here would mean naming a ModelConfig field or a
+# model class, and a default that hardcodes either is a default that breaks the
+# day that field is renamed or that class moves. Every comparison arm comes from
+# --variant on the command line; this is only the baseline they are measured
+# against.
 DEFAULT_VARIANTS = ("baseline:",)
+
+# The class every variant uses unless --model or its own `model=` says otherwise.
+# It is a string resolved by import, not the imported class, so this module has
+# exactly one hardcoded model reference and it is this line.
+DEFAULT_MODEL = "model.GPTmodel"
+
+# The one override key that is not a ModelConfig field.
+MODEL_KEY = "model"
+
+# Substrings that identify the attention submodule of a decoder block. Matched on
+# the attribute NAME, not on the type: the whole point of comparing two models is
+# that their attention classes have nothing in common but nn.Module.
+ATTENTION_HINTS = ("attention", "attn")
 
 
 # --------------------------------------------------------------------------- #
@@ -146,8 +175,13 @@ def coerce(key: str, raw: str, template: ModelConfig):
     return raw
 
 
-def parse_overrides(text: str, template: ModelConfig) -> dict:
-    out = {}
+def parse_overrides(text: str, template: ModelConfig) -> tuple[dict, str | None]:
+    """key=value,... -> (ModelConfig overrides, model path or None).
+
+    `model=` is pulled out rather than coerced, because it is the one key that
+    names a class instead of a config field.
+    """
+    out, model = {}, None
     for item in text.split(","):
         item = item.strip()
         if not item:
@@ -156,20 +190,58 @@ def parse_overrides(text: str, template: ModelConfig) -> dict:
             raise argparse.ArgumentTypeError(f"expected key=value, got '{item}'")
         key, _, value = item.partition("=")
         key = key.strip()
+        if key == MODEL_KEY and not hasattr(template, MODEL_KEY):
+            if not value.strip():
+                raise argparse.ArgumentTypeError("'model=' needs a class, e.g. 'model=model2.GPTWide'")
+            model = value.strip()
+            continue
         out[key] = coerce(key, value, template)
-    return out
+    return out, model
 
 
-def parse_variant(text: str, template: ModelConfig) -> tuple[str, dict]:
+def resolve_model(path: str) -> type:
+    """Import 'module.Class' -- or a bare 'Class' from model.py -- and return it.
+
+    Resolved while the arguments are parsed, so a typo fails in the first second
+    of the run rather than after the corpus has been tokenised and the baseline
+    trained. Nothing here knows the name of any architecture: an arm is
+    comparable against the baseline as soon as it exists as an importable
+    nn.Module, with no edit to this file.
+    """
+    module_name, _, class_name = path.rpartition(".")
+    module_name = module_name or "model"
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as error:
+        raise argparse.ArgumentTypeError(f"model '{path}': cannot import '{module_name}' ({error})")
+    resolved = getattr(module, class_name, None)
+    if resolved is None:
+        raise argparse.ArgumentTypeError(f"model '{path}': '{module_name}' has no '{class_name}'")
+    if not (isinstance(resolved, type) and issubclass(resolved, torch.nn.Module)):
+        raise argparse.ArgumentTypeError(f"model '{path}': '{class_name}' is not an nn.Module subclass")
+    return resolved
+
+
+class Variant(NamedTuple):
+    """One arm of the comparison: what to build, and what to call it."""
+    label: str
+    model: str          # dotted path, kept for the report and summary.json
+    cls: type
+    overrides: dict
+
+
+def parse_variant(text: str, template: ModelConfig, default_model: str) -> Variant:
     if ":" not in text:
         raise argparse.ArgumentTypeError(
-            f"variant '{text}' needs a name then a colon, e.g. 'wide:heads=16' "
-            "(or 'base:' for the flags as they stand)")
-    name, _, overrides = text.partition(":")
+            f"variant '{text}' needs a name then a colon, e.g. 'wide:heads=16' or "
+            "'flat:model=model2.GPTWide' (or 'base:' for the flags as they stand)")
+    name, _, spec = text.partition(":")
     name = name.strip()
     if not name:
         raise argparse.ArgumentTypeError(f"variant '{text}' has an empty name")
-    return name, parse_overrides(overrides, template)
+    overrides, model = parse_overrides(spec, template)
+    model = model or default_model
+    return Variant(name, model, resolve_model(model), overrides)
 
 
 # --------------------------------------------------------------------------- #
@@ -292,9 +364,45 @@ def isotropy(hidden: torch.Tensor, geom: Geometry) -> torch.Tensor:
     return trace.square() / (covariance.square().sum().clamp_min(FLOOR) * min(tokens.shape))
 
 
+def decoder_blocks(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
+    blocks = getattr(model, "decoders", None)
+    if blocks is None or not len(blocks):
+        raise RuntimeError(
+            f"variant '{label}': {type(model).__name__} has no non-empty `decoders`. The "
+            "per-layer diagnostics are the point of this script, so a model whose blocks "
+            "cannot be enumerated cannot be compared here.")
+    return list(blocks)
+
+
+def attention_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
+    """The attention submodule of every decoder block, found by attribute name.
+
+    Two architectures being compared are under no obligation to agree on that
+    name, and hardcoding whichever one they currently share would turn a rename
+    in either into an empty attn/* series here -- which does not look like a bug,
+    it looks like a real difference between the arms. Matching on ATTENTION_HINTS
+    covers the plausible names, and requiring exactly one match per block means a
+    model this heuristic cannot read fails loudly instead of silently.
+    """
+    found = []
+    for layer, block in enumerate(decoder_blocks(model, label)):
+        children = list(block.named_children())
+        matches = [child for name, child in children
+                   if any(hint in name.lower() for hint in ATTENTION_HINTS)]
+        if len(matches) != 1:
+            names = ", ".join(name for name, _ in children) or "no children"
+            raise RuntimeError(
+                f"variant '{label}': block {layer} of {type(model).__name__} has "
+                f"{len(matches)} submodules whose name looks like attention "
+                f"({names}). The diagnostics need exactly one; rename it to contain "
+                f"one of {ATTENTION_HINTS}, or drop the extra match.")
+        found.append(matches[0])
+    return found
+
+
 @torch.inference_mode()
-def diagnose(model: GPTmodel, inputs: torch.Tensor, pad: int,
-             causal: torch.Tensor) -> dict[str, float]:
+def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module], inputs: torch.Tensor,
+             pad: int, causal: torch.Tensor) -> dict[str, float]:
     """Per-layer attention health, from ONE forward pass.
 
     Everything here is read off forward hooks, from three tensors per decoder
@@ -303,7 +411,8 @@ def diagnose(model: GPTmodel, inputs: torch.Tensor, pad: int,
     attribute or recomputes a score. That is deliberate -- a diagnostic that
     knows the internals of one variant produces a tag the other variant cannot
     report, which is precisely the tag that cannot be compared. It also means
-    these numbers survive any change to the attention implementations.
+    these numbers survive any change to the attention implementations, and that
+    they mean the same thing across two unrelated model classes.
 
     A forward hook receives its module's positional inputs alongside its output,
     so one hook per attention module sees both the tensor it attends over
@@ -317,9 +426,11 @@ def diagnose(model: GPTmodel, inputs: torch.Tensor, pad: int,
                           and the scale every other magnitude here is relative to
       attn/update_ratio   ||update|| / ||x||, the sublayer's gain into the
                           residual stream. Far above 1 is a block shouting over
-                          the stream (and the first thing to check when one
-                          variant's grad_norm sits an order of magnitude off the
-                          other's); far below 1 is a block that has switched off.
+                          the stream (pair it with that block's Gradients/Decoder<i>
+                          when one variant's Gradients/Global sits an order of
+                          magnitude off the other's -- the ratio says which layer is
+                          loud, the gradient says whether it is also unstable); far
+                          below 1 is a block that has switched off.
       attn/update_cos     mean cos(update_i, x_i). ~0 is a sublayer writing
                           genuinely new content; -> 1 means it is mostly
                           rescaling what each token already held, which is
@@ -354,13 +465,13 @@ def diagnose(model: GPTmodel, inputs: torch.Tensor, pad: int,
         return hook
 
     def block_hook(layer: int):
-        # DecoderModule returns (hidden, new_kv)
+        # A decoder block returns (hidden, new_kv)
         def hook(_module, _args, output):
             rec.add("collapse/output", layer, cosine_collapse(output[0], geom))
         return hook
 
-    for layer, block in enumerate(model.decoders):
-        handles.append(block.masked_multihead_attention.register_forward_hook(attention_hook(layer)))
+    for layer, (block, attention) in enumerate(zip(model.decoders, attentions)):
+        handles.append(attention.register_forward_hook(attention_hook(layer)))
         handles.append(block.register_forward_hook(block_hook(layer)))
 
     was_training = model.training
@@ -520,7 +631,7 @@ class DataPlan:
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def validate(model: GPTmodel, batches: BatchSet, pad: int, causal: torch.Tensor,
+def validate(model: torch.nn.Module, batches: BatchSet, pad: int, causal: torch.Tensor,
              amp: bool) -> float:
     """Token-weighted mean cross-entropy over the validation batches.
 
@@ -548,7 +659,48 @@ def validate(model: GPTmodel, batches: BatchSet, pad: int, causal: torch.Tensor,
     return total.item() / max(batches.total_labels, 1)
 
 
-def build_optimiser(model: GPTmodel, args) -> torch.optim.AdamW:
+def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Squared gradient norm per component, bucketed by utils.component_key.
+
+    The buckets, and therefore the Gradients/* tags they become, are train.py's:
+    Embedding, Projection, Decoder<i> per block, NormF for the rest. Sharing the
+    rule rather than restating it is what keeps a comparison run's per-layer
+    gradient series readable against a real training run's.
+
+    Returned as 0-dim device tensors rather than floats. This has to be called
+    from inside the timed window -- the snapshot is only meaningful before
+    clipping, exactly where train.py takes it -- and an .item() per parameter
+    would be one device sync per parameter, tens of stalls per evaluation, inside
+    the region whose wall-clock this script exists to report. resolve_gradients
+    turns them into numbers later, with the clock stopped.
+    """
+    totals: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        key = component_key(name)
+        norm_sq = torch.linalg.vector_norm(param.grad.detach().float().view(-1)).square()
+        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
+    return totals
+
+
+def resolve_gradients(totals: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Squared sums -> Gradients/* scalars, in a single host transfer.
+
+    Gradients/Global is the root of the summed squares, which is both what
+    train.py reports and what clip_grad_norm_ measures against --grad-clip, so
+    the components always add up to the number the clipping acted on.
+    """
+    if not totals:
+        return {}
+    keys = list(totals)
+    values = torch.stack([totals[key] for key in keys]).cpu()      # the one and only sync
+    resolved = {f"Gradients/{key}": value.sqrt().item() for key, value in zip(keys, values)}
+    resolved["Gradients/Global"] = values.sum().sqrt().item()
+    return resolved
+
+
+def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
     # fused AdamW keeps the whole update in one kernel; it is available only on
     # CUDA, and applies identically to every variant, so it does not tilt the
     # comparison it speeds up.
@@ -557,8 +709,9 @@ def build_optimiser(model: GPTmodel, args) -> torch.optim.AdamW:
                              betas=(args.beta1, args.beta2), fused=fused)
 
 
-def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
+def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         pad: int, causal: torch.Tensor, run_dir: str) -> dict:
+    label, overrides = variant.label, variant.overrides
     # Checked BEFORE anything is built, so a variant that would train on data the
     # baseline never saw fails immediately rather than after producing a full set
     # of plausible-looking curves that are not comparable to anything.
@@ -579,12 +732,25 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
     seed_everything(args.seed)
 
     config = ModelConfig(**{**args.base_config, **overrides})
-    model = GPTmodel.build(config).to(DEVICE)
+    # build() when the class offers one -- it owns weight tying, the init scheme and
+    # LoRA, none of which this script should reimplement per architecture -- and the
+    # plain constructor otherwise. The isinstance check catches the one way a build()
+    # can lie: a staticmethod that hardcodes its own class, which would hand every
+    # subclass arm a silently identical baseline model and a comparison of nothing.
+    builder = getattr(variant.cls, "build", None)
+    model = builder(config) if callable(builder) else variant.cls(config)
+    if not isinstance(model, variant.cls):
+        raise RuntimeError(
+            f"variant '{label}': {variant.model}.build() returned a "
+            f"{type(model).__name__}, not a {variant.cls.__name__}. A build() that "
+            "hardcodes its class instead of using cls cannot be used to compare "
+            "architectures -- make it a classmethod.")
+    model = model.to(DEVICE)
     model.train()
-    # GPTmodel.__init__ may resolve derived config fields (a rank left at 0, say),
-    # so the config that gets reported is read back off the model, not off the
-    # overrides that were asked for.
-    config = model.config
+    # __init__ may resolve derived config fields (a rank left at 0, say), so the
+    # config that gets reported is read back off the model, not off the overrides
+    # that were asked for.
+    config = getattr(model, "config", config)
 
     # Only the training step runs through the compiled wrapper. The diagnostics
     # keep using the eager module: they install forward hooks on the decoder
@@ -599,9 +765,17 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
                            "possible failures or no speedup.")
         step_model = torch.compile(model, mode=args.compile_mode)
 
+    # Resolved once, here rather than inside diagnose(), so a model whose blocks this
+    # script cannot read fails before it trains for ten minutes and reports nothing.
+    attentions = attention_modules(model, label)
+
     unique = {id(p): p for p in model.parameters()}
     total_params = sum(p.numel() for p in unique.values())
-    attn_params = sum(p.numel() for n, p in model.named_parameters() if "masked_multihead" in n)
+    # By identity, not by name: two architectures agree on neither the attribute path
+    # nor the module type, and deduplicating on id() keeps a tied or shared weight
+    # from being counted twice.
+    attn_ids = {id(p) for attention in attentions for p in attention.parameters()}
+    attn_params = sum(p.numel() for pid, p in unique.items() if pid in attn_ids)
 
     optimiser = build_optimiser(model, args)
     scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=args.amp)
@@ -643,11 +817,12 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
     if args.compile:
         LOGGER.info(f"  {label}: compile + warmup took {warmup_sec:.1f}s (excluded from timings)")
 
-    initial = diagnose(model, data.diag, pad, causal)
+    initial = diagnose(model, attentions, data.diag, pad, causal)
     curve: list[tuple[int, float, float]] = []
     elapsed, window_start = 0.0, None
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    loss_count, grad_norm = 0, torch.zeros((), device=DEVICE)
+    loss_count, grad_totals = 0, {}
+    gradients: dict[str, float] = {}
     diag_index = 0
 
     # walltime is anchored so that every variant's first point sits at the same
@@ -674,12 +849,20 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
         if window_start is None:
             sync()
             window_start = time.perf_counter()
+        evaluating = step % args.eval_every == 0 or step == args.steps
 
         optimiser.zero_grad(set_to_none=True)
         loss = forward_backward(train.items[data.schedule[step - 1]])
         if args.amp:
             scaler.unscale_(optimiser)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # Snapshotted where train.py snapshots: after unscale_, so the numbers are
+        # true gradients rather than loss-scaled ones, and before clipping, so they
+        # describe the gradient the step produced rather than the one --grad-clip
+        # allowed through. Only on steps that will be logged -- train.py pays this
+        # every 100 steps, this pays it once per evaluation.
+        if evaluating:
+            grad_totals = gradient_norms(model)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimiser)
         scaler.update()
         scheduler.step()
@@ -688,7 +871,7 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
         loss_sum += loss
         loss_count += 1
 
-        if step % args.eval_every == 0 or step == args.steps:
+        if evaluating:
             sync()
             elapsed += time.perf_counter() - window_start
             window_start = None
@@ -703,7 +886,12 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("loss/val", val_loss, step, walltime=walltime)
             writer.add_scalar("loss/train", train_loss, step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
-            writer.add_scalar("optim/grad_norm", grad_norm.item(), step, walltime=walltime)
+            # Gradients/Global + Gradients/<component>, the tags and the decomposition
+            # train.py writes, so a variant's per-layer gradient trace can be read
+            # against a real training run's without translating anything.
+            gradients = resolve_gradients(grad_totals)
+            for tag, value in gradients.items():
+                writer.add_scalar(tag, value, step, walltime=walltime)
             writer.add_scalar("perf/elapsed_sec", elapsed, step, walltime=walltime)
             writer.add_scalar("perf/ms_per_step", elapsed / step * 1e3, step, walltime=walltime)
             writer.add_scalar("perf/tokens_per_sec",
@@ -714,7 +902,7 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
             # Tracked over training, not just start/end: representation collapse
             # is a trajectory, and the depth profile is the thing to compare.
             if diag_index % args.diag_every == 0 or step == args.steps:
-                diagnostics = diagnose(model, data.diag, pad, causal)
+                diagnostics = diagnose(model, attentions, data.diag, pad, causal)
                 for tag, value in diagnostics.items():
                     writer.add_scalar(tag, value, step, walltime=walltime)
                 collapse = diagnostics.get("collapse/output/mean")
@@ -728,7 +916,7 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
 
     progress.close()
 
-    final = diagnose(model, data.diag, pad, causal)
+    final = diagnose(model, attentions, data.diag, pad, causal)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
 
     # run_name="." keeps the hparams in this run's own directory; the default
@@ -737,7 +925,8 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
     # set disjoint fields, and a column per field would leave the hparams table
     # mostly blank and would need this script to know which fields exist.
     writer.add_hparams(
-        {"variant": label, "overrides": json.dumps(overrides, sort_keys=True),
+        {"variant": label, "model": variant.model,
+         "overrides": json.dumps(overrides, sort_keys=True),
          "attn_params": attn_params, "total_params": total_params,
          "embed_dim": config.embed_dim, "heads": config.heads,
          "n_decoders": config.n_decoders, "seq_len": config.seq_len, "lr": args.lr,
@@ -750,6 +939,8 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
 
     return {
         "label": label,
+        "model": variant.model,
+        "overrides": overrides,
         "config": config.to_dict(),
         "data_fingerprint": observed,
         "attn_params": attn_params,
@@ -762,6 +953,7 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
         "collapse_start": layer_profile(initial, "collapse/output"),
         "collapse_end": layer_profile(final, "collapse/output"),
         "diagnostics": final,
+        "gradients": gradients,
     }
 
 
@@ -770,8 +962,14 @@ def run(label: str, overrides: dict, args, data: DataPlan, fingerprint: str,
 # --------------------------------------------------------------------------- #
 
 def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> None:
-    width = max(max((len(label) for label in results), default=7), 7)
-    rule = "=" * (width + 81)
+    # Both name columns are left-aligned, so each carries its own two-space gutter;
+    # the numeric columns that follow are right-aligned and bring their own.
+    width = max(max((len(label) for label in results), default=7), 7) + 2
+    # The class each arm actually trained gets a column of its own, always -- also
+    # when every arm shares one. A table of numbers that does not say what was
+    # trained is a table that gets pasted somewhere and misread later.
+    model_width = max(max((len(r["model"]) for r in results.values()), default=5), 5) + 2
+    rule = "=" * (width + model_width + 81)
     base = args.base_config
 
     print("\n" + rule)
@@ -789,23 +987,28 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
     budget = min(r["curve"][-1][1] for r in results.values())
     precision = 0 if budget >= 10 else 1
 
-    print(f"\n{'variant':{width}s}{'attn params':>13}{'params':>12}{'final val':>11}"
-          f"{'d base':>9}{'val @ %.*fs' % (precision, budget):>12}{'sec':>8}{'x base':>8}"
-          f"{'tok/s':>10}{'peak MB':>10}")
-    print("-" * (width + 81))
+    print(f"\n{'variant':{width}s}{'model':{model_width}s}{'attn params':>13}{'params':>12}"
+          f"{'final val':>11}{'d base':>9}{'val @ %.*fs' % (precision, budget):>12}{'sec':>8}"
+          f"{'x base':>8}{'tok/s':>10}{'peak MB':>10}")
+    print("-" * (width + model_width + 81))
     for label, r in results.items():
         within = [point for point in r["curve"] if point[1] <= budget] or r["curve"][:1]
         delta = r["curve"][-1][2] - baseline["curve"][-1][2]
         speed = baseline["sec"] / max(r["sec"], 1e-9)
-        print(f"{label:{width}s}{r['attn_params']:>13}{r['total_params']:>12}"
+        print(f"{label:{width}s}{r['model']:{model_width}s}{r['attn_params']:>13}"
+              f"{r['total_params']:>12}"
               f"{r['curve'][-1][2]:>11.4f}{delta:>+9.4f}{within[-1][2]:>12.4f}"
               f"{r['sec']:>8.1f}{speed:>8.2f}{r['tokens_per_sec']:>10.0f}{r['peak_mb']:>10.0f}")
     print(f"\n  d base < 0 is better than {baseline['label']}; x base > 1 is faster than it.")
     print(f"  all variants verified against data fingerprint {fingerprint}: same batches,")
     print(f"  same order, same validation set.")
+    if len({r["model"] for r in results.values()}) > 1:
+        print("  the arms are different model CLASSES: the header describes the shared config")
+        print("  base only, and 'params' is the capacity axis to read 'd base' against -- an")
+        print("  architecture that wins while holding more parameters has not won yet.")
 
     print("\nper-layer token similarity after each block (mean pairwise cosine; -> 1 means collapsed)")
-    print("-" * (width + 81))
+    print("-" * (width + model_width + 81))
     for label, r in results.items():
         start = " ".join(f"{value:5.2f}" for value in r["collapse_start"])
         end = " ".join(f"{value:5.2f}" for value in r["collapse_end"])
@@ -813,14 +1016,21 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
 
     print(rule)
     print(f"\ntensorboard --logdir {run_dir}")
-    print("  loss/*, collapse/*, attn/* and perf/* carry the same tag in every variant's run,")
+    print("  loss/*, collapse/*, attn/*, Gradients/* and perf/* carry the same tag in every run,")
     print("  so each chart overlays them all. Switch the x-axis to RELATIVE for loss against")
     print("  seconds of training compute rather than steps.")
 
     summary = os.path.join(run_dir, "summary.json")
     with open(summary, "w", encoding="utf-8") as handle:
-        json.dump({"env": ENV, "args": {k: v for k, v in vars(args).items() if k != "base_config"},
-                   "base_config": args.base_config, "data_fingerprint": fingerprint,
+        # `variants` holds resolved classes; it is re-emitted below as the strings it
+        # was parsed from, which is what another run can be reproduced from.
+        json.dump({"env": ENV,
+                   "args": {k: v for k, v in vars(args).items()
+                            if k not in ("base_config", "variants")},
+                   "base_config": args.base_config,
+                   "variants": [{"label": v.label, "model": v.model, "overrides": v.overrides}
+                                for v in args.variants],
+                   "data_fingerprint": fingerprint,
                    "results": results}, handle, indent=2, default=str)
     print(f"\nmachine-readable summary: {summary}")
 
@@ -841,11 +1051,18 @@ def parse_args() -> argparse.Namespace:
                         help="A variant to train, as a name plus ModelConfig overrides, e.g. "
                              "'wide:heads=16'. Repeatable, and the FIRST one is the baseline the "
                              "rest are reported against. Any ModelConfig field is settable, so an "
-                             "ablation needs no code change. With none given the run trains only "
+                             "ablation needs no code change; 'model=<module.Class>' additionally "
+                             "trains a DIFFERENT architecture in that arm, e.g. "
+                             "'flat:model=model2.GPTWide'. With none given the run trains only "
                              f"the baseline (default: {'; '.join(DEFAULT_VARIANTS)})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, metavar="module.Class",
+                        help="Model class for variants that do not name one themselves. Any "
+                             "importable nn.Module subclass taking a ModelConfig; a bare name "
+                             f"is looked up in model.py (default: {DEFAULT_MODEL})")
     parser.add_argument("--config", default="", metavar="key=value,...",
                         help="ModelConfig overrides applied to EVERY variant, on top of the "
-                             "flags below and underneath each variant's own overrides")
+                             "flags below and underneath each variant's own overrides. Accepts "
+                             "'model=' too, as an alias for --model")
 
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--eval-every", type=int, default=50)
@@ -932,12 +1149,17 @@ def parse_args() -> argparse.Namespace:
                             n_decoders=args.n_decoders, ff_dim=args.ff_dim,
                             seq_len=args.seq_len, dropout=args.dropout)
     try:
-        args.base_config.update(parse_overrides(args.config, template))
-        args.variants = [parse_variant(v, template) for v in (args.variant or DEFAULT_VARIANTS)]
+        shared, shared_model = parse_overrides(args.config, template)
+        args.base_config.update(shared)
+        # --config model=... is the same knob as --model, so an explicit --model wins
+        # and otherwise either spelling sets the default the variants inherit.
+        args.model = args.model if args.model != DEFAULT_MODEL else (shared_model or args.model)
+        args.variants = [parse_variant(v, template, args.model)
+                         for v in (args.variant or DEFAULT_VARIANTS)]
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
 
-    names = [name for name, _ in args.variants]
+    names = [variant.label for variant in args.variants]
     if len(set(names)) != len(names):
         parser.error(f"duplicate variant names: {names}")
     return args
@@ -1008,10 +1230,15 @@ def main() -> None:
                 f"mixed precision {'on' if args.amp else 'off'}, "
                 f"compile {args.compile_mode if args.compile else 'off'}, "
                 f"batches {'preloaded' if preload else 'streamed'} ({footprint / 1024 ** 2:.0f} MiB)")
-    LOGGER.info(f"variants: {', '.join(f'{n} ({o or 'no overrides'})' for n, o in args.variants)}")
+    described = []
+    for variant in args.variants:
+        overrides = ", ".join(f"{key}={value}" for key, value in variant.overrides.items())
+        described.append(f"{variant.label} = {variant.model} ({overrides or 'no overrides'})")
+    LOGGER.info(f"variants: {'; '.join(described)}")
     if len(args.variants) == 1:
         LOGGER.warning("only one variant -- this trains a baseline and compares it to itself. "
-                       "Add arms with --variant NAME:field=value (repeatable); "
+                       "Add arms with --variant NAME:field=value or "
+                       "--variant NAME:model=module.Class (repeatable); "
                        f"settable fields: {', '.join(sorted(ModelConfig().to_dict()))}")
     LOGGER.info(f"data fingerprint {fingerprint} -- {len(data.schedule)} scheduled steps over "
                 f"{len(train)} batches; every variant re-checks this before training")
@@ -1021,8 +1248,8 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     results = {}
-    for label, overrides in args.variants:
-        results[label] = run(label, overrides, args, data, fingerprint, pad, causal, run_dir)
+    for variant in args.variants:
+        results[variant.label] = run(variant, args, data, fingerprint, pad, causal, run_dir)
 
     report(results, args, run_dir, fingerprint)
 
