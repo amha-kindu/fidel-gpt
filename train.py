@@ -315,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab-size", type=int, help="Vocabulary size to use")
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
+    parser.add_argument("--attn-dim", type=int, help="Dimensionality of the attention layer, i.e. what Wqkv projects up to and what the heads divide (default: embed_dim)")
     parser.add_argument("--post-norm", action="store_true", help="Apply layer normalization after each residual block (post-norm Transformer style)")
     parser.add_argument("--tie-weights", action=argparse.BooleanOptionalAction, default=None, help="Tie embedding and projection weights (default: enabled)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
@@ -344,8 +345,9 @@ if __name__ == "__main__":
 
         dist.init_process_group(backend=args.dist_backend)
 
-    if args.embed_dim and args.heads:
-        assert args.embed_dim % args.heads == 0, "embed_dim must be divisible by heads"
+    if (args.attn_dim or args.embed_dim) and args.heads:
+        assert (args.attn_dim or args.embed_dim) % args.heads == 0, \
+            "attn_dim (or embed_dim, when attn_dim is unset) must be divisible by heads"
 
     model_config = ModelConfig()
     model_config.update(**args.__dict__)

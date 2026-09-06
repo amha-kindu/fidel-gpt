@@ -39,15 +39,16 @@ class RoPeModule(nn.Module):
 
 class MultiHeadAttentionModule(nn.Module):
     def __init__(self, config: ModelConfig):
-        assert config.embed_dim % config.heads == 0, "EMBED_DIM is not divisible by heads"
+        assert config.attn_dim % config.heads == 0, "ATTN_DIM is not divisible by heads"
 
         super().__init__()
         self.heads = config.heads
-        self.d_head: int = config.embed_dim // config.heads
+        self.attn_dim: int = config.attn_dim
+        self.d_head: int = config.attn_dim // config.heads
 
         self.dropout_p: float = config.dropout
-        self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.embed_dim, bias=False)
-        self.Wo: nn.Linear = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.attn_dim, bias=False)
+        self.Wo: nn.Linear = nn.Linear(config.attn_dim, config.embed_dim, bias=False)
     
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
@@ -81,15 +82,15 @@ class MultiHeadAttentionModule(nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, 3 * EMBED_DIM) --> (N_BATCHES, SEQ_LEN, 3 * EMBED_DIM)
+        # (N_BATCHES, SEQ_LEN, EMBED_DIM) @ (EMBED_DIM, 3 * ATTN_DIM) --> (N_BATCHES, SEQ_LEN, 3 * ATTN_DIM)
         qkv: torch.Tensor = self.Wqkv(x)
         
-        # (N_BATCHES, SEQ_LEN, EMBED_DIM)
-        query: torch.Tensor = qkv[..., :x.shape[-1]]
-        key: torch.Tensor = qkv[..., x.shape[-1]: 2*x.shape[-1]]
-        value: torch.Tensor = qkv[..., 2*x.shape[-1]:]
-        
-        # (N_BATCHES, SEQ_LEN, EMBED_DIM) --> (N_BATCHES, SEQ_LEN, HEADS, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
+        # (N_BATCHES, SEQ_LEN, ATTN_DIM)
+        query: torch.Tensor = qkv[..., :self.attn_dim]
+        key: torch.Tensor = qkv[..., self.attn_dim: 2*self.attn_dim]
+        value: torch.Tensor = qkv[..., 2*self.attn_dim:]
+
+        # (N_BATCHES, SEQ_LEN, ATTN_DIM) --> (N_BATCHES, SEQ_LEN, HEADS, d_head) --> (N_BATCHES, HEADS, SEQ_LEN, d_head)
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
@@ -121,9 +122,10 @@ class MultiHeadAttentionModule(nn.Module):
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
         output = output.transpose(1, 2)
 
-        # (N_BATCHES, SEQ_LEN, HEADS, d_head) -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
+        # (N_BATCHES, SEQ_LEN, HEADS, d_head) -> (N_BATCHES, SEQ_LEN, ATTN_DIM)
         output = output.contiguous().view(*x.shape[:-1], -1)
-        
+
+        # (N_BATCHES, SEQ_LEN, ATTN_DIM) @ (ATTN_DIM, EMBED_DIM) -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
         return self.Wo(output), new_kv
     
 
@@ -196,7 +198,7 @@ class GPTmodel(nn.Module):
         
         self.embedding = EmbeddingModule(config)
         self.projection = ProjectionModule(config)
-        self.rope = RoPeModule(config.embed_dim // config.heads)
+        self.rope = RoPeModule(config.attn_dim // config.heads)
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
         self.norm_f = nn.LayerNorm(config.embed_dim)
         self.activation_ckpt = False

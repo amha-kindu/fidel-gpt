@@ -104,11 +104,23 @@ class ModelConfig(Config):
         self.n_decoders: int = kwargs.get("n_decoders", 6)
         self.vocab_size: int = kwargs.get("vocab_size", 25000)
         self.ff_dim: int = kwargs.get("ff_dim", 2048)
+        self.attn_dim: int = kwargs.get("attn_dim") or self.embed_dim
         self.heads: int = kwargs.get("heads", 8)
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
         self.post_norm: bool = kwargs.get("post_norm", False)
         self.tie_weights: bool = kwargs.get("tie_weights", True)
+
+    def update(self, skip: list[str] = [], **kwargs):
+        follows = self.attn_dim == self.embed_dim
+        super().update(skip, **kwargs)
+        if follows and kwargs.get("attn_dim") is None:
+            self.attn_dim = self.embed_dim
+
+    def __setstate__(self, state: dict):
+        self.__dict__.update({**type(self)().__dict__, **state})
+        if "attn_dim" not in state:
+            self.attn_dim = self.embed_dim
 
 
 class ModelWithLoRAConfig(ModelConfig):
