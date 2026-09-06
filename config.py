@@ -99,6 +99,8 @@ class Config:
                 setattr(self, key, value)
 
 class ModelConfig(Config):
+    NORM_STRATEGIES = ("pre", "post", "deepnorm", "rootdepth")
+
     def __init__(self, **kwargs):
         self.embed_dim: int = kwargs.get("embed_dim", 512)
         self.n_decoders: int = kwargs.get("n_decoders", 6)
@@ -108,8 +110,7 @@ class ModelConfig(Config):
         self.heads: int = kwargs.get("heads", 8)
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
-        self.post_norm: bool = kwargs.get("post_norm", False)
-        self.tie_weights: bool = kwargs.get("tie_weights", True)
+        self.norm_strategy: str = kwargs.get("norm_strategy", "pre")
 
     def update(self, skip: list[str] = [], **kwargs):
         follows = self.attn_dim == self.embed_dim
@@ -121,6 +122,13 @@ class ModelConfig(Config):
         self.__dict__.update({**type(self)().__dict__, **state})
         if "attn_dim" not in state:
             self.attn_dim = self.embed_dim
+        if "norm_strategy" not in state:
+            self.norm_strategy = "post" if state.get("post_norm") else "pre"
+        # The merge above copies retired flags straight out of the pickle; drop them.
+        # post_norm was replaced by norm_strategy, and the embedding/projection weights
+        # are no longer tied at all.
+        self.__dict__.pop("post_norm", None)
+        self.__dict__.pop("tie_weights", None)
 
 
 class ModelWithLoRAConfig(ModelConfig):

@@ -97,8 +97,29 @@ python train.py \
 | `--seq-len` | `50` | Context window length |
 | `--ff-dim` | `2048` | Feed-forward inner dimension |
 | `--dropout` | `0.1` | Dropout probability |
-| `--post-norm` | `False` | Use post-norm (vs pre-norm) residual connections |
-| `--tie-weights` / `--no-tie-weights` | tied | Share embedding and projection weights |
+| `--norm-strategy` | `pre` | Normalization scheme — one of `pre`, `post`, `deepnorm`, `rootdepth` (see below) |
+
+##### Normalization strategies
+
+With `N = --n-decoders` and `Sublayer` being either the attention or the feed-forward branch:
+
+| Value | Formula | Notes |
+|---|---|---|
+| `pre` | `x + Sublayer(LN(x))` | Default. Stable, needs a final `norm_f`. |
+| `post` | `LN(x + Sublayer(x))` | Original Transformer placement; sensitive to warmup at depth. |
+| `deepnorm` | `LN(α·x + Sublayer(x))`, `α = (2N)^0.25` | Also down-scales the branch weights at init by `β = (8N)^-0.25` (feed-forward, attention output, and the V slice of the fused `Wqkv`). β applies to freshly initialized models only, not to `--resume` or `--init-weights`. |
+| `rootdepth` | `x + α·Sublayer(RMSNorm(x))`, `α = 1/sqrt(2N)` | Uses `RMSNorm` (no bias) in place of `LayerNorm` throughout, including `norm_f`. Also initializes the embedding at std `1.0` instead of `0.02` (see below). |
+
+`post` and `deepnorm` end each block in a normalization, so the final `norm_f` is allocated but
+unused. Checkpoints written before this flag existed load unchanged: `post_norm=True` maps to
+`post`, and `post_norm=False` to `pre`.
+
+`rootdepth` raises the embedding init std because `α` controls how fast the residual stream
+*grows* but not where it *starts*. At std `0.02` the stream begins ~25x below the value it
+settles at, and pre-norm's backward pass scales as `1/RMS(x_l)`, so the early layers receive
+much larger gradients than the late ones. Unit std removes the mismatch — the first/last
+gradient ratio on `feed_forward.Wd` falls from ~8.2 to ~1.1 at 32 layers, and holds from 8 to
+64 layers.
 
 #### Training hyperparameters
 

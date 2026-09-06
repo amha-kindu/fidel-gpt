@@ -150,10 +150,19 @@ class GatedFeedForwardModule(nn.Module):
 class DecoderModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.post_norm = config.post_norm
+        self.strategy = config.norm_strategy
         self.dropout = nn.Dropout(config.dropout)
-        self.norm1 = nn.LayerNorm(config.embed_dim)
-        self.norm2 = nn.LayerNorm(config.embed_dim)
+
+        norm_cls = nn.RMSNorm if self.strategy == "rootdepth" else nn.LayerNorm
+        self.norm1 = norm_cls(config.embed_dim)
+        self.norm2 = norm_cls(config.embed_dim)
+
+        if self.strategy == "deepnorm":
+            self.alpha = (2 * config.n_decoders) ** 0.25
+        elif self.strategy == "rootdepth":
+            self.alpha = (2 * config.n_decoders) ** -0.5
+        else:
+            self.alpha = 1.0
 
         self.feed_forward = GatedFeedForwardModule(config)
         self.attention = MultiHeadAttentionModule(config)
@@ -169,10 +178,18 @@ class DecoderModule(nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
-        if self.post_norm:
+        if self.strategy == "post":
             x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
+        elif self.strategy == "deepnorm":
+            x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
+            x = self.norm1(self.alpha * x + self.dropout(x_update))
+            x = self.norm2(self.alpha * x + self.dropout(self.feed_forward(x)))
+        elif self.strategy == "rootdepth":
+            x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
+            x = x + self.alpha * self.dropout(x_update)
+            x = x + self.alpha * self.dropout(self.feed_forward(self.norm2(x)))
         else:
             x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = x + self.dropout(x_update)
@@ -193,6 +210,9 @@ class ProjectionModule(nn.Module):
 
 class GPTmodel(nn.Module):
     def __init__(self, config: ModelConfig):
+        assert config.norm_strategy in ModelConfig.NORM_STRATEGIES, \
+            f"norm_strategy must be one of {ModelConfig.NORM_STRATEGIES}"
+
         super().__init__()
         self.config: ModelConfig = config
         
@@ -200,12 +220,8 @@ class GPTmodel(nn.Module):
         self.projection = ProjectionModule(config)
         self.rope = RoPeModule(config.attn_dim // config.heads)
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
-        self.norm_f = nn.LayerNorm(config.embed_dim)
+        self.norm_f = (nn.RMSNorm if config.norm_strategy == "rootdepth" else nn.LayerNorm)(config.embed_dim)
         self.activation_ckpt = False
-        if config.tie_weights:
-            # Tie input embedding and output projection weights (standard for decoder-only LMs).
-            # Both are (vocab_size, embed_dim), sharing one tensor halves that parameter block.
-            self.projection.linear.weight = self.embedding.embedding.weight
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -216,6 +232,10 @@ class GPTmodel(nn.Module):
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
     def _project(self, x: torch.Tensor) -> torch.Tensor:
         return self.projection(x)
+
+    # Input/Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
+    def _final_norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.config.norm_strategy in ("post", "deepnorm") else self.norm_f(x)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -246,7 +266,7 @@ class GPTmodel(nn.Module):
                 x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
-        return self.norm_f(x) if not self.config.post_norm else x
+        return self._final_norm(x)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -277,31 +297,50 @@ class GPTmodel(nn.Module):
         base_weights = {k: v for k, v in weights.items() if k not in lora_weights}
 
         if weights:
-            if config.tie_weights and "embedding.embedding.weight" in base_weights:
-                # Finetuned checkpoints saved via named_parameters() deduplicate tied
-                # params and drop projection.linear.weight, so a merged weights dict can
-                # hold a stale projection value. load_state_dict copies projection after
-                # embedding into the one shared tensor, letting the stale value clobber
-                # the finetuned embedding — keep the two keys in sync before loading.
-                base_weights["projection.linear.weight"] = base_weights["embedding.embedding.weight"]
             model.load_state_dict(base_weights, strict=True)
         else:
+            # rootdepth damps every branch by alpha=1/sqrt(2N), so the 2N sublayers add
+            # O(1) total variance on top of the embedding. Starting the residual stream
+            # at the usual std 0.02 leaves it ~25x smaller than the value it settles at,
+            # and pre-norm's backward pass scales as 1/RMS(x_l), which hands the early
+            # layers far larger gradients than the late ones. Unit std removes that
+            # mismatch: measured first/last gradient ratio on feed_forward.Wd drops from
+            # ~8.2 to ~1.1 at 32 layers and stays there from 8 to 64 layers. Raising it
+            # further flattens the ratio only marginally while progressively drowning out
+            # the branches (they contribute 28% of the final stream at 1.0, 10% at 3.0).
+            emb_std = 1.0 if config.norm_strategy == "rootdepth" else 0.02
+
             def init_weights(m):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 elif isinstance(m, nn.Embedding):
-                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                elif isinstance(m, nn.LayerNorm):
-                    nn.init.ones_(m.weight)
-                    nn.init.zeros_(m.bias)
-            
+                    nn.init.normal_(m.weight, mean=0.0, std=emb_std)
+                elif isinstance(m, (nn.LayerNorm, nn.RMSNorm)):
+                    if m.weight is not None:
+                        nn.init.ones_(m.weight)
+                    if getattr(m, "bias", None) is not None:
+                        nn.init.zeros_(m.bias)
+
             model.apply(init_weights)
-            if config.tie_weights:
-                # apply() is children-first: EmbeddingModule gets normal(0, 0.02) then ProjectionModule
-                # overwrites the shared tensor with xavier. Restore normal init.
-                nn.init.normal_(model.embedding.embedding.weight, mean=0.0, std=0.02)
+
+            if config.norm_strategy == "deepnorm":
+                # DeepNorm's other half: shrink the residual branch at init so the alpha
+                # up-weighting of the identity path in DecoderModule.forward isn't just
+                # post-norm with extra steps. apply() dispatches on module type and can't
+                # tell a branch projection from any other Linear, so this needs a second,
+                # name-aware pass. Q/K are deliberately left unscaled.
+                beta = (8 * config.n_decoders) ** -0.25
+                for block in model.decoders:
+                    nn.init.xavier_uniform_(block.feed_forward.Wug.weight, gain=beta)
+                    nn.init.xavier_uniform_(block.feed_forward.Wd.weight, gain=beta)
+                    if hasattr(block.attention, "Wo"):
+                        nn.init.xavier_uniform_(block.attention.Wo.weight, gain=beta)
+                    with torch.no_grad():
+                        # Wqkv is fused (embed_dim -> 3 * attn_dim); scale the V third only.
+                        qkv_weight = block.attention.Wqkv.weight
+                        qkv_weight[qkv_weight.shape[0] // 3 * 2:].mul_(beta)
 
         if isinstance(config, ModelWithLoRAConfig):
             LoRAdapter.apply_lora(model, config.lora_targets, config.lora_rank, config.lora_alpha, config.lora_dropout)

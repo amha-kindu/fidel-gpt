@@ -38,6 +38,7 @@ This project provides the full training and fine-tuning pipeline for a **custom 
 - **Attention**: multi-head self-attention (`n_heads`)
 - **Depth**: configurable (`n_layers`)
 - **Sequence length**: configurable (`max_seq_len`)
+- **Normalization**: configurable (`--norm-strategy`) — pre-LN, post-LN, DeepNorm or RootDepthNorm
 - **Vocabulary**: trained with SentencePiece (default ~25k tokens)
 - **Special tokens**: `[USER]`, `[BOT]`, `[SYSTEM]`, `[STOP]`, `[UNK]`, `[PAD]`, `[SOS]`
 
