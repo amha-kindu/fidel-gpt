@@ -76,6 +76,7 @@ import torch.nn.functional as F
 import sentencepiece as spm
 from tqdm import tqdm
 from torch.utils.data import SubsetRandomSampler
+from torch.utils.flop_counter import FlopCounterMode
 from torch.utils.tensorboard import SummaryWriter
 
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
@@ -770,6 +771,142 @@ def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
                              betas=(args.beta1, args.beta2), fused=fused)
 
 
+def fenced_json(payload: dict) -> str:
+    """A payload in the fenced block TensorBoard's TEXT tab renders as code.
+
+    default=str so a field json cannot represent -- a dtype, a device -- degrades
+    to its repr rather than taking the run down at step 0, before a single batch
+    has been seen.
+    """
+    return f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
+
+
+def parameter_census(model: torch.nn.Module) -> dict:
+    """Where a variant's parameters actually sit, bucketed by component_key.
+
+    The rule the Gradients/* tags already use, so a component's share of the
+    weights reads directly against its share of the gradient norm. That pairing
+    is the point: a block holding 30% of the parameters and 3% of the gradient
+    has stopped learning, and neither number says so on its own.
+
+    Counted through named_parameters(), which yields each shared tensor once
+    under its first name -- so a tied embedding is counted once, matching both
+    total_params in run() and the deduplication in gradient_norms.
+
+    non_embedding is called out separately because it is usually the honest
+    capacity axis, and it nets out BOTH vocabulary-sized tables -- the input
+    embedding and the output projection. Each is vocab_size * embed_dim whatever
+    the blocks are doing, identical across arms that share a tokeniser, and
+    easily large enough to dilute a real difference in the blocks into a rounding
+    error in the total. Subtracting only the input side would leave the output
+    head counted as block capacity whenever the two are untied, so the figure
+    would quietly mean different things depending on a config flag -- which is
+    the one thing a comparison axis must never do.
+    """
+    census: dict[str, int] = {}
+    footprint = 0
+    for name, param in model.named_parameters():
+        census[component_key(name)] = census.get(component_key(name), 0) + param.numel()
+        footprint += param.numel() * param.element_size()
+    total = sum(census.values())
+    vocabulary = census.get("Embedding", 0) + census.get("Projection", 0)
+    # named_parameters() deduplicates by default; the gap against the
+    # undeduplicated walk is the number of parameter slots that alias another,
+    # which is how weight tying shows up without asking the model about it. At 0
+    # the two tables above are genuinely separate and both were counted.
+    aliased = (sum(1 for _ in model.named_parameters(remove_duplicate=False))
+               - sum(1 for _ in model.named_parameters()))
+    return {"total": total,
+            "non_embedding": total - vocabulary,
+            "vocabulary": vocabulary,
+            "bytes": footprint,
+            "aliased_tensors": aliased,
+            "by_component": dict(sorted(census.items()))}
+
+
+def flop_census(model: torch.nn.Module, inputs: torch.Tensor, mask: torch.Tensor) -> dict:
+    """FLOPs for one training step, measured by dispatch rather than derived.
+
+    Counted through torch's FlopCounterMode, so this knows nothing about the
+    architecture in front of it -- the same reason the activation diagnostics
+    read off hooks rather than reaching inside. An arm with a different block
+    structure is counted correctly with no edit here, which a hand-rolled
+    2 * in * out formula per layer type could not promise.
+
+    Normalised per POSITION, not per real token. FLOPs are spent on padding just
+    the same, so dividing by the non-pad count would credit an arm with a
+    throughput it did not achieve. That makes this the one place in the script
+    where the denominator is deliberately not the one validate() uses.
+
+    attention_counted is part of the result rather than a footnote. FlopCounterMode
+    has formulas registered for the fused CUDA attention kernels but not for every
+    backend SDPA can dispatch to -- the CPU one has none -- and where there is no
+    formula the op contributes zero rather than failing. So the flag says which
+    number you are holding, and it matters that the shortfall is not uniform
+    across arms: it drops exactly the term an attention-heavy variant spends most
+    of its time in, which would flatter it against a feed-forward-heavy one.
+    """
+    was_training = model.training
+    model.train()
+    with FlopCounterMode(display=False) as counter:
+        model(inputs, mask)
+    forward = counter.get_total_flops()
+    with FlopCounterMode(display=False) as counter:
+        model(inputs, mask).sum().backward()
+    total = counter.get_total_flops()
+    ops = {str(op): int(value) for op, value
+           in counter.get_flop_counts().get("Global", {}).items()}
+    # A throwaway loss and no optimiser step, so the weights are untouched -- but
+    # that backward left gradients behind, and the caller's first real step must
+    # not inherit them.
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+
+    positions = max(inputs.shape[0] * inputs.shape[1], 1)
+    return {"forward": forward,
+            "backward": total - forward,
+            "total": total,
+            "per_position": total / positions,
+            "attention_counted": any("scaled_dot_product" in op for op in ops),
+            "by_op": dict(sorted(ops.items(), key=lambda item: -item[1]))}
+
+
+def log_configs(writer: SummaryWriter, variant: Variant, config: ModelConfig, args,
+                fingerprint: str) -> None:
+    """This arm's configuration, as the fenced JSON text train.py logs.
+
+    ModelConfig and Environment carry the tag and the format they carry in a
+    training run, so the TEXT tab of a comparison run reads against a real one
+    without translating anything -- the same reason the Gradients/* buckets are
+    shared rather than restated. ComparisonConfig is this script's answer to
+    train.py's TrainingConfig: there is no TrainingConfig object here, the run
+    knobs live on the parsed arguments. Variant is the one with no counterpart,
+    and it is the important one -- a chart of two arms is unreadable later
+    without a record of which model class and which overrides produced each.
+
+    Written into every variant's own writer rather than once into a shared one.
+    TensorBoard's TEXT tab is per-run, so a single shared writer would either
+    hide the text from the runs it describes or hang a pseudo-run beside them --
+    the fragmentation the add_scalars note in run() exists to avoid. Environment
+    and ComparisonConfig therefore repeat per arm, which is what leaves each run
+    directory independently readable.
+
+    Emitted after the config is read back off the built model, so what lands is
+    what the arm actually trained with rather than what was asked for.
+    """
+    writer.add_text("ModelConfig", fenced_json(config.to_dict()), 0)
+    # `variants` holds resolved classes and `base_config` goes in whole beneath,
+    # which is the same pair summary.json keeps out of its own args block.
+    writer.add_text("ComparisonConfig", fenced_json(
+        {**{key: value for key, value in vars(args).items()
+            if key not in ("base_config", "variants")},
+         "base_config": args.base_config}), 0)
+    writer.add_text("Variant", fenced_json(
+        {"label": variant.label, "model": variant.model, "overrides": variant.overrides,
+         "data_fingerprint": fingerprint}), 0)
+    writer.add_text("Environment", fenced_json(ENV), 0)
+
+
 def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         pad: int, causal: torch.Tensor, run_dir: str) -> dict:
     label, overrides = variant.label, variant.overrides
@@ -812,6 +949,23 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     # config that gets reported is read back off the model, not off the overrides
     # that were asked for.
     config = getattr(model, "config", config)
+    log_configs(writer, variant, config, args, observed)
+
+    # Measured on the eager module and on a real training batch, so the FLOPs are
+    # the ones a step actually costs at this shape. Before the compile below and
+    # before the clock starts: it runs a forward and a backward of its own, which
+    # would otherwise be billed to this arm's wall-clock.
+    probe = train.items[0][0].to(DEVICE, non_blocking=True)
+    census = {"parameters": parameter_census(model),
+              "flops_per_step": flop_census(model, probe, build_mask(probe, pad, causal))}
+    writer.add_text("ModelCensus", fenced_json(census), 0)
+    flops_per_step = census["flops_per_step"]["total"]
+    if not census["flops_per_step"]["attention_counted"]:
+        LOGGER.warning(
+            f"  {label}: no FLOP formula is registered for the attention kernel this "
+            f"device dispatches to, so perf/tflops and the ModelCensus counts exclude "
+            f"attention. The shortfall is larger for arms that attend more, so treat "
+            f"the number as a floor rather than as a like-for-like ratio.")
 
     # Only the training step runs through the compiled wrapper. The diagnostics
     # keep using the eager module: they install forward hooks on the decoder
@@ -967,6 +1121,15 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("perf/tokens_per_sec",
                               train.total_inputs / len(train) * step / max(elapsed, 1e-9),
                               step, walltime=walltime)
+            # Achieved throughput, against which the device's peak is the yardstick.
+            # tok/s says how fast an arm moves data; this says how much of the
+            # machine it is using to do it, and the two come apart exactly where
+            # the interesting answer is -- an arm can trail on tok/s because it
+            # does more arithmetic per token, or because it is launch-bound and
+            # leaving the device idle, and only this number tells them apart.
+            writer.add_scalar("perf/tflops",
+                              flops_per_step * step / max(elapsed, 1e-9) / 1e12,
+                              step, walltime=walltime)
 
             collapse = None
             # Tracked over training, not just start/end: representation collapse
@@ -993,24 +1156,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     # only meaningful against a budget every variant reached, and that is not
     # known until they have all run, so report() derives it from `curve`.
     aulc_steps = aulc(curve, 0)
-
-    # run_name="." keeps the hparams in this run's own directory; the default
-    # would nest a fresh timestamped run underneath and split the variant in two.
-    # The overrides go in as one JSON string rather than as columns. Variants may
-    # set disjoint fields, and a column per field would leave the hparams table
-    # mostly blank and would need this script to know which fields exist.
-    writer.add_hparams(
-        {"variant": label, "model": variant.model,
-         "overrides": json.dumps(overrides, sort_keys=True),
-         "attn_params": attn_params, "total_params": total_params,
-         "embed_dim": config.embed_dim, "heads": config.heads,
-         "n_decoders": config.n_decoders, "seq_len": config.seq_len, "lr": args.lr,
-         "compile": args.compile_mode if args.compile else "off"},
-        {"hparam/final_val": curve[-1][2], "hparam/aulc": aulc_steps,
-         "hparam/gap": gap,
-         "hparam/sec": elapsed, "hparam/warmup_sec": warmup_sec,
-         "hparam/collapse_mean": final.get("collapse/output/mean", float("nan"))},
-        run_name=".")
+    
     writer.close()
 
     return {
@@ -1021,6 +1167,8 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         "data_fingerprint": observed,
         "attn_params": attn_params,
         "total_params": total_params,
+        "census": census,
+        "tflops": flops_per_step * args.steps / max(elapsed, 1e-9) / 1e12,
         "curve": curve,
         "aulc": aulc_steps,
         "gap": gap,
@@ -1115,6 +1263,11 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
     print("  loss/*, collapse/*, attn/*, Gradients/* and perf/* carry the same tag in every run,")
     print("  so each chart overlays them all. Switch the x-axis to RELATIVE for loss against")
     print("  seconds of training compute rather than steps.")
+    print("  TEXT holds ModelConfig, ComparisonConfig, Variant, Environment and ModelCensus per")
+    print("  run, so a chart reads back to the class, overrides, commit, parameter breakdown and")
+    print("  measured FLOPs that produced it. perf/tflops is achieved throughput against the")
+    print("  device's peak: read it beside tok/s to tell an arm that does more arithmetic per")
+    print("  token apart from one that is leaving the device idle.")
 
     summary = os.path.join(run_dir, "summary.json")
     with open(summary, "w", encoding="utf-8") as handle:
