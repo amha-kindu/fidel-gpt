@@ -112,6 +112,11 @@ MODEL_KEY = "model"
 # that their attention classes have nothing in common but nn.Module.
 ATTENTION_HINTS = ("attention", "attn")
 
+# The same, for the feed-forward submodule. Deliberately no bare "ff": at two
+# characters it matches "offset" and "buffer" as readily as a branch name, and a
+# spurious second match fails the block rather than mislabelling it.
+FEEDFORWARD_HINTS = ("feed_forward", "feedforward", "ffn", "mlp")
+
 
 # --------------------------------------------------------------------------- #
 # device + determinism
@@ -381,79 +386,128 @@ def decoder_blocks(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
     return list(blocks)
 
 
-def attention_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
-    """The attention submodule of every decoder block, found by attribute name.
+def sublayer_modules(model: torch.nn.Module, label: str,
+                     hints: tuple[str, ...], what: str) -> list[torch.nn.Module]:
+    """One named submodule per decoder block, found by attribute name.
 
     Two architectures being compared are under no obligation to agree on that
     name, and hardcoding whichever one they currently share would turn a rename
-    in either into an empty attn/* series here -- which does not look like a bug,
-    it looks like a real difference between the arms. Matching on ATTENTION_HINTS
-    covers the plausible names, and requiring exactly one match per block means a
-    model this heuristic cannot read fails loudly instead of silently.
+    in either into an empty attn/* or ffn/* series here -- which does not look
+    like a bug, it looks like a real difference between the arms. Matching on
+    hints covers the plausible names, and requiring exactly one match per block
+    means a model this heuristic cannot read fails loudly instead of silently.
+
+    Shared by both sublayers rather than written twice, so the two families of
+    tags cannot drift apart in which models they can read.
     """
     found = []
     for layer, block in enumerate(decoder_blocks(model, label)):
         children = list(block.named_children())
         matches = [child for name, child in children
-                   if any(hint in name.lower() for hint in ATTENTION_HINTS)]
+                   if any(hint in name.lower() for hint in hints)]
         if len(matches) != 1:
             names = ", ".join(name for name, _ in children) or "no children"
             raise RuntimeError(
                 f"variant '{label}': block {layer} of {type(model).__name__} has "
-                f"{len(matches)} submodules whose name looks like attention "
+                f"{len(matches)} submodules whose name looks like {what} "
                 f"({names}). The diagnostics need exactly one; rename it to contain "
-                f"one of {ATTENTION_HINTS}, or drop the extra match.")
+                f"one of {hints}, or drop the extra match.")
         found.append(matches[0])
     return found
 
 
-@torch.inference_mode()
-def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module], inputs: torch.Tensor,
-             pad: int, causal: torch.Tensor) -> dict[str, float]:
-    """Per-layer attention health, from ONE forward pass.
+def attention_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
+    return sublayer_modules(model, label, ATTENTION_HINTS, "attention")
 
-    Everything here is read off forward hooks, from three tensors per decoder
-    block: what the attention sublayer was handed, the update it wrote back, and
-    what left the block. No probe reaches inside an attention module, looks up an
-    attribute or recomputes a score. That is deliberate -- a diagnostic that
-    knows the internals of one variant produces a tag the other variant cannot
-    report, which is precisely the tag that cannot be compared. It also means
-    these numbers survive any change to the attention implementations, and that
-    they mean the same thing across two unrelated model classes.
+
+def feedforward_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
+    return sublayer_modules(model, label, FEEDFORWARD_HINTS, "a feed-forward")
+
+
+@torch.inference_mode()
+def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module],
+             feedforwards: list[torch.nn.Module], inputs: torch.Tensor,
+             pad: int, causal: torch.Tensor) -> dict[str, float]:
+    """Per-layer sublayer health, from ONE forward pass.
+
+    Everything here is read off forward hooks, from four tensors per decoder
+    block: what the attention sublayer was handed, the update it wrote back, the
+    same pair for the feed-forward sublayer, and what left the block. No probe
+    reaches inside a module, looks up an attribute or recomputes a score. That is
+    deliberate -- a diagnostic that knows the internals of one variant produces a
+    tag the other variant cannot report, which is precisely the tag that cannot be
+    compared. It also means these numbers survive any change to the sublayer
+    implementations, and that they mean the same thing across two unrelated model
+    classes.
 
     A forward hook receives its module's positional inputs alongside its output,
-    so one hook per attention module sees both the tensor it attends over
-    (post-norm1 under the default pre-norm block) and the update it produces.
+    so one hook per sublayer sees both the tensor it reads (post-norm1 and
+    post-norm2 respectively under a pre-norm block) and the update it produces.
+
+    attn/* and ffn/* carry the SAME four measurements against the same
+    definitions, so the pair answers which of the two branches is responsible for
+    whatever the block as a whole is doing -- the question a single
+    block-level number cannot answer.
 
       collapse/input      mean pairwise cosine of the tokens entering attention
+      collapse/mid        the same entering the feed-forward, i.e. after the
+                          attention sublayer has written back
       collapse/output     the same after the whole block. ~0 means tokens stay
                           spread out; -> 1 means they have collapsed onto each
-                          other and depth is no longer buying anything.
-      attn/input_norm     mean ||x|| entering attention -- residual-stream drift,
-                          and the scale every other magnitude here is relative to
-      attn/update_ratio   ||update|| / ||x||, the sublayer's gain into the
+                          other and depth is no longer buying anything. The three
+                          together split a block's collapse into the part
+                          attention added and the part the feed-forward added.
+      <s>/input_norm      mean ||x|| entering the sublayer -- residual-stream
+                          drift, and the scale its other magnitudes are relative to
+      <s>/update_ratio    ||update|| / ||x||, the sublayer's gain into the
                           residual stream. Far above 1 is a block shouting over
                           the stream (pair it with that block's Gradients/Decoder<i>
                           when one variant's Gradients/Global sits an order of
                           magnitude off the other's -- the ratio says which layer is
                           loud, the gradient says whether it is also unstable); far
-                          below 1 is a block that has switched off.
-      attn/update_cos     mean cos(update_i, x_i). ~0 is a sublayer writing
+                          below 1 is a sublayer that has switched off.
+      <s>/update_cos      mean cos(update_i, x_i). ~0 is a sublayer writing
                           genuinely new content; -> 1 means it is mostly
-                          rescaling what each token already held, which is
-                          attention that has stopped moving information BETWEEN
-                          tokens -- the failure a loss curve hides longest.
-      attn/update_isotropy
+                          rescaling what each token already held. Both branches
+                          end in an output projection that rotates the update out
+                          of the span of its input, so both rest near 0 at init
+                          (measured 0.0002 and -0.0038 at 6 layers). What a rise
+                          MEANS differs: for attention it is a block that has
+                          stopped moving information BETWEEN tokens, the failure
+                          a loss curve hides longest; the feed-forward is
+                          position-wise and never moved information between
+                          tokens, so for it a rise only says the branch has
+                          decayed toward rescaling in place.
+      <s>/update_isotropy
                           how evenly the update spreads over the directions
-                          available to it. -> 0 is a block writing everything
+                          available to it. -> 0 is a sublayer writing everything
                           into a handful of directions however wide EMBED_DIM
                           is, which cosine collapse cannot see (see isotropy)
+
+    where <s> is `attn` for the attention sublayer and `ffn` for the feed-forward.
+
+    The two families share definitions but NOT resting values, and isotropy is
+    the sharpest case: at init attention averages over positions with near-uniform
+    weights, which is close to rank one, while the feed-forward's update comes
+    through a random down-projection. Measured at 6 layers that is 0.19 against
+    0.67 -- a property of the two designs, not a fault in either. Compare each
+    against its own trajectory; comparing attn/* to ffn/* at a point in time
+    reads a structural difference as a finding.
     """
     rec = Recorder()
     geom = Geometry(inputs, pad)
     handles = []
 
-    def attention_hook(layer: int):
+    def sublayer_hook(family: str, collapse_tag: str, layer: int):
+        """One hook body for both sublayers.
+
+        `family` is the tag prefix (`attn` or `ffn`) and `collapse_tag` is where
+        this sublayer's INPUT collapse is filed -- the attention sublayer reads
+        the tensor entering the block, the feed-forward reads the tensor halfway
+        through it. Written once so the two families cannot drift apart in how a
+        ratio or a cosine is defined, which would make them incomparable exactly
+        where comparing them is the point.
+        """
         def hook(_module, args, output):
             x = args[0].float()
             update = (output[0] if isinstance(output, tuple) else output).float()
@@ -461,14 +515,14 @@ def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module], inputs: 
             update_norm = update.norm(dim=-1, keepdim=True)
             mean_x_norm = masked_mean(x_norm, geom.token)
 
-            rec.add("attn/input_norm", layer, mean_x_norm)
-            rec.add("attn/update_ratio", layer,
+            rec.add(f"{family}/input_norm", layer, mean_x_norm)
+            rec.add(f"{family}/update_ratio", layer,
                     masked_mean(update_norm, geom.token) / mean_x_norm.clamp_min(FLOOR))
-            rec.add("attn/update_cos", layer,
+            rec.add(f"{family}/update_cos", layer,
                     masked_mean((update * x).sum(dim=-1, keepdim=True)
                                 / (update_norm * x_norm).clamp_min(FLOOR), geom.token))
-            rec.add("attn/update_isotropy", layer, isotropy(update, geom))
-            rec.add("collapse/input", layer, cosine_collapse(x, geom))
+            rec.add(f"{family}/update_isotropy", layer, isotropy(update, geom))
+            rec.add(collapse_tag, layer, cosine_collapse(x, geom))
         return hook
 
     def block_hook(layer: int):
@@ -477,8 +531,12 @@ def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module], inputs: 
             rec.add("collapse/output", layer, cosine_collapse(output[0], geom))
         return hook
 
-    for layer, (block, attention) in enumerate(zip(model.decoders, attentions)):
-        handles.append(attention.register_forward_hook(attention_hook(layer)))
+    for layer, (block, attention, feedforward) in enumerate(
+            zip(model.decoders, attentions, feedforwards)):
+        handles.append(attention.register_forward_hook(
+            sublayer_hook("attn", "collapse/input", layer)))
+        handles.append(feedforward.register_forward_hook(
+            sublayer_hook("ffn", "collapse/mid", layer)))
         handles.append(block.register_forward_hook(block_hook(layer)))
 
     was_training = model.training
@@ -983,6 +1041,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     # Resolved once, here rather than inside diagnose(), so a model whose blocks this
     # script cannot read fails before it trains for ten minutes and reports nothing.
     attentions = attention_modules(model, label)
+    feedforwards = feedforward_modules(model, label)
 
     unique = {id(p): p for p in model.parameters()}
     total_params = sum(p.numel() for p in unique.values())
@@ -1032,7 +1091,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     if args.compile:
         LOGGER.info(f"  {label}: compile + warmup took {warmup_sec:.1f}s (excluded from timings)")
 
-    initial = diagnose(model, attentions, data.diag, pad, causal)
+    initial = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
     curve: list[tuple[int, float, float]] = []
     elapsed, window_start = 0.0, None
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
@@ -1135,7 +1194,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             # Tracked over training, not just start/end: representation collapse
             # is a trajectory, and the depth profile is the thing to compare.
             if diag_index % args.diag_every == 0 or step == args.steps:
-                diagnostics = diagnose(model, attentions, data.diag, pad, causal)
+                diagnostics = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
                 for tag, value in diagnostics.items():
                     writer.add_scalar(tag, value, step, walltime=walltime)
                 collapse = diagnostics.get("collapse/output/mean")
@@ -1149,7 +1208,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     progress.close()
 
-    final = diagnose(model, attentions, data.diag, pad, causal)
+    final = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
     # Over steps, which every arm shares by construction, so this one is
     # comparable as it stands. The seconds-axis area is NOT computed here: it is
@@ -1260,9 +1319,11 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
 
     print(rule)
     print(f"\ntensorboard --logdir {run_dir}")
-    print("  loss/*, collapse/*, attn/*, Gradients/* and perf/* carry the same tag in every run,")
-    print("  so each chart overlays them all. Switch the x-axis to RELATIVE for loss against")
-    print("  seconds of training compute rather than steps.")
+    print("  loss/*, collapse/*, attn/*, ffn/*, Gradients/* and perf/* carry the same tag in every")
+    print("  run, so each chart overlays them all. attn/* and ffn/* hold the same four measurements")
+    print("  per sublayer, so reading them side by side says which branch drove the block.")
+    print("  Switch the x-axis to RELATIVE for loss against seconds of training compute")
+    print("  rather than steps.")
     print("  TEXT holds ModelConfig, ComparisonConfig, Variant, Environment and ModelCensus per")
     print("  run, so a chart reads back to the class, overrides, commit, parameter breakdown and")
     print("  measured FLOPs that produced it. perf/tflops is achieved throughput against the")
@@ -1333,6 +1394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-decoders", type=int, default=3)
     parser.add_argument("--ff-dim", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--gain", type=float, default=1.0)
 
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
