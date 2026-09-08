@@ -99,7 +99,7 @@ class Config:
                 setattr(self, key, value)
 
 class ModelConfig(Config):
-    NORM_STRATEGIES = ("pre", "post", "deepnorm", "rootdepth")
+    NORM_STRATEGIES = ("pre-ln", "pre-rms", "post-ln", "post-rms", "deepnorm", "rootdepth-ln", "rootdepth-rms")
 
     def __init__(self, **kwargs):
         self.embed_dim: int = kwargs.get("embed_dim", 512)
@@ -110,7 +110,8 @@ class ModelConfig(Config):
         self.heads: int = kwargs.get("heads", 8)
         self.dropout: float = kwargs.get("dropout", 0.1)
         self.seq_len: int = kwargs.get("seq_len", 50)
-        self.norm_strategy: str = kwargs.get("norm_strategy", "pre")
+        self.norm_strategy: str = kwargs.get("norm_strategy", "pre-ln")
+        self.gain: float = kwargs.get("gain", 1.0)
 
     def update(self, skip: list[str] = [], **kwargs):
         follows = self.attn_dim == self.embed_dim

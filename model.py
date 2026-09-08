@@ -153,14 +153,14 @@ class DecoderModule(nn.Module):
         self.strategy = config.norm_strategy
         self.dropout = nn.Dropout(config.dropout)
 
-        norm_cls = nn.RMSNorm if self.strategy == "rootdepth" else nn.LayerNorm
+        norm_cls = nn.RMSNorm if "-rms" in self.strategy else nn.LayerNorm
         self.norm1 = norm_cls(config.embed_dim)
         self.norm2 = norm_cls(config.embed_dim)
 
         if self.strategy == "deepnorm":
             self.alpha = (2 * config.n_decoders) ** 0.25
-        elif self.strategy == "rootdepth":
-            self.alpha = (2 * config.n_decoders) ** -0.5
+        elif "rootdepth" in self.strategy:
+            self.alpha = config.gain * (2 * config.n_decoders) ** -0.5
         else:
             self.alpha = 1.0
 
@@ -178,7 +178,7 @@ class DecoderModule(nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cos_sin_phases: tuple[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, SlidingKVCache | None]:
-        if self.strategy == "post":
+        if "post" in self.strategy:
             x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(x + self.dropout(x_update))
             x = self.norm2(x + self.dropout(self.feed_forward(x)))
@@ -186,7 +186,7 @@ class DecoderModule(nn.Module):
             x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(self.alpha * x + self.dropout(x_update))
             x = self.norm2(self.alpha * x + self.dropout(self.feed_forward(x)))
-        elif self.strategy == "rootdepth":
+        elif "rootdepth" in self.strategy:
             x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = x + self.alpha * self.dropout(x_update)
             x = x + self.alpha * self.dropout(self.feed_forward(self.norm2(x)))
@@ -220,7 +220,7 @@ class GPTmodel(nn.Module):
         self.projection = ProjectionModule(config)
         self.rope = RoPeModule(config.attn_dim // config.heads)
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
-        self.norm_f = (nn.RMSNorm if config.norm_strategy == "rootdepth" else nn.LayerNorm)(config.embed_dim)
+        self.norm_f = (nn.RMSNorm if "-rms" in config.norm_strategy else nn.LayerNorm)(config.embed_dim)
         self.activation_ckpt = False
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
@@ -235,7 +235,7 @@ class GPTmodel(nn.Module):
 
     # Input/Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def _final_norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x if self.config.norm_strategy in ("post", "deepnorm") else self.norm_f(x)
+        return x if self.config.norm_strategy in ("post-ln", "post-rms", "deepnorm") else self.norm_f(x)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM), mask -> (SEQ_LEN, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -299,24 +299,13 @@ class GPTmodel(nn.Module):
         if weights:
             model.load_state_dict(base_weights, strict=True)
         else:
-            # rootdepth damps every branch by alpha=1/sqrt(2N), so the 2N sublayers add
-            # O(1) total variance on top of the embedding. Starting the residual stream
-            # at the usual std 0.02 leaves it ~25x smaller than the value it settles at,
-            # and pre-norm's backward pass scales as 1/RMS(x_l), which hands the early
-            # layers far larger gradients than the late ones. Unit std removes that
-            # mismatch: measured first/last gradient ratio on feed_forward.Wd drops from
-            # ~8.2 to ~1.1 at 32 layers and stays there from 8 to 64 layers. Raising it
-            # further flattens the ratio only marginally while progressively drowning out
-            # the branches (they contribute 28% of the final stream at 1.0, 10% at 3.0).
-            emb_std = 1.0 if config.norm_strategy == "rootdepth" else 0.02
-
             def init_weights(m):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 elif isinstance(m, nn.Embedding):
-                    nn.init.normal_(m.weight, mean=0.0, std=emb_std)
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
                 elif isinstance(m, (nn.LayerNorm, nn.RMSNorm)):
                     if m.weight is not None:
                         nn.init.ones_(m.weight)

@@ -97,29 +97,45 @@ python train.py \
 | `--seq-len` | `50` | Context window length |
 | `--ff-dim` | `2048` | Feed-forward inner dimension |
 | `--dropout` | `0.1` | Dropout probability |
-| `--norm-strategy` | `pre` | Normalization scheme — one of `pre`, `post`, `deepnorm`, `rootdepth` (see below) |
+| `--norm-strategy` | `pre-ln` | Normalization scheme — one of `pre-ln`, `pre-rms`, `post-ln`, `post-rms`, `deepnorm`, `rootdepth-ln`, `rootdepth-rms` (see below) |
 
 ##### Normalization strategies
 
-With `N = --n-decoders` and `Sublayer` being either the attention or the feed-forward branch:
+A strategy name encodes two independent choices. The suffix picks the normalization —
+`-ln` is `LayerNorm`, `-rms` is `RMSNorm` (no bias) — and the prefix picks where it sits.
+`deepnorm` is the one exception: it is defined with `LayerNorm` and takes no suffix.
 
-| Value | Formula | Notes |
+With `N = --n-decoders`, `Norm` being the suffix's choice, and `Sublayer` being either the
+attention or the feed-forward branch:
+
+| Placement | Formula | Notes |
 |---|---|---|
-| `pre` | `x + Sublayer(LN(x))` | Default. Stable, needs a final `norm_f`. |
-| `post` | `LN(x + Sublayer(x))` | Original Transformer placement; sensitive to warmup at depth. |
+| `pre-*` | `x + Sublayer(Norm(x))` | Default (`pre-ln`). Stable, needs a final `norm_f`. |
+| `post-*` | `Norm(x + Sublayer(x))` | Original Transformer placement; sensitive to warmup at depth. |
 | `deepnorm` | `LN(α·x + Sublayer(x))`, `α = (2N)^0.25` | Also down-scales the branch weights at init by `β = (8N)^-0.25` (feed-forward, attention output, and the V slice of the fused `Wqkv`). β applies to freshly initialized models only, not to `--resume` or `--init-weights`. |
-| `rootdepth` | `x + α·Sublayer(RMSNorm(x))`, `α = 1/sqrt(2N)` | Uses `RMSNorm` (no bias) in place of `LayerNorm` throughout, including `norm_f`. Also initializes the embedding at std `1.0` instead of `0.02` (see below). |
+| `rootdepth-*` | `x + α·Sublayer(Norm(x))`, `α = gain/sqrt(2N)` | Pre-norm placement with both residual branches damped by `α`. `gain` is a `ModelConfig` field (default `1.0`) — see below. |
 
-`post` and `deepnorm` end each block in a normalization, so the final `norm_f` is allocated but
-unused. Checkpoints written before this flag existed load unchanged: `post_norm=True` maps to
-`post`, and `post_norm=False` to `pre`.
+`post-*` and `deepnorm` end each block in a normalization, so the final `norm_f` is allocated
+but unused.
 
-`rootdepth` raises the embedding init std because `α` controls how fast the residual stream
-*grows* but not where it *starts*. At std `0.02` the stream begins ~25x below the value it
-settles at, and pre-norm's backward pass scales as `1/RMS(x_l)`, so the early layers receive
-much larger gradients than the late ones. Unit std removes the mismatch — the first/last
-gradient ratio on `feed_forward.Wd` falls from ~8.2 to ~1.1 at 32 layers, and holds from 8 to
-64 layers.
+Checkpoints predating the `-ln`/`-rms` split carry the old names and need `norm_strategy`
+renamed before they will load: `pre` → `pre-ln`, `post` → `post-ln`, `rootdepth` →
+`rootdepth-rms` (old `rootdepth` used `RMSNorm` throughout). Checkpoints older than the flag
+itself carry `post_norm`, which `ModelConfig.__setstate__` maps to `pre`/`post` — the same
+rename then applies.
+
+##### `gain` under `rootdepth-*`
+
+Every embedding initializes at std `0.02`, so `gain` sets the balance between what the
+embedding contributes to the residual stream and what the `2N` damped branches add on top of
+it. At `gain = 1.0` and 6 layers the branches dominate the stream from the first block, and
+the token identity the LM head reads is largely buried at init; lowering `gain` restores it.
+
+A sweep at 6 layers × 64 dim found a broad optimum around `0.03`, with every value from
+`0.008` to `0.07` indistinguishable at that budget. `α` already carries a `(2N)^-0.5` factor,
+but the useful `gain` still depends on depth and embedding scale, so re-check it if either
+changes. `gain` is not exposed on `train.py`; set it through a config file, or per variant in
+`compare_models.py` (`--variant "a:norm_strategy=rootdepth-rms,gain=0.03"`).
 
 #### Training hyperparameters
 

@@ -316,7 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--attn-dim", type=int, help="Dimensionality of the attention layer, i.e. what Wqkv projects up to and what the heads divide (default: embed_dim)")
-    parser.add_argument("--norm-strategy", type=str, default=None, choices=list(ModelConfig.NORM_STRATEGIES), help="Normalization scheme: 'pre'/'post' layer normalization, 'deepnorm' (post-norm with the residual scaled by alpha=(2N)^0.25 and branch weights by beta=(8N)^-0.25) or 'rootdepth' (pre-RMSNorm with branches scaled by alpha=1/sqrt(2N)), where N is n_decoders (default: pre)")
+    parser.add_argument("--norm-strategy", type=str, default=None, choices=list(ModelConfig.NORM_STRATEGIES), help="Normalization scheme. The suffix picks the norm ('-ln' is LayerNorm, '-rms' is RMSNorm without bias); the prefix picks the placement: 'pre-*' is x + Sublayer(Norm(x)), 'post-*' is Norm(x + Sublayer(x)), 'rootdepth-*' is pre-norm with both branches scaled by alpha=gain/sqrt(2N). 'deepnorm' is post-LayerNorm with the residual scaled by alpha=(2N)^0.25 and branch weights by beta=(8N)^-0.25. N is n_decoders (default: pre-ln)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
