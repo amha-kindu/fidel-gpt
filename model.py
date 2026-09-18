@@ -7,6 +7,7 @@ from config import *
 from probes import register
 from lora import LoRAdapter
 from cache import SlidingKVCache
+from probes import register
 
 
 class EmbeddingModule(nn.Module):
