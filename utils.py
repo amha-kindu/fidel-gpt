@@ -118,10 +118,15 @@ def component_key(name: str) -> str:
     """Parameter name -> the component its norms are reported under.
 
     One rule, used by the gradient and weight-norm logging below and imported by
-    compare_models.py, so that Gradients/Decoder3 covers the same parameters in a
-    training run and in a comparison run. Anything that is not the embedding, the
-    projection or a decoder block falls into NormF -- that is norm_f alone in
-    GPTmodel, but a subclass with its own top-level layers lands there too.
+    compare_models.py, so a bucket covers the same parameters in a training run
+    and in a comparison run. The BUCKETS are shared; the tag prefixes are not --
+    training writes Gradients/Decoder3 and WeightNorm/Decoder3, a comparison run
+    writes param/grad/Decoder3 and param/weight/Decoder3. Same parameters, so the
+    series are readable against each other, but they do not overlay on one chart.
+
+    Anything that is not the embedding, the projection or a decoder block falls
+    into NormF -- that is norm_f alone in GPTmodel, but a subclass with its own
+    top-level layers lands there too.
     """
     if name.startswith("embedding"):
         return "Embedding"

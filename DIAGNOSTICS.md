@@ -16,18 +16,37 @@ tags across runs and colours them by run.
 
 ## Table of Contents
 
-- [Conventions](#conventions)
-- [The measurement principle](#the-measurement-principle)
-- [`collapse/*` — representation collapse](#collapse--representation-collapse)
-- [`attn/*` and `ffn/*` — sublayer health](#attn-and-ffn--sublayer-health)
-- [`loss/*` — quality](#loss--quality)
-- [`optim/*` — optimisation](#optim--optimisation)
-- [`Gradients/*` — where the gradient is going](#gradients--where-the-gradient-is-going)
-- [`perf/*` — cost](#perf--cost)
-- [TEXT — what produced the curves](#text--what-produced-the-curves)
-- [Reading them together](#reading-them-together)
-- [Caveats](#caveats)
-- [`summary.json`](#summaryjson)
+- [Attention Diagnostics Reference](#attention-diagnostics-reference)
+  - [Table of Contents](#table-of-contents)
+  - [Conventions](#conventions)
+  - [The measurement principle](#the-measurement-principle)
+  - [`collapse/*` — representation collapse](#collapse--representation-collapse)
+  - [`attn/*` and `ffn/*` — sublayer health](#attn-and-ffn--sublayer-health)
+    - [`<s>/input_norm`](#sinput_norm)
+    - [`<s>/update_ratio`](#supdate_ratio)
+    - [`<s>/update_cos`](#supdate_cos)
+    - [`<s>/update_isotropy`](#supdate_isotropy)
+    - [`loss/*` — quality](#loss--quality)
+    - [`loss/val`](#lossval)
+    - [`loss/train`](#losstrain)
+    - [`loss/gap`](#lossgap)
+    - [`loss/ppl_val`](#lossppl_val)
+    - [`loss/aulc`](#lossaulc)
+  - [`optim/*` — optimisation](#optim--optimisation)
+    - [`optim/lr`](#optimlr)
+    - [`optim/grad_norm`](#optimgrad_norm)
+    - [`optim/clip_frac`](#optimclip_frac)
+    - [`optim/grad_scale`](#optimgrad_scale)
+  - [`param/*` — where the gradient is going, and what it is moving](#param--where-the-gradient-is-going-and-what-it-is-moving)
+    - [`param/grad/<bucket>`](#paramgradbucket)
+    - [`param/weight/<bucket>`](#paramweightbucket)
+    - [`param/ratio/<bucket>`](#paramratiobucket)
+  - [`perf/*` — cost](#perf--cost)
+  - [TEXT — what produced the curves](#text--what-produced-the-curves)
+  - [HPARAMS — variants as a sortable table](#hparams--variants-as-a-sortable-table)
+  - [Reading them together](#reading-them-together)
+  - [Caveats](#caveats)
+  - [`summary.json`](#summaryjson)
 
 ---
 
@@ -79,15 +98,23 @@ Everything is read from forward hooks, from five tensors per decoder block:
 | feed-forward `update` | what the feed-forward wrote back, **before** the residual add |
 | block output | what left the block, after attention, FFN and both residuals |
 
-No probe reaches inside a module, looks up an attribute, or recomputes a score. That
-is deliberate. A diagnostic that knows the internals of one variant produces a tag the
-other variant cannot report — which is precisely the tag that cannot be compared. It
-also means these numbers survive any change to either sublayer's implementation.
+No `collapse/*`, `attn/*` or `ffn/*` probe reaches inside a module, looks up an attribute,
+or recomputes a score. That is deliberate. A diagnostic that knows the internals of one
+variant produces a tag the other variant cannot report — which is precisely the tag that
+cannot be compared. It also means these numbers survive any change to either sublayer's
+implementation. `attn/*` and `ffn/*` share a single hook body registered twice, so the two
+families cannot drift apart in how a ratio or a cosine is defined.
 
-The two sublayers are found by attribute name (`ATTENTION_HINTS`, `FEEDFORWARD_HINTS`),
-and a block where either match is not exactly one **fails the run** rather than emitting
-an empty series — an empty series does not look like a bug, it looks like a real
-difference between the arms.
+**Where the probes live.** `compare_models.py` owns the mechanism and none of the meaning:
+the probe batch, the padding mask, the single host transfer, and the tag naming. What each
+tag *measures* is defined beside the module it measures, and registered with
+`probes.register` — `collapse/*`, `attn/*` and `ffn/*` at the bottom of `model.py`. A model
+class that defines its own modules registers its own probes the same way, in its own file;
+nothing needs to change in the comparison script.
+
+A module with no registered probe simply emits no tags. An absent series reads as "this
+variant does not have that part", which is true, while a flat line of zeros reads as a
+measurement, which it would not be.
 
 ---
 
@@ -173,8 +200,8 @@ of means, not a mean of ratios.)
 →0     the block has switched itself off; the residual path is routing around it
 ```
 
-This is the first thing to check when one variant's `Gradients/Global` sits an order of
-magnitude off another's — pair it with that block's `Gradients/Decoder<i>` to tell a loud
+This is the first thing to check when one variant's `param/grad/global` sits an order of
+magnitude off another's — pair it with that block's `param/grad/Decoder<i>` to tell a loud
 block from an unstable one.
 
 ### `<s>/update_cos`
@@ -258,6 +285,13 @@ read it against `params` before crediting the architecture. Because the train si
 window mean taken in training mode, compare gaps **between** arms and watch the trend;
 the absolute value reads low and can be negative early in a run.
 
+### `loss/ppl_val`
+
+`exp(loss/val)`, clamped before the exponential so an early diverging arm cannot render the
+chart unreadable for every other arm sharing it. Carries no information `loss/val` does not;
+it is here because perplexity is the unit most LM results are quoted in, and converting by
+eye while reading a chart is where mistakes happen.
+
 ### `loss/aulc`
 
 Running area under the validation curve over steps: at each evaluation, the mean `loss/val`
@@ -280,33 +314,86 @@ budget every arm reached; that one is not a scalar tag.
 Current learning rate from the linear-warmup-then-cosine schedule. A sanity check that
 warmup and decay landed where `--warmup-frac` and `--steps` put them.
 
+### `optim/grad_norm`
+
+Mean pre-clip total gradient norm over the steps since the last evaluation — the value
+`clip_grad_norm_` returns, which it computes every step anyway. Accumulated on device
+alongside the loss and resolved once per evaluation, so per-step telemetry costs no
+per-step sync.
+
+This is a **window mean over every step**, where `param/grad/global` is a single-step
+sample taken at the evaluation step. Read them together: the two diverging means the
+evaluation step is not representative of the window.
+
+### `optim/clip_frac`
+
+Fraction of steps in that window where the pre-clip norm exceeded `--grad-clip`.
+
+The tag that says whether `optim/lr` is telling the truth. At `clip_frac → 1` almost every
+step is being rescaled to the clip threshold, so the step size is set by `--grad-clip` and
+not by the learning rate, and two arms at the same `optim/lr` can be training at completely
+different effective rates. Nothing else here would show that.
+
+### `optim/grad_scale`
+
+The AMP loss-scale, written only under `--amp`. Repeated halving means the backward pass is
+producing infs and those steps are being skipped — an arm that is silently training on
+fewer steps than its x-axis claims.
+
 ---
 
-## `Gradients/*` — where the gradient is going
+## `param/*` — where the gradient is going, and what it is moving
 
-Gradient norms taken **before** clipping, at the same step as each evaluation, bucketed by
-`utils.component_key` — the same rule `train.py` uses, so a comparison run's gradient series
-reads directly against a real training run's.
+Three families sharing one decomposition, taken **before** clipping at the same step as each
+evaluation and bucketed by `utils.component_key` — the same rule `train.py` uses, so a
+comparison run's series reads directly against a real training run's.
 
-| tag | covers |
+| bucket | covers |
 |---|---|
-| `Gradients/Global` | root of the summed squares over every component — what `clip_grad_norm_` measures against `--grad-clip` |
-| `Gradients/Embedding` | the input embedding table |
-| `Gradients/Decoder<i>` | every parameter in decoder block *i* |
-| `Gradients/Projection` | the output head |
-| `Gradients/NormF` | everything else — `norm_f` alone in `GPTmodel`, plus any top-level layers a subclass adds |
+| `global` | root of the summed squares over every component — this script's own aggregate, hence lower case; the rest are `component_key` buckets and keep its casing |
+| `Embedding` | the input embedding table |
+| `Decoder<i>` | every parameter in decoder block *i* |
+| `Projection` | the output head |
+| `NormF` | everything else — `norm_f` alone in `GPTmodel`, plus any top-level layers a subclass adds |
 
-If `Gradients/Global` sits above `--grad-clip` (default 1.0) for a whole run, most steps are
-being clipped and you are not training at the LR you set — you are taking direction-only
-steps. Correlate with `attn/update_ratio` and `ffn/update_ratio` when a variant misbehaves:
-the ratios say which block *and which branch* is loud, the gradient says whether it is also
+They are grouped under one prefix rather than split into three top-level families because
+TensorBoard sorts alphabetically, and the ratio below is unreadable without the two norms it
+is formed from on the same screen.
+
+### `param/grad/<bucket>`
+
+Gradient norm per component. `param/grad/global` is what `clip_grad_norm_` measures against
+`--grad-clip`, so the components always add up to the number the clipping acted on — which
+makes a component's share directly comparable to its share of the parameters in
+`ModelCensus`. A block holding 30% of the weights and 3% of the gradient has stopped
+learning, and neither number says so alone.
+
+Correlate with `attn/update_ratio` and `ffn/update_ratio` when a variant misbehaves: the
+ratios say which block *and which branch* is loud, the gradient says whether it is also
 unstable.
 
-The components add up to the number clipping acted on, so a component's share is directly
-comparable to its share of the parameters in `ModelCensus` — a block holding 30% of the
-weights and 3% of the gradient has stopped learning, and neither number says so alone.
+### `param/weight/<bucket>`
 
-Single-step samples, not window averages, so expect them to be noisy.
+Weight norm, same buckets. On its own it mostly tracks weight decay and initialisation; its
+job is to be the denominator below.
+
+### `param/ratio/<bucket>`
+
+`lr · ‖grad‖ / ‖weight‖` — the fraction of its own magnitude a component moves in one step.
+
+```
+~1e-3        healthy
+≪1e-3        this component has stopped learning while the loss keeps falling
+             on the strength of the others
+≫1e-3        this component is about to destabilise the run
+```
+
+The only **scale-free** number in this section, and therefore the only one comparable
+*between components* and *between variants*. Two arms with different widths or different
+initialisations have incomparable `param/grad/*`, and comparable `param/ratio/*`.
+
+`param/grad/*` and `param/weight/*` are single-step samples, not window averages, so expect
+them to be noisy; `optim/grad_norm` is the window-averaged view of the same quantity.
 
 ---
 
@@ -318,6 +405,7 @@ Single-step samples, not window averages, so expect them to be noisy.
 | `perf/ms_per_step` | cumulative average, `elapsed / step`. Flat means steady state; a rising curve means something is growing |
 | `perf/tokens_per_sec` | non-pad input tokens per second — the throughput number to quote, since it normalises away padding differences |
 | `perf/tflops` | achieved TFLOP/s, from the dispatch-measured FLOPs of one training step |
+| `perf/peak_mem_mb` | CUDA peak allocated memory, as a curve. The end-of-run number also lands in `summary.json`, but two arms can share a final peak while one of them spent the whole run near it |
 
 Read `perf/tflops` beside `perf/tokens_per_sec`: they come apart exactly where the
 interesting answer is. An arm can trail on tok/s because it does more arithmetic per token,
@@ -345,8 +433,27 @@ measured FLOPs that produced it.
 working tree was dirty. A run produced by uncommitted code reports the hash of the commit it
 was based on, so two runs with different behaviour can carry the same hash.
 
-There is no **HPARAMS** tab: `compare_models.py` writes no `add_hparams` call. To sort a
-sweep by final validation loss, use the table `report()` prints, or `summary.json`.
+---
+
+## HPARAMS — variants as a sortable table
+
+Each variant writes one `add_hparams` row at the end of its run: every `ModelConfig` field
+plus the training arguments that can differ between arms, against four outcomes —
+`hparam/loss_val`, `hparam/loss_aulc`, `hparam/tokens_per_sec`, `hparam/peak_mem_mb`.
+
+This is what the TEXT tags above cannot do. A text blob renders one variant's config for
+you to read; the HPARAMS tab renders every variant as a row you can **sort by outcome** and
+**filter by setting**, and plot a setting directly against a result. For a sweep over
+several interacting knobs that is the difference between reading a chart per arm and reading
+one table.
+
+Every config field is written, not only the overridden ones, because TensorBoard can only
+filter on a column that exists — and which field mattered is what the sweep is trying to
+find out. Non-scalar values are stringified rather than dropped, since a row missing the
+field that distinguishes it from its neighbour is worse than a stringified one.
+
+The rows land in each variant's own run directory (`run_name="."`). Without that, TensorBoard
+mints a timestamped subdirectory per variant and shows it as a phantom run in the picker.
 
 ---
 
@@ -356,7 +463,7 @@ The diagnostic that identifies a *cause* is usually a combination.
 
 | pattern | reading |
 |---|---|
-| `Gradients/Global` high **+** either `update_ratio` high | that branch is over-writing the residual stream — lower the LR or check its output scale |
+| `param/grad/global` high **+** either `update_ratio` high | that branch is over-writing the residual stream — lower the LR or check its output scale |
 | `collapse` rising **+** `update_isotropy` falling | genuine representational collapse |
 | `collapse` flat **+** `attn/update_cos` → 1 | attention has stopped mixing positions; the FFN is carrying the model — confirm with `ffn/update_ratio` holding up while `attn/update_ratio` decays |
 | either `update_ratio` decaying → 0 | that branch is being routed around; its parameters are dead weight |
@@ -412,7 +519,8 @@ comparison strictly like-for-like. Data and data order *are* pinned and verified
 Written next to the TensorBoard runs. Holds the environment (`torch` version, CUDA,
 git commit), the resolved arguments, the shared data fingerprint, and per variant: the
 full config, parameter counts, the `(step, elapsed, val_loss)` curve, timings, peak
-memory, and the final resolved diagnostics dict.
+memory, the last resolved `param_norms` (the `param/*` scalars at the final evaluation),
+and the final resolved diagnostics dict.
 
 Use it for offline plotting and for confirming after the fact that two runs saw the
 same data — the fingerprint is an order-sensitive digest of every token every variant

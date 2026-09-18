@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from config import *
 from lora import LoRAdapter
 from cache import SlidingKVCache
+from probes import register
 
 
 class EmbeddingModule(nn.Module):
@@ -338,3 +339,120 @@ class GPTmodel(nn.Module):
                 model.load_state_dict(lora_weights, strict=False)
 
         return model
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic Probes
+# --------------------------------------------------------------------------- #
+
+
+def _sublayer_metrics(module: nn.Module, inputs, output, ctx) -> dict[str, torch.Tensor]:
+    """The four sublayer-health numbers, for whichever residual branch this is.
+
+    Registered TWICE, once as `attn` and once as `ffn`, deliberately sharing one
+    body: the pair only answers "which branch is responsible" if both sides are
+    measured against identical definitions, and two copies would eventually drift
+    apart exactly where comparing them is the point.
+
+      input_norm        mean ||x|| entering the sublayer -- residual-stream drift,
+                        and the scale its other magnitudes are relative to.
+      update_ratio      ||update|| / ||x||, the sublayer's gain into the residual
+                        stream. Far above 1 is a block shouting over the stream;
+                        far below 1 is a sublayer that has switched off.
+      update_cos        mean cos(update_i, x_i). ~0 is a sublayer writing genuinely
+                        new content; -> 1 means it is mostly rescaling what each
+                        token already held.
+      update_isotropy   how evenly the update spreads over the directions
+                        available to it. -> 0 is a sublayer writing everything into
+                        a handful of directions however wide embed_dim is, which
+                        cosine collapse cannot see.
+
+    The two families share definitions but NOT resting values -- at init attention
+    averages over positions with near-uniform weights, close to rank one, while
+    the feed-forward's update comes through a random down-projection. Compare each
+    against its own trajectory; comparing attn/x to ffn/x at a point in time reads
+    a structural difference as a finding.
+    """
+    x = inputs[0].float()
+    update = (output[0] if isinstance(output, tuple) else output).float()
+
+    x_norm = x.norm(dim=-1, keepdim=True)
+    update_norm = update.norm(dim=-1, keepdim=True)
+    mean_x_norm = ctx.mean(x_norm)
+
+    return {
+        "input_norm": mean_x_norm,
+        "update_ratio": ctx.mean(update_norm) / mean_x_norm.clamp_min(ctx.floor),
+        "update_cos": ctx.mean((update * x).sum(dim=-1, keepdim=True)
+                               / (update_norm * x_norm).clamp_min(ctx.floor)),
+        "update_isotropy": ctx.isotropy(update),
+    }
+
+
+def _collapse_metric(metric: str, of_output: bool):
+    """Mean pairwise token cosine, filed under one of collapse's three stages.
+
+    One body, three registrations, so the three stages cannot come to mean
+    slightly different things. `input` and `mid` read what a sublayer was HANDED
+    (so under a pre-norm block they are post-norm1 and post-norm2), while
+    `output` reads what left the block. mid - input is what attention added to
+    the collapse and output - mid is what the feed-forward added, which is what
+    attributes a block's collapse to the branch that caused it.
+    """
+    def measure(_module, inputs, output, ctx) -> dict[str, torch.Tensor]:
+        hidden = (output[0] if isinstance(output, tuple) else output) if of_output else inputs[0]
+        return {metric: ctx.collapse(hidden)}
+    return measure
+
+def _head_metrics(_module, inputs, output, ctx) -> dict[str, torch.Tensor]:
+    """What the output head was handed, and how sharply it answers.
+
+    A forward hook sees no labels, so nothing target-relative -- accuracy,
+    calibration, per-token loss -- can live here. These two are what the head's
+    own input and output say on their own.
+
+      logit_std       per-token spread of the logits: the temperature the head
+                      has taught itself. Rising while loss/val is flat is a head
+                      sharpening rather than learning. It is also the tag that
+                      reads RLMField on the projection, where the radial gain
+                      multiplies logits directly and so acts as a per-token
+                      temperature rather than the feature gate it is everywhere
+                      else -- pair it with rlm/projection/g_dev.
+      input_isotropy  how many directions the final representation actually uses,
+                      as a fraction of those available. This is the head's raw
+                      material: a rank-starved input caps what ANY head can
+                      discriminate, however well trained. Read it against
+                      ffn/update_isotropy at the last block to see whether the
+                      narrowing happened in the stack or at norm_f.
+
+    Cosine collapse is deliberately NOT here. Under -rms and -qrms, norm_f is a
+    per-token rescale, which leaves pairwise cosine exactly unchanged, so it
+    would duplicate collapse/output at every strategy but -ln.
+    """
+    logits = output
+    # Reduced with dtype=float32 rather than by casting the whole tensor first:
+    # logits are (B, S, VOCAB), the widest activation in the model, and .float()
+    # on it would double an already large transient for a per-token scalar.
+    # Population std, matching ProbeContext.std and QuantizedRMSNorm's running
+    # statistics. torch.std's default applies Bessel's correction and so reads
+    # sqrt(V/(V-1)) higher -- 0.002% at a 25k vocabulary, and not worth an
+    # inconsistency with every other spread in the tree.
+    mean = logits.mean(dim=-1, keepdim=True, dtype=torch.float32)
+    mean_square = logits.square().mean(dim=-1, keepdim=True, dtype=torch.float32)
+
+    return {
+        "logit_std": ctx.mean((mean_square - mean.square()).clamp_min(0).sqrt()),
+        "input_isotropy": ctx.isotropy(inputs[0]),
+    }
+
+register("attn", lambda m: isinstance(m, MultiHeadAttentionModule), per_site=False)(_sublayer_metrics)
+register("ffn", lambda m: isinstance(m, GatedFeedForwardModule), per_site=False)(_sublayer_metrics)
+
+register("collapse", lambda m: isinstance(m, MultiHeadAttentionModule), per_site=False)(
+    _collapse_metric("input", of_output=False))
+register("collapse", lambda m: isinstance(m, GatedFeedForwardModule), per_site=False)(
+    _collapse_metric("mid", of_output=False))
+register("collapse", lambda m: isinstance(m, DecoderModule), per_site=False)(
+    _collapse_metric("output", of_output=True))
+
+register("head", lambda m: isinstance(m, ProjectionModule), per_site=False)(_head_metrics)

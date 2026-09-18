@@ -19,7 +19,7 @@ come from the variant itself (see DataPlan). What gets reported:
     above as loss/gap
   * per-layer attention health    -- how the sublayer is behaving in each decoder
     block, not averaged into a single scalar that hides the one bad layer
-  * per-layer gradient norms      -- Gradients/Global and Gradients/<component>,
+  * per-layer gradient norms      -- param/grad/global and param/grad/<component>,
     the same decomposition train.py logs (it shares the bucketing rule, see
     utils.component_key), so a variant's gradient trace here reads directly
     against a real training run's
@@ -81,6 +81,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
+import probes
 from utils import component_key, get_causal_mask
 
 # model classes are NOT imported here: every arm names its own, and resolve_model
@@ -306,76 +307,6 @@ class Recorder:
         return out
 
 
-class Geometry:
-    """Masks shared by every diagnostic, built once per diagnostic batch.
-
-    Padding tokens all share one embedding, so pad-pad pairs sit at cosine ~1
-    and inflate any similarity averaged over every pair; self-pairs sit at
-    exactly 1. Both are excluded here, once, instead of every hook rebuilding a
-    `torch.eye` of its own.
-    """
-
-    def __init__(self, inputs: torch.Tensor, pad: int) -> None:
-        self.valid = inputs != pad                                   # (B, S)
-        self.token = self.valid.unsqueeze(-1)                        # (B, S, 1)
-        pair = self.valid.unsqueeze(2) & self.valid.unsqueeze(1)     # (B, S, S)
-        pair.diagonal(dim1=-2, dim2=-1).fill_(False)
-        self.pair = pair
-
-
-def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean of `values` over the True positions of a broadcastable bool mask.
-
-    `torch.where` rather than multiply-by-zero: a padding position can hold inf
-    or NaN -- a zero vector divided by its own clamped norm, say -- and
-    0 * NaN is NaN, which would take the whole reduction with it.
-    """
-    mask = mask.expand_as(values)
-    values = values.float()
-    kept = torch.where(mask, values, torch.zeros((), dtype=values.dtype, device=values.device))
-    return kept.sum() / mask.sum().clamp_min(1)
-
-
-def cosine_collapse(hidden: torch.Tensor, geom: Geometry) -> torch.Tensor:
-    """Mean pairwise cosine similarity of token representations.
-
-    ~0 means tokens stay spread out; -> 1 means they have collapsed onto each
-    other and depth is no longer buying anything.
-    """
-    unit = F.normalize(hidden.float(), dim=-1)
-    return masked_mean(unit @ unit.transpose(-2, -1), geom.pair)
-
-
-def isotropy(hidden: torch.Tensor, geom: Geometry) -> torch.Tensor:
-    """How evenly the tokens spread their energy over the directions available.
-
-    The participation ratio of the token covariance spectrum -- (sum lambda)^2 /
-    sum lambda^2, also called the effective rank -- divided by the most
-    directions this tensor could possibly have spanned. 1 is isotropic: every
-    available direction carries the same energy. -> 0 is strongly anisotropic:
-    the tokens live on a handful of directions no matter how wide EMBED_DIM is.
-
-    Normalised to (0, 1] rather than left as the raw effective rank so it stays
-    comparable across embed_dim, and named for the property rather than for the
-    estimator -- "rank" reads as an integer count, which this is not.
-
-    This catches the failure that cosine collapse misses. Mean pairwise cosine
-    reports how aligned tokens are with each other; a block can hold that near
-    zero and still write every token into the same two-dimensional subspace, and
-    an anisotropic update is a block that has stopped using the width it was
-    given.
-
-    Computed from the Gram matrix's traces -- tr(C) = ||Z||_F^2 and
-    tr(C^2) = ||C||_F^2 -- so there is no eigendecomposition, and the covariance
-    is (EMBED_DIM, EMBED_DIM) regardless of how many tokens are in the batch.
-    """
-    tokens = hidden[geom.valid]                                       # (TOKENS, EMBED_DIM)
-    tokens = tokens - tokens.mean(dim=0, keepdim=True)
-    covariance = tokens.transpose(0, 1) @ tokens
-    trace = covariance.diagonal().sum()
-    return trace.square() / (covariance.square().sum().clamp_min(FLOOR) * min(tokens.shape))
-
-
 def decoder_blocks(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
     blocks = getattr(model, "decoders", None)
     if blocks is None or not len(blocks):
@@ -425,124 +356,70 @@ def feedforward_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Mod
 
 
 @torch.inference_mode()
-def diagnose(model: torch.nn.Module, attentions: list[torch.nn.Module],
-             feedforwards: list[torch.nn.Module], inputs: torch.Tensor,
-             pad: int, causal: torch.Tensor) -> dict[str, float]:
-    """Per-layer sublayer health, from ONE forward pass.
+def site_of(name: str) -> tuple[str, int]:
+    """(role, depth) from a module path, tolerant of DDP/compile name prefixes.
 
-    Everything here is read off forward hooks, from four tensors per decoder
-    block: what the attention sublayer was handed, the update it wrote back, the
-    same pair for the feed-forward sublayer, and what left the block. No probe
-    reaches inside a module, looks up an attribute or recomputes a score. That is
-    deliberate -- a diagnostic that knows the internals of one variant produces a
-    tag the other variant cannot report, which is precisely the tag that cannot be
-    compared. It also means these numbers survive any change to the sublayer
-    implementations, and that they mean the same thing across two unrelated model
-    classes.
-
-    A forward hook receives its module's positional inputs alongside its output,
-    so one hook per sublayer sees both the tensor it reads (post-norm1 and
-    post-norm2 respectively under a pre-norm block) and the update it produces.
-
-    attn/* and ffn/* carry the SAME four measurements against the same
-    definitions, so the pair answers which of the two branches is responsible for
-    whatever the block as a whole is doing -- the question a single
-    block-level number cannot answer.
-
-      collapse/input      mean pairwise cosine of the tokens entering attention
-      collapse/mid        the same entering the feed-forward, i.e. after the
-                          attention sublayer has written back
-      collapse/output     the same after the whole block. ~0 means tokens stay
-                          spread out; -> 1 means they have collapsed onto each
-                          other and depth is no longer buying anything. The three
-                          together split a block's collapse into the part
-                          attention added and the part the feed-forward added.
-      <s>/input_norm      mean ||x|| entering the sublayer -- residual-stream
-                          drift, and the scale its other magnitudes are relative to
-      <s>/update_ratio    ||update|| / ||x||, the sublayer's gain into the
-                          residual stream. Far above 1 is a block shouting over
-                          the stream (pair it with that block's Gradients/Decoder<i>
-                          when one variant's Gradients/Global sits an order of
-                          magnitude off the other's -- the ratio says which layer is
-                          loud, the gradient says whether it is also unstable); far
-                          below 1 is a sublayer that has switched off.
-      <s>/update_cos      mean cos(update_i, x_i). ~0 is a sublayer writing
-                          genuinely new content; -> 1 means it is mostly
-                          rescaling what each token already held. Both branches
-                          end in an output projection that rotates the update out
-                          of the span of its input, so both rest near 0 at init
-                          (measured 0.0002 and -0.0038 at 6 layers). What a rise
-                          MEANS differs: for attention it is a block that has
-                          stopped moving information BETWEEN tokens, the failure
-                          a loss curve hides longest; the feed-forward is
-                          position-wise and never moved information between
-                          tokens, so for it a rise only says the branch has
-                          decayed toward rescaling in place.
-      <s>/update_isotropy
-                          how evenly the update spreads over the directions
-                          available to it. -> 0 is a sublayer writing everything
-                          into a handful of directions however wide EMBED_DIM
-                          is, which cosine collapse cannot see (see isotropy)
-
-    where <s> is `attn` for the attention sublayer and `ffn` for the feed-forward.
-
-    The two families share definitions but NOT resting values, and isotropy is
-    the sharpest case: at init attention averages over positions with near-uniform
-    weights, which is close to rank one, while the feed-forward's update comes
-    through a random down-projection. Measured at 6 layers that is 0.19 against
-    0.67 -- a property of the two designs, not a fault in either. Compare each
-    against its own trajectory; comparing attn/* to ffn/* at a point in time
-    reads a structural difference as a finding.
+    The role is the leaf attribute -- norm1, norm2, norm_f, Wqkv, Wo, Wug, Wd --
+    so one tag follows the same structural position across every block, and the
+    depth is the decoder index so the per-layer/mean/min/max split lands on the
+    same axis as attn/* and ffn/*. Anything outside a decoder block is filed at
+    layer 0. `projection.linear` is renamed for its parent, since `linear` says
+    nothing about where it sits.
     """
+    parts = name.split(".")
+    role = "projection" if parts[-1] == "linear" else parts[-1]
+    if "decoders" in parts:
+        return role, int(parts[parts.index("decoders") + 1])
+    return role, 0
+
+
+def diagnose_modules(model: torch.nn.Module, inputs: torch.Tensor,
+                     pad: int, causal: torch.Tensor) -> dict[str, float]:
+    """Everything registered in `probes`, from ONE forward pass.
+
+    Deliberately the opposite of `diagnose` on one axis: these probes DO reach
+    inside their modules, read running buffers and recompute internal
+    quantities. That is defensible only because the tags are variant-specific by
+    construction -- a model without the module emits none of them, so nothing
+    here can be mistaken for a number some other variant failed to report. They
+    stay out of the attn/* ffn/* collapse/* namespace, which remains
+    internals-blind precisely so it can be compared across unrelated classes.
+
+    This function owns the mechanism and none of the meaning: the probe batch,
+    the padding mask, the single host transfer, and the <family>/<site>/<metric>
+    naming. What each metric IS lives beside the module that registers it, where
+    `isinstance` is available and where anyone changing the module is already
+    looking. See `probes.register`.
+    """
+    sites = [(name, module, probe)
+             for name, module in model.named_modules()
+             for probe in probes.probes_for(module)]
+    if not sites:
+        return {}                       # arms without probed modules emit nothing, not zeros
+
     rec = Recorder()
-    geom = Geometry(inputs, pad)
+    ctx = probes.ProbeContext(inputs != pad)
     handles = []
 
-    def sublayer_hook(family: str, collapse_tag: str, layer: int):
-        """One hook body for both sublayers.
-
-        `family` is the tag prefix (`attn` or `ffn`) and `collapse_tag` is where
-        this sublayer's INPUT collapse is filed -- the attention sublayer reads
-        the tensor entering the block, the feed-forward reads the tensor halfway
-        through it. Written once so the two families cannot drift apart in how a
-        ratio or a cosine is defined, which would make them incomparable exactly
-        where comparing them is the point.
-        """
+    def probe_hook(probe: probes.Probe, module: torch.nn.Module, prefix: str, layer: int):
         def hook(_module, args, output):
-            x = args[0].float()
-            update = (output[0] if isinstance(output, tuple) else output).float()
-            x_norm = x.norm(dim=-1, keepdim=True)
-            update_norm = update.norm(dim=-1, keepdim=True)
-            mean_x_norm = masked_mean(x_norm, geom.token)
-
-            rec.add(f"{family}/input_norm", layer, mean_x_norm)
-            rec.add(f"{family}/update_ratio", layer,
-                    masked_mean(update_norm, geom.token) / mean_x_norm.clamp_min(FLOOR))
-            rec.add(f"{family}/update_cos", layer,
-                    masked_mean((update * x).sum(dim=-1, keepdim=True)
-                                / (update_norm * x_norm).clamp_min(FLOOR), geom.token))
-            rec.add(f"{family}/update_isotropy", layer, isotropy(update, geom))
-            rec.add(collapse_tag, layer, cosine_collapse(x, geom))
+            for metric, value in probe.measure(module, args, output, ctx).items():
+                rec.add(f"{prefix}/{metric}", layer, value)
         return hook
 
-    def block_hook(layer: int):
-        # A decoder block returns (hidden, new_kv)
-        def hook(_module, _args, output):
-            rec.add("collapse/output", layer, cosine_collapse(output[0], geom))
-        return hook
-
-    for layer, (block, attention, feedforward) in enumerate(
-            zip(model.decoders, attentions, feedforwards)):
-        handles.append(attention.register_forward_hook(
-            sublayer_hook("attn", "collapse/input", layer)))
-        handles.append(feedforward.register_forward_hook(
-            sublayer_hook("ffn", "collapse/mid", layer)))
-        handles.append(block.register_forward_hook(block_hook(layer)))
+    for name, module, probe in sites:
+        site, layer = site_of(name)
+        # per_site=False drops the role segment: one such module per block means
+        # the family already names it, and attn/attention/update_ratio says
+        # nothing attn/update_ratio does not.
+        prefix = f"{probe.family}/{site}" if probe.per_site else probe.family
+        handles.append(module.register_forward_hook(probe_hook(probe, module, prefix, layer)))
 
     was_training = model.training
-    model.eval()
-    try:
-        model(inputs, build_mask(inputs, pad, causal))
+    model.eval()                        # eval matters: a norm carrying running stats
+    try:                                # must not fold the probe batch into them
+        with torch.no_grad():
+            model(inputs, build_mask(inputs, pad, causal))
     finally:
         model.train(was_training)
         for handle in handles:
@@ -782,7 +659,7 @@ def aulc(curve: list[tuple[int, float, float]], axis: int, cutoff: float | None 
 def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Squared gradient norm per component, bucketed by utils.component_key.
 
-    The buckets, and therefore the Gradients/* tags they become, are train.py's:
+    The buckets, and therefore the param/grad/* tags they become, are train.py's:
     Embedding, Projection, Decoder<i> per block, NormF for the rest. Sharing the
     rule rather than restating it is what keeps a comparison run's per-layer
     gradient series readable against a real training run's.
@@ -791,7 +668,7 @@ def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     from inside the timed window -- the snapshot is only meaningful before
     clipping, exactly where train.py takes it -- and an .item() per parameter
     would be one device sync per parameter, tens of stalls per evaluation, inside
-    the region whose wall-clock this script exists to report. resolve_gradients
+    the region whose wall-clock this script exists to report. resolve_parameters
     turns them into numbers later, with the clock stopped.
     """
     totals: dict[str, torch.Tensor] = {}
@@ -804,20 +681,89 @@ def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return totals
 
 
-def resolve_gradients(totals: dict[str, torch.Tensor]) -> dict[str, float]:
-    """Squared sums -> Gradients/* scalars, in a single host transfer.
+def weight_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Squared weight norm per component, in the same buckets as the gradients.
 
-    Gradients/Global is the root of the summed squares, which is both what
-    train.py reports and what clip_grad_norm_ measures against --grad-clip, so
-    the components always add up to the number the clipping acted on.
+    The counterpart to gradient_norms, sharing utils.component_key so the two
+    decompositions line up term for term. On its own a weight norm says little;
+    paired with the gradient norm it gives the scale-free ratio below, which is
+    the number that actually says whether a component is learning.
+
+    Same 0-dim-device-tensor discipline: this runs inside the timed window, and
+    an .item() per parameter would be tens of stalls per evaluation.
     """
-    if not totals:
+    totals: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        key = component_key(name)
+        norm_sq = torch.linalg.vector_norm(param.detach().float().view(-1)).square()
+        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
+    return totals
+
+
+def resolve_parameters(grads: dict[str, torch.Tensor], weights: dict[str, torch.Tensor],
+                       lr: float) -> dict[str, float]:
+    """Gradient, weight and update-ratio scalars, in ONE host transfer.
+
+    Emits three families off one sync:
+
+      param/grad/<component>    ||grad||, and param/grad/global over everything.
+                                Global is the root of the summed squares, which is
+                                what clip_grad_norm_ measures against --grad-clip,
+                                so the components always add up to the number the
+                                clipping acted on.
+      param/weight/<component>  ||weight||, same buckets, plus param/weight/global.
+      param/ratio/<component>   lr * ||grad|| / ||weight||: the fraction of its own
+                                magnitude a component moves in one step. Roughly
+                                1e-3 is healthy. Orders of magnitude below means a
+                                component has stopped learning while the loss curve
+                                keeps falling on the strength of the others; orders
+                                above is the component about to destabilise the run.
+                                Scale-free, so it is comparable BETWEEN components
+                                and between variants, which neither norm is.
+
+    Grouped under param/ rather than as three top-level families because
+    TensorBoard sorts alphabetically, and the ratio is unreadable without the two
+    norms it is formed from on the same screen.
+    """
+    if not grads and not weights:
         return {}
-    keys = list(totals)
-    values = torch.stack([totals[key] for key in keys]).cpu()      # the one and only sync
-    resolved = {f"Gradients/{key}": value.sqrt().item() for key, value in zip(keys, values)}
-    resolved["Gradients/Global"] = values.sum().sqrt().item()
+
+    grad_keys, weight_keys = list(grads), list(weights)
+    stacked = torch.stack([grads[k] for k in grad_keys] + [weights[k] for k in weight_keys])
+    values = stacked.sqrt().cpu().tolist()                      # the one and only sync
+
+    grad_norm = dict(zip(grad_keys, values[:len(grad_keys)]))
+    weight_norm = dict(zip(weight_keys, values[len(grad_keys):]))
+
+    resolved = {f"param/grad/{k}": v for k, v in grad_norm.items()}
+    resolved["param/grad/global"] = sum(v * v for v in grad_norm.values()) ** 0.5
+    resolved.update({f"param/weight/{k}": v for k, v in weight_norm.items()})
+    resolved["param/weight/global"] = sum(v * v for v in weight_norm.values()) ** 0.5
+    for key, grad in grad_norm.items():
+        weight = weight_norm.get(key)
+        if weight:
+            resolved[f"param/ratio/{key}"] = lr * grad / weight
     return resolved
+
+
+def hparams(variant, config: ModelConfig, args) -> dict:
+    """The variant's settings, flattened to what add_hparams accepts.
+
+    Only bool/int/float/str survive the HPARAMS tab, so anything structured is
+    rendered to a string rather than dropped -- a row missing the field that
+    distinguishes it from its neighbour is worse than a stringified one.
+
+    Every ModelConfig field is included, not just the overridden ones: TensorBoard
+    only lets you filter on a column that exists, and which field mattered is the
+    thing the sweep is trying to find out.
+    """
+    flat = {"variant": variant.label, "model": variant.model}
+    for key, value in config.to_dict().items():
+        flat[key] = value if isinstance(value, (bool, int, float, str)) else str(value)
+    for key in ("lr", "weight_decay", "grad_clip", "steps", "batch_size", "seq_len", "amp"):
+        if hasattr(args, key):
+            flat[key] = getattr(args, key)
+    return flat
 
 
 def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
@@ -842,7 +788,7 @@ def fenced_json(payload: dict) -> str:
 def parameter_census(model: torch.nn.Module) -> dict:
     """Where a variant's parameters actually sit, bucketed by component_key.
 
-    The rule the Gradients/* tags already use, so a component's share of the
+    The rule the param/grad/* tags already use, so a component's share of the
     weights reads directly against its share of the gradient norm. That pairing
     is the point: a block holding 30% of the parameters and 3% of the gradient
     has stopped learning, and neither number says so on its own.
@@ -935,7 +881,7 @@ def log_configs(writer: SummaryWriter, variant: Variant, config: ModelConfig, ar
 
     ModelConfig and Environment carry the tag and the format they carry in a
     training run, so the TEXT tab of a comparison run reads against a real one
-    without translating anything -- the same reason the Gradients/* buckets are
+    without translating anything -- the same reason the param/grad/* buckets are
     shared rather than restated. ComparisonConfig is this script's answer to
     train.py's TrainingConfig: there is no TrainingConfig object here, the run
     knobs live on the parsed arguments. Variant is the one with no counterpart,
@@ -1038,8 +984,10 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
                            "possible failures or no speedup.")
         step_model = torch.compile(model, mode=args.compile_mode)
 
-    # Resolved once, here rather than inside diagnose(), so a model whose blocks this
-    # script cannot read fails before it trains for ten minutes and reports nothing.
+    # Resolved once, up front, so a model whose blocks this script cannot read
+    # fails before it trains for ten minutes and reports nothing. These feed the
+    # parameter census below; the sublayer DIAGNOSTICS no longer come through
+    # here, since attn/* and ffn/* are registered probes now (see model.py).
     attentions = attention_modules(model, label)
     feedforwards = feedforward_modules(model, label)
 
@@ -1091,12 +1039,17 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     if args.compile:
         LOGGER.info(f"  {label}: compile + warmup took {warmup_sec:.1f}s (excluded from timings)")
 
-    initial = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
+    initial = diagnose_modules(model, data.diag, pad, causal)
     curve: list[tuple[int, float, float]] = []
     elapsed, window_start = 0.0, None
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    loss_count, grad_totals = 0, {}
-    gradients: dict[str, float] = {}
+    loss_count, grad_totals, weight_totals = 0, {}, {}
+    # Mirror loss_sum/loss_count: accumulated on device, resolved once per
+    # evaluation, so per-step clipping telemetry adds no per-step sync.
+    clip_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    clip_hits = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    clip_count = 0
+    parameters: dict[str, float] = {}
     gap = float("nan")
     diag_index = 0
 
@@ -1137,7 +1090,15 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         # every 100 steps, this pays it once per evaluation.
         if evaluating:
             grad_totals = gradient_norms(model)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            weight_totals = weight_norms(model)
+        # clip_grad_norm_ returns the pre-clip total norm it measured. It runs
+        # every step regardless, so taking the return is free -- and it is the
+        # only way to see how OFTEN clipping fires, which the every-evaluation
+        # gradient snapshot above cannot show.
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        clip_sum += total_norm.detach()
+        clip_hits += (total_norm.detach() > args.grad_clip).float()
+        clip_count += 1
         scaler.step(optimiser)
         scaler.update()
         scheduler.step()
@@ -1168,12 +1129,30 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             # lead actually began, which a single end-of-run scalar cannot say.
             # Cheap, and the clock is stopped here (see the window above).
             writer.add_scalar("loss/aulc", aulc(curve, 0), step, walltime=walltime)
+            writer.add_scalar("loss/ppl_val", math.exp(min(val_loss, 20.0)), step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
-            # Gradients/Global + Gradients/<component>, the tags and the decomposition
-            # train.py writes, so a variant's per-layer gradient trace can be read
-            # against a real training run's without translating anything.
-            gradients = resolve_gradients(grad_totals)
-            for tag, value in gradients.items():
+            # Accumulated on device across the window, exactly like loss_sum above,
+            # so the per-step pre-clip norm costs no per-step sync. grad_norm is
+            # what --grad-clip acted against and clip_frac is how often it acted:
+            # at clip_frac ~ 1 the effective learning rate is not the one on
+            # optim/lr, which no other tag here would show.
+            writer.add_scalar("optim/grad_norm",
+                              (clip_sum / max(clip_count, 1)).item(), step, walltime=walltime)
+            writer.add_scalar("optim/clip_frac",
+                              (clip_hits / max(clip_count, 1)).item(), step, walltime=walltime)
+            clip_sum.zero_(); clip_hits.zero_(); clip_count = 0
+            if args.amp:
+                writer.add_scalar("optim/grad_scale", scaler.get_scale(), step, walltime=walltime)
+
+            # param/grad/* uses train.py's buckets, so a variant's gradient trace
+            # reads against a real training run's without translating anything.
+            # param/weight/* is the same decomposition of the weights themselves,
+            # and exists so param/ratio/* can be formed: lr * ||grad|| / ||weight||
+            # is the scale-free number that says whether a component is learning
+            # too fast or has stopped, which neither half tells you alone.
+            parameters = resolve_parameters(grad_totals, weight_totals,
+                                            scheduler.get_last_lr()[0])
+            for tag, value in parameters.items():
                 writer.add_scalar(tag, value, step, walltime=walltime)
             writer.add_scalar("perf/elapsed_sec", elapsed, step, walltime=walltime)
             writer.add_scalar("perf/ms_per_step", elapsed / step * 1e3, step, walltime=walltime)
@@ -1189,12 +1168,19 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("perf/tflops",
                               flops_per_step * step / max(elapsed, 1e-9) / 1e12,
                               step, walltime=walltime)
+            if DEVICE.type == "cuda":
+                # A curve, not just the end-of-run number in summary.json: peak
+                # allocation moves with the step, and two arms can share a final
+                # peak while one of them spent the run near it.
+                writer.add_scalar("perf/peak_mem_mb",
+                                  torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2,
+                                  step, walltime=walltime)
 
             collapse = None
             # Tracked over training, not just start/end: representation collapse
             # is a trajectory, and the depth profile is the thing to compare.
             if diag_index % args.diag_every == 0 or step == args.steps:
-                diagnostics = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
+                diagnostics = diagnose_modules(model, data.diag, pad, causal)
                 for tag, value in diagnostics.items():
                     writer.add_scalar(tag, value, step, walltime=walltime)
                 collapse = diagnostics.get("collapse/output/mean")
@@ -1208,14 +1194,28 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     progress.close()
 
-    final = diagnose(model, attentions, feedforwards, data.diag, pad, causal)
+    final = diagnose_modules(model, data.diag, pad, causal)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
     # Over steps, which every arm shares by construction, so this one is
     # comparable as it stands. The seconds-axis area is NOT computed here: it is
     # only meaningful against a budget every variant reached, and that is not
     # known until they have all run, so report() derives it from `curve`.
     aulc_steps = aulc(curve, 0)
-    
+
+    # HPARAMS: what a sweep is actually for. The text tags above render one
+    # variant's config as a blob you can read; this renders every variant as a
+    # row you can SORT by outcome and filter by setting, which is the difference
+    # between reading k*spread*tau_rel charts and reading one table. run_name="."
+    # writes into this variant's own directory -- the default mints a timestamped
+    # subdirectory, which TensorBoard then shows as a phantom run.
+    writer.add_hparams(
+        hparams(variant, config, args),
+        {"hparam/loss_val": curve[-1][2] if curve else float("nan"),
+         "hparam/loss_aulc": aulc_steps,
+         "hparam/tokens_per_sec": train.total_inputs / len(train) * args.steps / max(elapsed, 1e-9),
+         "hparam/peak_mem_mb": peak_mb},
+        run_name=".")
+
     writer.close()
 
     return {
@@ -1238,7 +1238,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         "collapse_start": layer_profile(initial, "collapse/output"),
         "collapse_end": layer_profile(final, "collapse/output"),
         "diagnostics": final,
-        "gradients": gradients,
+        "param_norms": parameters,
     }
 
 
@@ -1319,7 +1319,7 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
 
     print(rule)
     print(f"\ntensorboard --logdir {run_dir}")
-    print("  loss/*, collapse/*, attn/*, ffn/*, Gradients/* and perf/* carry the same tag in every")
+    print("  loss/*, collapse/*, attn/*, ffn/*, param/* and perf/* carry the same tag in every")
     print("  run, so each chart overlays them all. attn/* and ffn/* hold the same four measurements")
     print("  per sublayer, so reading them side by side says which branch drove the block.")
     print("  Switch the x-axis to RELATIVE for loss against seconds of training compute")
