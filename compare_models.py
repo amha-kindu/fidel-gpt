@@ -82,7 +82,7 @@ from torch.utils.tensorboard import SummaryWriter
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
 import probes
-from utils import component_key, get_causal_mask
+from utils import build_param_groups, component_key, get_causal_mask
 
 # model classes are NOT imported here: every arm names its own, and resolve_model
 # imports it at parse time (see DEFAULT_MODEL).
@@ -188,13 +188,32 @@ def coerce(key: str, raw: str, template: ModelConfig):
     return raw
 
 
-def parse_overrides(text: str, template: ModelConfig) -> tuple[dict, str | None]:
-    """key=value,... -> (ModelConfig overrides, model path or None).
+def config_class(cls: type) -> type:
+    """The ModelConfig subclass an architecture wants, or ModelConfig itself.
+
+    An architecture with extra knobs declares them on its own config class and
+    points `CONFIG` at it, rather than growing config.py a block of fields per
+    experiment. Everything that types or builds a config goes through here, so
+    a flag only exists for the arms whose model actually reads it.
+    """
+    resolved = getattr(cls, "CONFIG", ModelConfig)
+    if not (isinstance(resolved, type) and issubclass(resolved, ModelConfig)):
+        raise argparse.ArgumentTypeError(
+            f"{cls.__name__}.CONFIG must be a ModelConfig subclass, got {resolved!r}")
+    return resolved
+
+
+def parse_overrides(text: str, default_model: str) -> tuple[dict, str | None]:
+    """key=value,... -> (config overrides, model path or None).
 
     `model=` is pulled out rather than coerced, because it is the one key that
-    names a class instead of a config field.
+    names a class instead of a config field. It is also read FIRST, in a pass of
+    its own, because which fields exist depends on which architecture this arm
+    builds -- `cp_fast` is a real field for RotaryScaleGPT and a typo for
+    anything else, and that cannot be decided before the class is known.
     """
-    out, model = {}, None
+    items = []
+    model = None
     for item in text.split(","):
         item = item.strip()
         if not item:
@@ -203,13 +222,15 @@ def parse_overrides(text: str, template: ModelConfig) -> tuple[dict, str | None]
             raise argparse.ArgumentTypeError(f"expected key=value, got '{item}'")
         key, _, value = item.partition("=")
         key = key.strip()
-        if key == MODEL_KEY and not hasattr(template, MODEL_KEY):
+        if key == MODEL_KEY:
             if not value.strip():
                 raise argparse.ArgumentTypeError("'model=' needs a class, e.g. 'model=model2.GPTWide'")
             model = value.strip()
             continue
-        out[key] = coerce(key, value, template)
-    return out, model
+        items.append((key, value))
+
+    template = config_class(resolve_model(model or default_model))()
+    return {key: coerce(key, value, template) for key, value in items}, model
 
 
 def resolve_model(path: str) -> type:
@@ -243,7 +264,7 @@ class Variant(NamedTuple):
     overrides: dict
 
 
-def parse_variant(text: str, template: ModelConfig, default_model: str) -> Variant:
+def parse_variant(text: str, default_model: str) -> Variant:
     if ":" not in text:
         raise argparse.ArgumentTypeError(
             f"variant '{text}' needs a name then a colon, e.g. 'wide:heads=16' or "
@@ -252,7 +273,7 @@ def parse_variant(text: str, template: ModelConfig, default_model: str) -> Varia
     name = name.strip()
     if not name:
         raise argparse.ArgumentTypeError(f"variant '{text}' has an empty name")
-    overrides, model = parse_overrides(spec, template)
+    overrides, model = parse_overrides(spec, default_model)
     model = model or default_model
     return Variant(name, model, resolve_model(model), overrides)
 
@@ -771,7 +792,7 @@ def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
     # CUDA, and applies identically to every variant, so it does not tilt the
     # comparison it speeds up.
     fused = DEVICE.type == "cuda" and args.fused
-    return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+    return torch.optim.AdamW(build_param_groups(model, args.weight_decay), lr=args.lr, weight_decay=args.weight_decay,
                              betas=(args.beta1, args.beta2), fused=fused)
 
 
@@ -933,7 +954,10 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     writer = SummaryWriter(os.path.join(run_dir, label.replace("/", "-")))
     seed_everything(args.seed)
 
-    config = ModelConfig(**{**args.base_config, **overrides})
+    # The arm's own config class, so an architecture's extra fields exist here
+    # exactly when its model reads them. base_config only ever holds fields the
+    # plain ModelConfig defines, so this never has to filter it.
+    config = config_class(variant.cls)(**{**args.base_config, **overrides})
     # build() when the class offers one -- it owns weight tying, the init scheme and
     # LoRA, none of which this script should reimplement per architecture -- and the
     # plain constructor otherwise. The isinstance check catches the one way a build()
@@ -1352,7 +1376,6 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    template = ModelConfig()
 
     parser.add_argument("--tokenizer", default="tokenizers/amharic-bpe-tokenizer-25k.model")
     parser.add_argument("--training-data", default="data/pretraining/train.jsonl")
@@ -1394,7 +1417,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-decoders", type=int, default=3)
     parser.add_argument("--ff-dim", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--gain", type=float, default=1.0)
 
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -1460,12 +1482,16 @@ def parse_args() -> argparse.Namespace:
                             n_decoders=args.n_decoders, ff_dim=args.ff_dim,
                             seq_len=args.seq_len, dropout=args.dropout)
     try:
-        shared, shared_model = parse_overrides(args.config, template)
+        # --config is typed against whichever architecture ends up the default,
+        # since that is the one every variant inherits from unless it names its
+        # own. A field only that architecture defines is therefore settable here
+        # and lands in base_config for the arms that can read it.
+        shared, shared_model = parse_overrides(args.config, args.model)
         args.base_config.update(shared)
         # --config model=... is the same knob as --model, so an explicit --model wins
         # and otherwise either spelling sets the default the variants inherit.
         args.model = args.model if args.model != DEFAULT_MODEL else (shared_model or args.model)
-        args.variants = [parse_variant(v, template, args.model)
+        args.variants = [parse_variant(v, args.model)
                          for v in (args.variant or DEFAULT_VARIANTS)]
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
