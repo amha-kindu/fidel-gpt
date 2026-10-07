@@ -12,24 +12,41 @@ tensorboard --logdir <tb_log_dir>
 
 ## Table of Contents
 
-- [The tree at a glance](#the-tree-at-a-glance)
-- [When things are written](#when-things-are-written)
-- [Conventions](#conventions)
-- [`loss/*` — quality](#loss--quality)
-- [`optim/*` — the optimiser](#optim--the-optimiser)
-- [`param/*` — where the gradient goes and what it moves](#param--where-the-gradient-goes-and-what-it-moves)
-- [`perf/*` — cost](#perf--cost)
-- [The probes](#the-probes)
-  - [How a probe pass works](#how-a-probe-pass-works)
-  - [The shared measurements](#the-shared-measurements)
-  - [`embedding/*` — what the embedding table hands the stack](#embedding--what-the-embedding-table-hands-the-stack)
-  - [`attn/*` and `ffn/*` — sublayer health](#attn-and-ffn--sublayer-health)
-  - [`stream/*` — the residual stream between blocks](#stream--the-residual-stream-between-blocks)
-  - [`head/*` — what the output head reads and how sharply it answers](#head--what-the-output-head-reads-and-how-sharply-it-answers)
-- [TEXT — `ModelCensus`](#text--modelcensus)
-- [Reading them together](#reading-them-together)
-- [Caveats](#caveats)
-- [Adding a probe](#adding-a-probe)
+- [Training Diagnostics Reference](#training-diagnostics-reference)
+  - [Table of Contents](#table-of-contents)
+  - [The tree at a glance](#the-tree-at-a-glance)
+  - [When things are written](#when-things-are-written)
+  - [Conventions](#conventions)
+  - [`loss/*` — quality](#loss--quality)
+    - [`loss/curves` `{train, val}`](#losscurves-train-val)
+    - [`loss/gap`](#lossgap)
+  - [`optim/*` — the optimiser](#optim--the-optimiser)
+  - [`param/*` — where the gradient goes and what it moves](#param--where-the-gradient-goes-and-what-it-moves)
+    - [`param/grad/<group>`](#paramgradgroup)
+    - [`param/norm/<group>`](#paramnormgroup)
+    - [`param/update_ratio/<group>`](#paramupdate_ratiogroup)
+  - [`perf/*` — cost](#perf--cost)
+  - [Gradient noise — `param/gsnr/*` and `optim/noise_scale`](#gradient-noise--paramgsnr-and-optimnoise_scale)
+    - [`param/gsnr/<group>`](#paramgsnrgroup)
+    - [`optim/noise_scale`](#optimnoise_scale)
+    - [Cost and settings](#cost-and-settings)
+  - [The probes](#the-probes)
+    - [How a probe pass works](#how-a-probe-pass-works)
+    - [The shared measurements](#the-shared-measurements)
+    - [`embedding/*` — what the embedding table hands the stack](#embedding--what-the-embedding-table-hands-the-stack)
+    - [`attn/*` and `ffn/*` — sublayer health](#attn-and-ffn--sublayer-health)
+      - [`<s>/input_norm`](#sinput_norm)
+      - [`<s>/update_ratio`](#supdate_ratio)
+      - [`<s>/update_cos`](#supdate_cos)
+      - [`<s>/update_isotropy`](#supdate_isotropy)
+    - [`stream/*` — the residual stream between blocks](#stream--the-residual-stream-between-blocks)
+      - [`stream/norm`](#streamnorm)
+      - [`stream/collapse`](#streamcollapse)
+    - [`head/*` — what the output head reads and how sharply it answers](#head--what-the-output-head-reads-and-how-sharply-it-answers)
+  - [TEXT — `ModelCensus`](#text--modelcensus)
+  - [Reading them together](#reading-them-together)
+  - [Caveats](#caveats)
+  - [Adding a probe](#adding-a-probe)
 
 ---
 
@@ -46,11 +63,13 @@ optim/
 ├── lr                          learning rate
 ├── grad_norm                   mean pre-clip global gradient norm over the window
 ├── clip_frac                   share of the window's steps that were clipped
-└── grad_scale                  AMP loss scale (mixed precision only)
+├── grad_scale                  AMP loss scale (mixed precision only)
+└── noise_scale                 gradient noise scale ≈ critical batch size, in sequences
 param/
 ├── grad/<group>                ‖grad‖, before clipping
 ├── norm/<group>                ‖W‖, before the optimiser step
-└── update_ratio/<group>        ‖W_after − W_before‖ / ‖W_before‖ across one step
+├── update_ratio/<group>        ‖W_after − W_before‖ / ‖W_before‖ across one step
+└── gsnr/<group>                gradient signal-to-noise ratio, per sequence
 perf/
 ├── tokens_per_sec              non-pad input tokens per second of training
 └── tflops                      achieved TFLOP/s
@@ -89,9 +108,10 @@ Read in forward-pass order, the probe families trace one token's path through th
 
 | what | when | measured on |
 |---|---|---|
-| `loss/curves {train}`, `optim/*`, `param/*`, `perf/*` | once per **window** of `log_every` optimiser steps (default 100) | the training batches |
+| `loss/curves {train}`, `optim/*`, `param/*`, `perf/*` — except the two below | once per **window** of `log_every` optimiser steps (default 100) | the training batches |
 | `loss/curves {val}`, `loss/gap` | at every validation | the validation set |
-| `embedding/*` `attn/*` `ffn/*` `stream/*` `head/*` | at every validation | one **fixed probe batch**, drawn once from the validation data at the start of the run |
+| `embedding/*` `attn/*` `ffn/*` `stream/*` `head/*` | at every validation | one **fixed probe batch**, drawn once from the validation data at the start of the run, with its labels |
+| `param/gsnr/*`, `optim/noise_scale` | at every validation | the same probe batch, split into `gsnr_chunks` chunks |
 | `ModelCensus` | once, at step 0 | — |
 
 Every step is an **optimiser step**: under gradient accumulation, one step spans
@@ -252,6 +272,77 @@ number tells those apart.
 
 FLOPs are counted on every position, padding included, since padding costs the same
 compute. Tokens count non-pad inputs only.
+
+---
+
+## Gradient noise — `param/gsnr/*` and `optim/noise_scale`
+
+How much of the gradient is **signal** — the direction the whole data distribution agrees
+on — and how much is **noise** from which sequences happened to be sampled. Nothing else in
+the tree separates the two: `param/grad/*` and `optim/grad_norm` measure the gradient's
+size, which signal and noise both contribute to.
+
+Measured at every validation, on the fixed probe batch, as a step of its own:
+
+1. The probe batch is split into `K = gsnr_chunks` equal chunks of `b` sequences (default
+   `K = 8`).
+2. Each chunk's gradient `g_k` of the plain cross-entropy loss is taken separately, in eval
+   mode, without touching the training step's gradients.
+3. Per group, from the chunk gradients:
+
+```
+tr(Σ_b)  =  K/(K−1) · ( mean_k ‖g_k‖²  −  ‖ḡ‖² )        noise:  unbiased trace of the chunk covariance
+‖G‖²     =  ‖ḡ‖²  −  tr(Σ_b) / K                          signal: ‖ḡ‖² with its own noise removed
+tr(Σ₁)   =  b · tr(Σ_b)                                   noise of ONE sequence
+```
+
+The correction on `‖G‖²` matters: the mean of K noisy gradients still carries `tr(Σ_b)/K`
+of noise, and left in, a small K overstates the signal. Scaling the noise to one sequence
+makes both tags independent of the probe batch's size and of K.
+
+### `param/gsnr/<group>`
+
+`‖G‖² / tr(Σ₁)` — the gradient signal-to-noise ratio of one group, per sequence.
+
+```
+≳ 1      a single sequence's gradient already points the right way
+≪ 1      the group is moving mostly on sampling noise
+0        the noise swallowed the signal estimate entirely (it came out ≤ 0)
+```
+
+A **ratio of sums** over the group, not a mean of per-parameter ratios: per-parameter GSNR
+is heavy-tailed, and a few near-zero-variance weights would dominate a mean. Groups are the
+`param/*` groups.
+
+GSNR falls as training proceeds — the easy, shared directions are learned first — and a
+sustained fall alongside a widening `loss/gap` is the gradient turning into noise the model
+then fits (Liu et al., 2020). Groups differ by orders of magnitude by design: a final norm's
+few gains see a gradient most sequences agree on; an embedding row sees a gradient only
+from the sequences containing its token.
+
+### `optim/noise_scale`
+
+`tr(Σ₁) / ‖G‖²` over the whole model, **in sequences** — the gradient noise scale
+`B_simple` (McCandlish et al., 2018). It estimates the **critical batch size**: below it, a
+larger batch buys a proportionally better gradient and so fewer steps; above it, extra
+sequences per step are mostly wasted compute.
+
+Compare it with the sequences per optimiser step (`batch_size × grad_accum_steps ×` world
+size). It typically **grows** as the loss falls, so a batch size that was right early can
+become too small late. Omitted at a validation where the signal estimate is not positive —
+common at initialisation and on data with no learnable structure.
+
+On a small two-block model on real data, it read ≈ 5.4, 6.3 and 6.7 sequences at three
+successive validations, while per-group GSNR fell from its first reading.
+
+### Cost and settings
+
+`K` forward + backward passes over the probe batch per validation, plus one fp32 copy of the
+trainable weights. `gsnr_chunks < 2` disables both tags.
+
+Each chunk is `probe batch ÷ K` sequences, so a small probe batch gives few, small chunks
+and a noisy estimate. A larger probe batch, or reading the trend over several validations
+rather than one point, steadies it.
 
 ---
 
@@ -516,6 +607,10 @@ The diagnostic that identifies a *cause* is usually a combination.
 | `optim/grad_norm` spiking **+** one branch's `update_ratio` high | that branch is over-writing the stream — lower the learning rate or check its output scale |
 | `optim/clip_frac` → 1 | the step size is set by `max_norm`, not `optim/lr` |
 | `param/update_ratio/<group>` ≪ others **+** `param/grad/<group>` small | that group has stopped learning |
+| `param/gsnr/<group>` ≪ 1 **+** `param/update_ratio/<group>` healthy | that group is moving, but mostly on noise |
+| `param/gsnr/*` falling **+** `loss/gap` widening | the gradient is turning into noise the model is fitting |
+| `optim/noise_scale` ≫ sequences per step | a larger batch would buy fewer steps; the batch is below the critical size |
+| `optim/noise_scale` ≪ sequences per step | extra sequences per step are mostly wasted compute |
 | `stream/collapse` rising **+** `update_isotropy` falling | genuine representational collapse |
 | `stream/collapse` flat **+** `attn/update_cos` → 1 | attention has stopped mixing positions; the feed-forward is carrying the model — confirm with `ffn/update_ratio` holding while `attn/update_ratio` decays |
 | `stream/collapse` flat **+** `attn/update_isotropy` falling | heads converging onto a single operator |
@@ -562,6 +657,11 @@ across ranks.
 
 **`param/*` and the probes are snapshots**, taken at one step and on one batch respectively;
 `optim/*` and `perf/*` are window means. Expect the former to be noisier.
+
+**Gradient noise is measured on validation data, in eval mode, with plain cross-entropy.**
+The training gradient also carries dropout's noise and, when set, label smoothing, so
+`param/gsnr/*` reads the data's noise alone and `optim/noise_scale` the batch size that noise
+calls for.
 
 ---
 

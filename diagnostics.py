@@ -1,6 +1,7 @@
 """Training diagnostics: one implementation of every TensorBoard tag.
 
   loss/*  optim/*  param/*  perf/*          TrainingMonitor
+  param/gsnr/*  optim/noise_scale           gradient_noise
   embedding/* attn/* ffn/* stream/* head/*  diagnose_modules, driving the probes
                                             each module registers beside itself
   TEXT: ModelCensus                         parameter_census + flop_census
@@ -273,6 +274,90 @@ def resolve_parameters(grads: dict[str, torch.Tensor], weights: dict[str, torch.
     return resolved
 
 
+def gradient_noise(model: torch.nn.Module, inputs: torch.Tensor, mask: torch.Tensor,
+                   labels: torch.Tensor, chunks: int) -> dict[str, float]:
+    """Gradient signal-to-noise per component, and the gradient noise scale.
+
+    The probe batch is split into `chunks` equal chunks of b sequences, and each
+    chunk's gradient g_k is taken separately. Per component (component_key):
+
+        tr(S_b) = K/(K-1) * (mean_k ||g_k||^2 - ||g_mean||^2)    gradient noise
+        ||G||^2 = ||g_mean||^2 - tr(S_b) / K                       gradient signal
+
+    the second corrected for the noise ||g_mean||^2 still carries -- uncorrected,
+    a small K overstates the signal. Both are scaled to ONE SEQUENCE (the noise of
+    a b-sequence mean is 1/b of a single sequence's), so neither depends on how
+    large the probe batch is or how it was chunked:
+
+      param/gsnr/<component>   ||G||^2 / tr(S_1). A ratio of sums rather than a
+                               mean of per-parameter ratios, which a few
+                               near-zero-variance weights would dominate. ~1 or
+                               more is a gradient one sequence already points
+                               the right way with; << 1 is a component moving on
+                               noise. 0 when the noise swallowed the signal
+                               estimate entirely.
+      optim/noise_scale        tr(S_1) / ||G||^2 over the whole model, in
+                               sequences: the batch size past which a larger batch
+                               stops buying a proportionally better gradient
+                               (McCandlish et al., 2018, B_simple). Compare it with
+                               the sequences per optimiser step. Omitted when the
+                               signal estimate is not positive.
+
+    Gradients come from torch.autograd.grad, which never touches .grad -- the
+    training step's gradients are undisturbed -- and does not run the
+    AccumulateGrad hooks DDP reduces through. Eval mode, so dropout's randomness
+    is not counted as gradient noise; plain cross-entropy, without label
+    smoothing. Costs `chunks` forward + backward passes over the probe batch and
+    one fp32 copy of the trainable weights.
+    """
+    rows = inputs.shape[0]
+    chunks = min(chunks, rows)
+    if chunks < 2:
+        return {}
+    size = rows // chunks
+
+    named = [(component_key(name), param) for name, param in model.named_parameters()
+             if param.requires_grad]
+    params = [param for _, param in named]
+    total = [torch.zeros_like(param, dtype=torch.float32) for param in params]
+    square: dict[str, torch.Tensor] = {}
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.enable_grad():
+            for k in range(chunks):
+                rows_k = slice(k * size, (k + 1) * size)
+                logits = model(inputs[rows_k], mask[rows_k])
+                loss = torch.nn.functional.cross_entropy(
+                    logits.flatten(0, 1).float(), labels[rows_k].flatten(), ignore_index=-100)
+                grads = torch.autograd.grad(loss, params, allow_unused=True)
+                for i, ((key, _), grad) in enumerate(zip(named, grads)):
+                    if grad is None:
+                        continue
+                    grad = grad.detach().float()
+                    total[i] += grad
+                    norm_sq = grad.square().sum()
+                    square[key] = square[key] + norm_sq if key in square else norm_sq
+    finally:
+        model.train(was_training)
+
+    mean_sq: dict[str, torch.Tensor] = {}
+    for (key, _), summed in zip(named, total):
+        norm_sq = (summed / chunks).square().sum()
+        mean_sq[key] = mean_sq[key] + norm_sq if key in mean_sq else norm_sq
+
+    keys = list(square)
+    noise = torch.stack([(square[k] / chunks - mean_sq[k]) * chunks / (chunks - 1) for k in keys])
+    signal = torch.stack([mean_sq[k] for k in keys]) - noise / chunks
+    noise, signal = (noise * size).cpu().tolist(), signal.cpu().tolist()   # the one sync
+
+    out = {f"param/gsnr/{k}": max(s, 0.0) / max(n, probes.FLOOR) for k, s, n in zip(keys, signal, noise)}
+    if sum(signal) > 0:
+        out["optim/noise_scale"] = sum(noise) / sum(signal)
+    return out
+
+
 def fenced_json(payload: dict) -> str:
     """A payload in the fenced block TensorBoard's TEXT tab renders as code.
 
@@ -400,7 +485,8 @@ class TrainingMonitor:
 
     and at each validation: loss/curves {val}, loss/gap and, from one fixed probe
     batch, every registered probe -- embedding/* attn/* ffn/* stream/* head/* and
-    whatever a model class registers itself.
+    whatever a model class registers itself -- plus param/gsnr/* and
+    optim/noise_scale from gradient_noise, unless gsnr_chunks < 2.
 
     Only the coordinator writes, and only it pays for the param/* snapshot and the
     probe pass. The window accumulators stay on device on every rank, so a step
@@ -412,13 +498,15 @@ class TrainingMonitor:
     """
 
     def __init__(self, logger, model: torch.nn.Module, log_every: int, max_norm: float,
-                 probe: tuple[torch.Tensor, torch.Tensor, torch.Tensor], flops: dict,
-                 batches_per_step: int, world_size: int, is_coordinator: bool) -> None:
+                 probe: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], flops: dict,
+                 batches_per_step: int, world_size: int, is_coordinator: bool,
+                 gsnr_chunks: int = 8) -> None:
         self.logger = logger
         self.model = model
         self.log_every = max(1, log_every)
         self.max_norm = max_norm
-        self.probe_inputs, self.probe_mask, self.probe_valid = probe
+        self.probe_inputs, self.probe_mask, self.probe_valid, self.probe_labels = probe
+        self.gsnr_chunks = gsnr_chunks
         self.flops = flops
         self.flops_per_step = flops["total"] * batches_per_step * world_size
         self.world_size = world_size
@@ -506,7 +594,7 @@ class TrainingMonitor:
         self._reset_window()
 
     def validated(self, step: int, val_loss: float) -> None:
-        """loss/curves {val}, loss/gap and the probe pass. Coordinator only."""
+        """loss/curves {val}, loss/gap, the probe pass and gradient_noise. Coordinator only."""
         if not self.is_coordinator:
             return
         with self.paused():
@@ -515,6 +603,8 @@ class TrainingMonitor:
             train = self.train_loss if self.train_loss is not None else self.loss_sum / max(self.steps, 1)
             self.logger.log_scalar("loss/gap", val_loss - train, step)
             diagnostics = diagnose_modules(self.model, self.probe_inputs, self.probe_mask, self.probe_valid)
+            diagnostics.update(gradient_noise(self.model, self.probe_inputs, self.probe_mask,
+                                              self.probe_labels, self.gsnr_chunks))
             for tag, value in diagnostics.items():
                 self.logger.log_scalar(tag, value, step)
 
@@ -525,9 +615,11 @@ class TrainingMonitor:
                                                              "flops": self.flops}), step=0)
 
 
-def probe_batch(inputs: torch.Tensor, mask: torch.Tensor, pad: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One fixed batch on device for every probe pass of a run, with its valid map.
+def probe_batch(inputs: torch.Tensor, mask: torch.Tensor, labels: torch.Tensor,
+                pad: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One fixed batch on device for every probe pass of a run: (inputs, mask,
+    valid map, labels). The labels are for gradient_noise.
 
     Fixed so a probe tag's curve moves with the model, not with the batch."""
-    inputs, mask = inputs.to(DEVICE), mask.to(DEVICE)
-    return inputs, mask, inputs != pad
+    inputs, mask, labels = inputs.to(DEVICE), mask.to(DEVICE), labels.to(DEVICE)
+    return inputs, mask, inputs != pad, labels

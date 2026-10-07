@@ -168,6 +168,8 @@ class TrainingConfig(Config):
         self.save_every: int = kwargs.get("save_every", 1000)
         self.validate_every: int = kwargs.get("validate_every", 100)
         self.log_every: int = kwargs.get("log_every", 100)
+        # Chunks the probe batch is split into for param/gsnr/* and optim/noise_scale; < 2 disables them.
+        self.gsnr_chunks: int = kwargs.get("gsnr_chunks", 8)
         self.training_data: str = kwargs.get("training_data", None)
         self.validation_data: str = kwargs.get("validation_data", None)
         self.finetuning: bool = kwargs.get("finetuning", False)

@@ -83,11 +83,13 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
     share = math.ceil(config.batch_size / len(intent_val_loaders))
     firsts = [next(iter(loader)) for _, loader in intent_val_loaders.values()]
     probe = probe_batch(torch.cat([b[0][:share] for b in firsts])[:config.batch_size],
-                        torch.cat([b[2][:share] for b in firsts])[:config.batch_size], pad)
+                        torch.cat([b[2][:share] for b in firsts])[:config.batch_size],
+                        torch.cat([b[1][:share] for b in firsts])[:config.batch_size], pad)
     flops = flop_census(model, probe[0], probe[1]) if GLOBAL_RANK == COORDINATOR_RANK else {"total": 0}
     monitor = TrainingMonitor(tb_logger, model, config.log_every, config.max_norm, probe, flops,
                               batches_per_step=config.grad_accum_steps, world_size=1,
-                              is_coordinator=GLOBAL_RANK == COORDINATOR_RANK)
+                              is_coordinator=GLOBAL_RANK == COORDINATOR_RANK,
+                              gsnr_chunks=config.gsnr_chunks)
     monitor.log_census()
 
     for epoch in range(initial_epoch, config.epochs):
@@ -217,6 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, help="Number of warmup steps")
     parser.add_argument("--save-every", type=int, help="Number of weight updates between checkpoints")
     parser.add_argument("--validate-every", type=int, help="Number of weight updates between validations")
+    parser.add_argument("--gsnr-chunks", type=int, help="Chunks the probe batch is split into for param/gsnr/* and optim/noise_scale at each validation; < 2 disables them (default: 8)")
     parser.add_argument("--log-every", type=int, help="Number of weight updates per diagnostics window: loss/curves train, optim/*, param/*, perf/* (default: 100)")
     parser.add_argument("--vt-ratio", type=float, help="The ratio between the number of samples to validate the model on and the number of samples it has seen, since the last validation")
     parser.add_argument("--init-lr", type=float, help="Initial learning rate")
