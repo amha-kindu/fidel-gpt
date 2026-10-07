@@ -79,7 +79,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
-from diagnostics import (diagnose_modules, fenced_json, flop_census, gradient_norms,
+from diagnostics import (ClipStats, GradientEstimator, diagnose_modules, fenced_json, flop_census, gradient_norms,
                          parameter_census, resolve_parameters, snapshot_parameters,
                          update_norms, weight_norms)
 from utils import build_param_groups, get_causal_mask
@@ -471,10 +471,33 @@ class DataPlan:
         hash_tensor(hasher, self.diag)
         return hasher.hexdigest()
 
+    def upcoming(self, step: int, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(inputs, labels): the first `rows` rows of the batches scheduled from
+        step+1 on -- training data the model has not been updated on yet. Past the
+        end of the schedule it wraps to the start, which is data already trained on."""
+        inputs, labels, index = [], [], step
+        while sum(len(x) for x in inputs) < rows:
+            batch = self.train.items[self.schedule[index % len(self.schedule)]]
+            inputs.append(batch[0]); labels.append(batch[1])
+            index += 1
+        return torch.cat(inputs)[:rows], torch.cat(labels)[:rows]
+
 
 # --------------------------------------------------------------------------- #
 # training
 # --------------------------------------------------------------------------- #
+
+def diagnose(model: torch.nn.Module, data: DataPlan, pad: int, causal: torch.Tensor,
+             gradient: GradientEstimator, step: int) -> dict[str, float]:
+    """Every probe on the diagnostic (validation) batch, plus param/gsnr/* and
+    optim/noise_scale on a fresh training batch: the next --gsnr-samples rows
+    scheduled after `step`."""
+    mask = build_mask(data.diag, pad, causal)
+    inputs, labels = data.upcoming(step, gradient.batch_size)
+    inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+    gradient.measure(inputs, build_mask(inputs, pad, causal), labels)
+    return {**diagnose_modules(model, data.diag, mask, data.diag != pad), **gradient.resolve()}
+
 
 @torch.no_grad()
 def validate(model: torch.nn.Module, batches: BatchSet, pad: int, causal: torch.Tensor,
@@ -756,16 +779,15 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     if args.compile:
         LOGGER.info(f"  {label}: compile + warmup took {warmup_sec:.1f}s (excluded from timings)")
 
-    initial = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
+    gradient = GradientEstimator(model, args.gsnr_chunks, batch_size=args.gsnr_samples)
+    initial = diagnose(model, data, pad, causal, gradient, 0)
     curve: list[tuple[int, float, float]] = []
     elapsed, window_start = 0.0, None
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
     loss_count, grad_totals, weight_totals, update_totals = 0, {}, {}, {}
     # Mirror loss_sum/loss_count: accumulated on device, resolved once per
     # evaluation, so per-step clipping telemetry adds no per-step sync.
-    clip_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    clip_hits = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    clip_count = 0
+    clip_stats = ClipStats(args.grad_clip)
     parameters: dict[str, float] = {}
     gap = float("nan")
     diag_index = 0
@@ -814,9 +836,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         # only way to see how OFTEN clipping fires, which the every-evaluation
         # gradient snapshot above cannot show.
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        clip_sum += total_norm.detach()
-        clip_hits += (total_norm.detach() > args.grad_clip).float()
-        clip_count += 1
+        clip_stats.record(total_norm)
         scaler.step(optimiser)
         if evaluating:
             update_totals = update_norms(model, before_step)
@@ -845,16 +865,12 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("loss/train", train_loss, step, walltime=walltime)
             writer.add_scalar("loss/gap", gap, step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
-            # Accumulated on device across the window, exactly like loss_sum above,
-            # so the per-step pre-clip norm costs no per-step sync. grad_norm is
-            # what --grad-clip acted against and clip_frac is how often it acted:
-            # at clip_frac ~ 1 the effective learning rate is not the one on
-            # optim/lr, which no other tag here would show.
-            writer.add_scalar("optim/grad_norm",
-                              (clip_sum / max(clip_count, 1)).item(), step, walltime=walltime)
-            writer.add_scalar("optim/clip_frac",
-                              (clip_hits / max(clip_count, 1)).item(), step, walltime=walltime)
-            clip_sum.zero_(); clip_hits.zero_(); clip_count = 0
+            # Accumulated on device across the window, exactly like loss_sum above.
+            # grad_norm is what --grad-clip acted against and clip_frac how often it
+            # acted -- at clip_frac ~ 1 the effective learning rate is not the one on
+            # optim/lr -- both over the steps AMP did not skip; skip_frac counts those.
+            for tag, value in clip_stats.resolve().items():
+                writer.add_scalar(tag, value, step, walltime=walltime)
             if args.amp:
                 writer.add_scalar("optim/grad_scale", scaler.get_scale(), step, walltime=walltime)
 
@@ -890,7 +906,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             # Tracked over training, not just start/end: representation collapse
             # is a trajectory, and the depth profile is the thing to compare.
             if diag_index % args.diag_every == 0 or step == args.steps:
-                diagnostics = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
+                diagnostics = diagnose(model, data, pad, causal, gradient, step)
                 for tag, value in diagnostics.items():
                     writer.add_scalar(tag, value, step, walltime=walltime)
                 collapse = diagnostics.get("stream/collapse/mean")
@@ -904,7 +920,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     progress.close()
 
-    final = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
+    final = diagnose(model, data, pad, causal, gradient, args.steps)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
     # Over steps, which every arm shares by construction, so this one is
     # comparable as it stands. The seconds-axis area is NOT computed here: it is
@@ -1120,6 +1136,15 @@ def parse_args() -> argparse.Namespace:
                         help="Sequences used for the per-layer diagnostics, taken from the head "
                              "of the first validation batch and so capped at --batch-size. Bounds "
                              "diagnostic memory independently of the training batch (default: 8)")
+    parser.add_argument("--gsnr-samples", type=int, default=64,
+                        help="Sequences per param/gsnr/* and optim/noise_scale measurement: the "
+                             "next ones in the training schedule, split into --gsnr-chunks chunks "
+                             "and run one chunk at a time, so memory follows the chunk size "
+                             "(default: 64)")
+    parser.add_argument("--gsnr-chunks", type=int, default=8,
+                        help="Chunks each --gsnr-samples measurement is split into for "
+                             "param/gsnr/* and optim/noise_scale; < 2 disables them. Capped at "
+                             "--gsnr-samples (default: 8)")
     parser.add_argument("--diag-every", type=int, default=1,
                         help="Run the per-layer diagnostics every Nth evaluation. The final "
                              "step is always diagnosed (default: 1)")
