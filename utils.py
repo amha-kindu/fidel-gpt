@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 
 from config import *
-from tensorboard_logger import TensorboardLogger
 
 
 class Conversation:
@@ -101,61 +100,23 @@ def _non_blocking():
         return wrapper
     return decorator
 
-@_non_blocking()
-def log_confidence_metrics(tb_logger: TensorboardLogger, logits: torch.Tensor, global_step: int):
-    with torch.no_grad():
-        # Cast to fp32: under fp16 autocast, 1e-9 underflows to 0.0 making clamp a no-op.
-        logits_f = logits.float()
-        probs = torch.softmax(logits_f, dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs.clamp(min=1e-9)), dim=-1).mean().item()
-        max_prob = probs.max(dim=-1).values.mean().item()
-        logit_std = logits_f.std(dim=-1).mean().item()
-        tb_logger.log_scalar("Confidence/Entropy", entropy, global_step)
-        tb_logger.log_scalar("Confidence/MaxProb", max_prob, global_step)
-        tb_logger.log_scalar("Confidence/LogitStd", logit_std, global_step)
+def component_key(name: str) -> str:
+    """Parameter name -> the component its norms are reported under.
 
-@_non_blocking()
-def log_gradients(tb_logger: TensorboardLogger, grads: dict[str, torch.Tensor], global_step: int):
-    with torch.no_grad():
-        global_sq = 0.0
-        component_sq: dict[str, float] = {}
-        for name, grad in grads.items():
-            if grad is None:
-                continue
-            norm_sq = torch.linalg.vector_norm(grad.float().view(-1)).item() ** 2
-            global_sq += norm_sq
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
-            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
-        
-        tb_logger.log_scalar("Gradients/Global", global_sq ** 0.5, global_step)
-        for key, sq in component_sq.items():
-            tb_logger.log_scalar(f"Gradients/{key}", sq ** 0.5, global_step)
+    One rule, used by diagnostics.py for every param/* tag and by the census, so
+    a bucket covers the same parameters in a training run and in a comparison run.
 
-@_non_blocking()
-def log_weight_norms(tb_logger: TensorboardLogger, weights: dict[str, torch.Tensor], global_step: int):
-    with torch.no_grad():
-        component_sq: dict[str, float] = {}
-        for name, param in weights.items():
-            norm_sq = torch.linalg.vector_norm(param.float().view(-1)).item() ** 2
-            if name.startswith("embedding"):
-                key = "Embedding"
-            elif name.startswith("decoders."):
-                key = f"Decoder{name.split('.')[1]}"
-            elif name.startswith("projection"):
-                key = "Projection"
-            else:
-                key = "NormF"
-            component_sq[key] = component_sq.get(key, 0.0) + norm_sq
-        for key, sq in component_sq.items():
-            tb_logger.log_scalar(f"WeightNorm/{key}", sq ** 0.5, global_step)
-
+    Anything that is not the embedding, the projection or a decoder block falls
+    into NormF -- that is norm_f alone in GPTmodel, but a subclass with its own
+    top-level layers lands there too.
+    """
+    if name.startswith("embedding"):
+        return "Embedding"
+    if name.startswith("decoders."):
+        return f"Decoder{name.split('.')[1]}"
+    if name.startswith("projection"):
+        return "Projection"
+    return "NormF"
 
 @_non_blocking()
 def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, config: TrainingConfig, training_state: TrainingState):

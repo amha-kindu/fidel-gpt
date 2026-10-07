@@ -167,6 +167,7 @@ class TrainingConfig(Config):
         self.warmup_steps: int = kwargs.get("warmup_steps", 1000)
         self.save_every: int = kwargs.get("save_every", 1000)
         self.validate_every: int = kwargs.get("validate_every", 100)
+        self.log_every: int = kwargs.get("log_every", 100)
         self.training_data: str = kwargs.get("training_data", None)
         self.validation_data: str = kwargs.get("validation_data", None)
         self.finetuning: bool = kwargs.get("finetuning", False)
@@ -184,7 +185,11 @@ class TrainingConfig(Config):
             for path in (data.split(',') if data else []):
                 if path.strip() and not os.path.isfile(path.strip()):
                     raise FileNotFoundError(f"File '{path.strip()}' does not exist")
-        
+
+    def __setstate__(self, state: dict):
+        # A checkpoint pickled before a field existed gets that field's default on --resume.
+        self.__dict__.update({**type(self)().__dict__, **state})
+
 class TrainingState:
     def __init__(self, epoch: int, global_step: int, training_loss: float, validation_loss: float, best_val_loss: float, optimizer_state: dict, lr_scheduler_state: dict, scaler_state: dict | None = None):
         self.epoch = epoch

@@ -1,7 +1,4 @@
 import os
-import json
-import math
-import time
 import torch
 import argparse
 import itertools
@@ -21,7 +18,8 @@ from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
-from utils import EarlyStopping, build_param_groups, init_sdp_backend,log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint
+from diagnostics import TrainingMonitor, fenced_json, flop_census, probe_batch
+from utils import EarlyStopping, build_param_groups, init_sdp_backend, save_checkpoint
 
 
 def data_size(paths: str) -> int:
@@ -32,14 +30,21 @@ def data_names(paths: str) -> str:
     return ", ".join(os.path.basename(p.strip()) for p in paths.split(',') if p.strip())
 
 
-def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, val_dataset: NLPDataset, is_distributed: bool = False, training_state: TrainingState | None = None) -> None:
+def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, val_dataset: NLPDataset, pad: int, is_distributed: bool = False, training_state: TrainingState | None = None) -> None:
     tb_logger = TensorboardLogger(config.tb_log_dir)
-    
-    tb_logger.log_text("TrainingConfig", f"```json\n{json.dumps(config.__dict__, indent=2)}\n```", step=0)
-    tb_logger.log_text("ModelConfig", f"```json\n{json.dumps(model.config.__dict__, indent=2)}\n```", step=0)
-    tb_logger.log_text("Environment", f"```json\n{json.dumps(ENV, indent=2)}\n```", step=0)
+
+    tb_logger.log_text("TrainingConfig", fenced_json(config.to_dict()), step=0)
+    tb_logger.log_text("ModelConfig", fenced_json(model.config.to_dict()), step=0)
+    tb_logger.log_text("Environment", fenced_json(ENV), step=0)
 
     base_model = model
+    # One fixed validation batch: every probe pass reads it, and the FLOP census
+    # runs on it. The census does a backward, so it runs before the DDP wrap --
+    # DDP's reducer hooks on the parameters would otherwise expect every rank.
+    first = next(iter(val_dataset.get_loader(config.batch_size)))
+    probe = probe_batch(first[0], first[2], pad)
+    flops = flop_census(base_model, probe[0], probe[1]) if GLOBAL_RANK == COORDINATOR_RANK else {"total": 0}
+
     if is_distributed:
         model = DistributedDataParallel(model, device_ids=[LOCAL_RANK])
 
@@ -96,7 +101,11 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
         val_sampler = RandomSampler(val_dataset, replacement=True, num_samples=config.batch_size * val_batches)
         val_loader = val_dataset.get_loader(config.batch_size, sampler=val_sampler)
 
-    last_step_time = time.monotonic()
+    monitor = TrainingMonitor(tb_logger, base_model, config.log_every, config.max_norm, probe, flops,
+                              batches_per_step=config.grad_accum_steps, world_size=WORLD_SIZE,
+                              is_coordinator=GLOBAL_RANK == COORDINATOR_RANK)
+    monitor.log_census()
+
     for epoch in range(initial_epoch, config.epochs):
         if isinstance(train_dataset, PackedTextStreamDataset):
             train_dataset.set_epoch(epoch)
@@ -112,6 +121,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
 
             # (N_BATCHES, 1, SEQ_LEN, SEQ_LEN)
             decoder_mask: torch.Tensor  = batch[2].to(DEVICE, non_blocking=True)
+            monitor.count_tokens(decoder_input, pad)
 
             with torch.autocast(device_type=DEVICE.type, enabled=MIXED_PRECISION_ENABLED):
                 # (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -137,17 +147,10 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                     scaler.scale(avg_loss).backward()
                 if update_weights:
                     scaler.unscale_(optimizer)
-                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
-                        grad_snapshot, weight_snapshot = {}, {}
-                        for name, param in base_model.named_parameters():
-                            weight_snapshot[name] = param.detach().cpu()
-                            if param.grad is not None:
-                                grad_snapshot[name] = param.grad.detach().cpu()
-                        
-                        log_gradients(tb_logger, grad_snapshot, global_step)
-                        log_weight_norms(tb_logger, weight_snapshot, global_step)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
+                    monitor.before_update(global_step)
+                    monitor.clip(model.parameters())
                     scaler.step(optimizer)
+                    monitor.after_update()
                     scaler.update()
                     scheduler.step()
                     optimizer.zero_grad()
@@ -155,41 +158,29 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 with sync_ctx:
                     avg_loss.backward()
                 if update_weights:
-                    if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
-                        grad_snapshot, weight_snapshot = {}, {}
-                        for name, param in base_model.named_parameters():
-                            weight_snapshot[name] = param.detach().cpu()
-                            if param.grad is not None:
-                                grad_snapshot[name] = param.grad.detach().cpu()
-                        
-                        log_gradients(tb_logger, grad_snapshot, global_step)
-                        log_weight_norms(tb_logger, weight_snapshot, global_step)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_norm)
+                    monitor.before_update(global_step)
+                    monitor.clip(model.parameters())
                     optimizer.step()
+                    monitor.after_update()
                     scheduler.step()
                     optimizer.zero_grad()
 
             if update_weights:
-                now = time.monotonic()
-                tb_logger.log_scalar("Training/TokensPerSec", WORLD_SIZE * config.batch_size * base_model.config.seq_len * config.grad_accum_steps / (now - last_step_time), global_step)
-                last_step_time = now
-                if MIXED_PRECISION_ENABLED and GLOBAL_RANK == COORDINATOR_RANK:
-                    tb_logger.log_scalar("Training/ScalerScale", scaler.get_scale(), global_step)
+                monitor.end_step(global_step, training_loss, scheduler.get_last_lr()[0], scaler)
 
-                tb_logger.log_scalars("Loss/Curves", {"Train": training_loss}, global_step)
-                tb_logger.log_scalar("Training/LearningRate", scheduler.get_last_lr()[0], global_step)
-                
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step % config.validate_every == 0:
                     if isinstance(val_dataset, PackedTextStreamDataset):
                         val_dataset.set_epoch(global_step // config.validate_every)
-                    model.eval()
-                    val_loss = validate(
-                        model=base_model,
-                        data_loader=val_loader,
-                        loss_func=loss_func,
-                        max_batches=val_batches,
-                    )
-                    model.train()
+                    with monitor.paused():
+                        model.eval()
+                        val_loss = validate(
+                            model=base_model,
+                            data_loader=val_loader,
+                            loss_func=loss_func,
+                            max_batches=val_batches,
+                        )
+                        model.train()
+                    monitor.validated(global_step, val_loss)
 
                     if early_stopping(val_loss):
                         LOGGER.info(f"Early stopping triggered at epoch {epoch + 1}; avg val loss {early_stopping.best_loss:.4f} did not decrease significantly for {early_stopping.patience} consecutive weight updates")
@@ -203,21 +194,14 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
                 if should_early_stop:
                     break
 
-                if global_step % config.validate_every == 0:
-                    tb_logger.log_scalars("Loss/Curves", {"Val": val_loss}, global_step)
-                    tb_logger.log_scalar("Perplexity/Val", math.exp(min(val_loss, 20)), global_step)
-                    tb_logger.log_scalar("Loss/Gap", val_loss - training_loss, global_step)
-
                 data_loader.set_postfix({
                     "train_loss": f"{training_loss:6.3f}",
                     "val_loss": f"{val_loss:6.3f}"
                 })
                 
-                if GLOBAL_RANK == COORDINATOR_RANK and global_step % 100 == 0:
-                    log_confidence_metrics(tb_logger, logits.detach().cpu(), global_step)
-                
                 if GLOBAL_RANK == COORDINATOR_RANK and global_step and global_step % config.save_every == 0:
-                    weights_snapshot = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+                    with monitor.paused():
+                        weights_snapshot = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
                     save_checkpoint(
                         weights=weights_snapshot,
                         model_config=base_model.config,
@@ -293,6 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, help="Number of warmup steps")
     parser.add_argument("--save-every", type=int, help="Number of weight updates between checkpoints")
     parser.add_argument("--validate-every", type=int, help="Number of weight updates between validations")
+    parser.add_argument("--log-every", type=int, help="Number of weight updates per diagnostics window: loss/curves train, optim/*, param/*, perf/* (default: 100)")
     parser.add_argument("--vt-ratio", type=float, help="The ratio between the number of samples to validate the model on and the number of samples it has seen, since the last validation")
     parser.add_argument("--init-lr", type=float, help="Initial learning rate")
     parser.add_argument("--min-lr", type=float, help="Minimum learning rate")
@@ -420,7 +405,7 @@ if __name__ == "__main__":
         LOGGER.info(f"Model size: {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-    train(training_config, model, train_dataset, val_dataset, args.is_distributed, training_state)
+    train(training_config, model, train_dataset, val_dataset, tokenizer.pad_id(), args.is_distributed, training_state)
     
     THREAD_POOL.shutdown()
     if args.is_distributed:

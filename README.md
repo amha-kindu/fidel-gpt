@@ -60,9 +60,7 @@ This project provides the full training and fine-tuning pipeline for a **custom 
    - Can target subsets of parameters via `trainable_params.json` or apply LoRA adapters (`lora.py`, `lora_targets.json`).
 
 4. **Monitoring**
-   - Training/validation loss
-   - Perplexity
-   - Confidence metrics (entropy)
+   - Training and validation loss on one chart, plus the full diagnostics tree in `DIAGNOSTICS.md`
 
 5. **Inference**
    - Greedy or sampling-based decoding in `inference.py`.
@@ -193,11 +191,9 @@ Start TensorBoard to monitor training:
 tensorboard --logdir runs
 ```
 
-Logged metrics:
-
-* Training/validation loss
-* Perplexity
-* Entropy-based confidence
+Logged metrics: training and validation loss on one chart (`loss/curves`), optimiser and
+per-component parameter health (`optim/*`, `param/*`), throughput (`perf/*`), and per-layer
+probes of the embedding, residual stream, sublayers and head. See `DIAGNOSTICS.md`.
 
 ---
 
