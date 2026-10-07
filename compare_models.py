@@ -19,10 +19,9 @@ come from the variant itself (see DataPlan). What gets reported:
     above as loss/gap
   * per-layer attention health    -- how the sublayer is behaving in each decoder
     block, not averaged into a single scalar that hides the one bad layer
-  * per-layer gradient norms      -- param/grad/global and param/grad/<component>,
-    the same decomposition train.py logs (it shares the bucketing rule, see
-    utils.component_key), so a variant's gradient trace here reads directly
-    against a real training run's
+  * per-layer gradient norms      -- param/grad/<component>, computed by the
+    same code a training run uses (diagnostics.py), so a variant's gradient
+    trace here reads directly against a real training run's
 
 The first variant is the baseline every other one is reported against. It is the
 model the flags describe -- model.GPTmodel, standard multi-head attention --
@@ -76,13 +75,14 @@ import torch.nn.functional as F
 import sentencepiece as spm
 from tqdm import tqdm
 from torch.utils.data import SubsetRandomSampler
-from torch.utils.flop_counter import FlopCounterMode
 from torch.utils.tensorboard import SummaryWriter
 
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
-import probes
-from utils import build_param_groups, component_key, get_causal_mask
+from diagnostics import (diagnose_modules, fenced_json, flop_census, gradient_norms,
+                         parameter_census, resolve_parameters, snapshot_parameters,
+                         update_norms, weight_norms)
+from utils import build_param_groups, get_causal_mask
 
 # model classes are NOT imported here: every arm names its own, and resolve_model
 # imports it at parse time (see DEFAULT_MODEL).
@@ -282,51 +282,6 @@ def parse_variant(text: str, default_model: str) -> Variant:
 # diagnostics
 # --------------------------------------------------------------------------- #
 
-class Recorder:
-    """Per-layer scalars accumulated as 0-dim device tensors.
-
-    Every `.item()` on a CUDA tensor is a device sync. Reading each metric off
-    the device as it is produced costs one stall per metric per layer -- well
-    over a hundred per evaluation -- inside the loop whose wall-clock is the
-    number this script exists to report. Here the values stay on device until
-    `resolve()` stacks them into a single transfer.
-    """
-
-    def __init__(self) -> None:
-        self._entries: list[tuple[str, int]] = []
-        self._values: list[torch.Tensor] = []
-
-    def add(self, tag: str, layer: int, value: torch.Tensor) -> None:
-        self._entries.append((tag, layer))
-        self._values.append(value.detach().float().reshape(()))
-
-    def resolve(self) -> dict[str, float]:
-        """(tag, layer) -> scalars, plus a mean/min/max reduction over layers.
-
-        Reporting only the mean once hid a real finding: mid-stack collapse at
-        one layer was invisible in the average, because the deepest layer was
-        fine and a six-layer mean dilutes one bad layer sixfold. Any scalar
-        worth watching is worth watching per layer, and the extremes are what
-        make a single-layer anomaly visible on a summary chart.
-        """
-        if not self._values:
-            return {}
-        flat = torch.stack(self._values).cpu().tolist()   # the one and only sync
-        per_tag: dict[str, dict[int, float]] = {}
-        for (tag, layer), value in zip(self._entries, flat):
-            per_tag.setdefault(tag, {})[layer] = value
-
-        out: dict[str, float] = {}
-        for tag, layers in per_tag.items():
-            values = []
-            for layer in sorted(layers):
-                out[f"{tag}/layer_{layer:02d}"] = layers[layer]
-                values.append(layers[layer])
-            out[f"{tag}/mean"] = sum(values) / len(values)
-            out[f"{tag}/min"] = min(values)
-            out[f"{tag}/max"] = max(values)
-        return out
-
 
 def decoder_blocks(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
     blocks = getattr(model, "decoders", None)
@@ -374,78 +329,6 @@ def attention_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Modul
 
 def feedforward_modules(model: torch.nn.Module, label: str) -> list[torch.nn.Module]:
     return sublayer_modules(model, label, FEEDFORWARD_HINTS, "a feed-forward")
-
-
-@torch.inference_mode()
-def site_of(name: str) -> tuple[str, int]:
-    """(role, depth) from a module path, tolerant of DDP/compile name prefixes.
-
-    The role is the leaf attribute -- norm1, norm2, norm_f, Wqkv, Wo, Wug, Wd --
-    so one tag follows the same structural position across every block, and the
-    depth is the decoder index so the per-layer/mean/min/max split lands on the
-    same axis as attn/* and ffn/*. Anything outside a decoder block is filed at
-    layer 0. `projection.linear` is renamed for its parent, since `linear` says
-    nothing about where it sits.
-    """
-    parts = name.split(".")
-    role = "projection" if parts[-1] == "linear" else parts[-1]
-    if "decoders" in parts:
-        return role, int(parts[parts.index("decoders") + 1])
-    return role, 0
-
-
-def diagnose_modules(model: torch.nn.Module, inputs: torch.Tensor,
-                     pad: int, causal: torch.Tensor) -> dict[str, float]:
-    """Everything registered in `probes`, from ONE forward pass.
-
-    Deliberately the opposite of `diagnose` on one axis: these probes DO reach
-    inside their modules, read running buffers and recompute internal
-    quantities. That is defensible only because the tags are variant-specific by
-    construction -- a model without the module emits none of them, so nothing
-    here can be mistaken for a number some other variant failed to report. They
-    stay out of the attn/* ffn/* collapse/* namespace, which remains
-    internals-blind precisely so it can be compared across unrelated classes.
-
-    This function owns the mechanism and none of the meaning: the probe batch,
-    the padding mask, the single host transfer, and the <family>/<site>/<metric>
-    naming. What each metric IS lives beside the module that registers it, where
-    `isinstance` is available and where anyone changing the module is already
-    looking. See `probes.register`.
-    """
-    sites = [(name, module, probe)
-             for name, module in model.named_modules()
-             for probe in probes.probes_for(module)]
-    if not sites:
-        return {}                       # arms without probed modules emit nothing, not zeros
-
-    rec = Recorder()
-    ctx = probes.ProbeContext(inputs != pad)
-    handles = []
-
-    def probe_hook(probe: probes.Probe, module: torch.nn.Module, prefix: str, layer: int):
-        def hook(_module, args, output):
-            for metric, value in probe.measure(module, args, output, ctx).items():
-                rec.add(f"{prefix}/{metric}", layer, value)
-        return hook
-
-    for name, module, probe in sites:
-        site, layer = site_of(name)
-        # per_site=False drops the role segment: one such module per block means
-        # the family already names it, and attn/attention/update_ratio says
-        # nothing attn/update_ratio does not.
-        prefix = f"{probe.family}/{site}" if probe.per_site else probe.family
-        handles.append(module.register_forward_hook(probe_hook(probe, module, prefix, layer)))
-
-    was_training = model.training
-    model.eval()                        # eval matters: a norm carrying running stats
-    try:                                # must not fold the probe batch into them
-        with torch.no_grad():
-            model(inputs, build_mask(inputs, pad, causal))
-    finally:
-        model.train(was_training)
-        for handle in handles:
-            handle.remove()
-    return rec.resolve()
 
 
 def layer_profile(diagnostics: dict[str, float], tag: str) -> list[float]:
@@ -677,96 +560,6 @@ def aulc(curve: list[tuple[int, float, float]], axis: int, cutoff: float | None 
     return area / span
 
 
-def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Squared gradient norm per component, bucketed by utils.component_key.
-
-    The buckets, and therefore the param/grad/* tags they become, are train.py's:
-    Embedding, Projection, Decoder<i> per block, NormF for the rest. Sharing the
-    rule rather than restating it is what keeps a comparison run's per-layer
-    gradient series readable against a real training run's.
-
-    Returned as 0-dim device tensors rather than floats. This has to be called
-    from inside the timed window -- the snapshot is only meaningful before
-    clipping, exactly where train.py takes it -- and an .item() per parameter
-    would be one device sync per parameter, tens of stalls per evaluation, inside
-    the region whose wall-clock this script exists to report. resolve_parameters
-    turns them into numbers later, with the clock stopped.
-    """
-    totals: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        key = component_key(name)
-        norm_sq = torch.linalg.vector_norm(param.grad.detach().float().view(-1)).square()
-        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
-    return totals
-
-
-def weight_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Squared weight norm per component, in the same buckets as the gradients.
-
-    The counterpart to gradient_norms, sharing utils.component_key so the two
-    decompositions line up term for term. On its own a weight norm says little;
-    paired with the gradient norm it gives the scale-free ratio below, which is
-    the number that actually says whether a component is learning.
-
-    Same 0-dim-device-tensor discipline: this runs inside the timed window, and
-    an .item() per parameter would be tens of stalls per evaluation.
-    """
-    totals: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        key = component_key(name)
-        norm_sq = torch.linalg.vector_norm(param.detach().float().view(-1)).square()
-        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
-    return totals
-
-
-def resolve_parameters(grads: dict[str, torch.Tensor], weights: dict[str, torch.Tensor],
-                       lr: float) -> dict[str, float]:
-    """Gradient, weight and update-ratio scalars, in ONE host transfer.
-
-    Emits three families off one sync:
-
-      param/grad/<component>    ||grad||, and param/grad/global over everything.
-                                Global is the root of the summed squares, which is
-                                what clip_grad_norm_ measures against --grad-clip,
-                                so the components always add up to the number the
-                                clipping acted on.
-      param/weight/<component>  ||weight||, same buckets, plus param/weight/global.
-      param/ratio/<component>   lr * ||grad|| / ||weight||: the fraction of its own
-                                magnitude a component moves in one step. Roughly
-                                1e-3 is healthy. Orders of magnitude below means a
-                                component has stopped learning while the loss curve
-                                keeps falling on the strength of the others; orders
-                                above is the component about to destabilise the run.
-                                Scale-free, so it is comparable BETWEEN components
-                                and between variants, which neither norm is.
-
-    Grouped under param/ rather than as three top-level families because
-    TensorBoard sorts alphabetically, and the ratio is unreadable without the two
-    norms it is formed from on the same screen.
-    """
-    if not grads and not weights:
-        return {}
-
-    grad_keys, weight_keys = list(grads), list(weights)
-    stacked = torch.stack([grads[k] for k in grad_keys] + [weights[k] for k in weight_keys])
-    values = stacked.sqrt().cpu().tolist()                      # the one and only sync
-
-    grad_norm = dict(zip(grad_keys, values[:len(grad_keys)]))
-    weight_norm = dict(zip(weight_keys, values[len(grad_keys):]))
-
-    resolved = {f"param/grad/{k}": v for k, v in grad_norm.items()}
-    resolved["param/grad/global"] = sum(v * v for v in grad_norm.values()) ** 0.5
-    resolved.update({f"param/weight/{k}": v for k, v in weight_norm.items()})
-    resolved["param/weight/global"] = sum(v * v for v in weight_norm.values()) ** 0.5
-    for key, grad in grad_norm.items():
-        weight = weight_norm.get(key)
-        if weight:
-            resolved[f"param/ratio/{key}"] = lr * grad / weight
-    return resolved
-
-
 def hparams(variant, config: ModelConfig, args) -> dict:
     """The variant's settings, flattened to what add_hparams accepts.
 
@@ -794,106 +587,6 @@ def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
     fused = DEVICE.type == "cuda" and args.fused
     return torch.optim.AdamW(build_param_groups(model, args.weight_decay), lr=args.lr, weight_decay=args.weight_decay,
                              betas=(args.beta1, args.beta2), fused=fused)
-
-
-def fenced_json(payload: dict) -> str:
-    """A payload in the fenced block TensorBoard's TEXT tab renders as code.
-
-    default=str so a field json cannot represent -- a dtype, a device -- degrades
-    to its repr rather than taking the run down at step 0, before a single batch
-    has been seen.
-    """
-    return f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
-
-
-def parameter_census(model: torch.nn.Module) -> dict:
-    """Where a variant's parameters actually sit, bucketed by component_key.
-
-    The rule the param/grad/* tags already use, so a component's share of the
-    weights reads directly against its share of the gradient norm. That pairing
-    is the point: a block holding 30% of the parameters and 3% of the gradient
-    has stopped learning, and neither number says so on its own.
-
-    Counted through named_parameters(), which yields each shared tensor once
-    under its first name -- so a tied embedding is counted once, matching both
-    total_params in run() and the deduplication in gradient_norms.
-
-    non_embedding is called out separately because it is usually the honest
-    capacity axis, and it nets out BOTH vocabulary-sized tables -- the input
-    embedding and the output projection. Each is vocab_size * embed_dim whatever
-    the blocks are doing, identical across arms that share a tokeniser, and
-    easily large enough to dilute a real difference in the blocks into a rounding
-    error in the total. Subtracting only the input side would leave the output
-    head counted as block capacity whenever the two are untied, so the figure
-    would quietly mean different things depending on a config flag -- which is
-    the one thing a comparison axis must never do.
-    """
-    census: dict[str, int] = {}
-    footprint = 0
-    for name, param in model.named_parameters():
-        census[component_key(name)] = census.get(component_key(name), 0) + param.numel()
-        footprint += param.numel() * param.element_size()
-    total = sum(census.values())
-    vocabulary = census.get("Embedding", 0) + census.get("Projection", 0)
-    # named_parameters() deduplicates by default; the gap against the
-    # undeduplicated walk is the number of parameter slots that alias another,
-    # which is how weight tying shows up without asking the model about it. At 0
-    # the two tables above are genuinely separate and both were counted.
-    aliased = (sum(1 for _ in model.named_parameters(remove_duplicate=False))
-               - sum(1 for _ in model.named_parameters()))
-    return {"total": total,
-            "non_embedding": total - vocabulary,
-            "vocabulary": vocabulary,
-            "bytes": footprint,
-            "aliased_tensors": aliased,
-            "by_component": dict(sorted(census.items()))}
-
-
-def flop_census(model: torch.nn.Module, inputs: torch.Tensor, mask: torch.Tensor) -> dict:
-    """FLOPs for one training step, measured by dispatch rather than derived.
-
-    Counted through torch's FlopCounterMode, so this knows nothing about the
-    architecture in front of it -- the same reason the activation diagnostics
-    read off hooks rather than reaching inside. An arm with a different block
-    structure is counted correctly with no edit here, which a hand-rolled
-    2 * in * out formula per layer type could not promise.
-
-    Normalised per POSITION, not per real token. FLOPs are spent on padding just
-    the same, so dividing by the non-pad count would credit an arm with a
-    throughput it did not achieve. That makes this the one place in the script
-    where the denominator is deliberately not the one validate() uses.
-
-    attention_counted is part of the result rather than a footnote. FlopCounterMode
-    has formulas registered for the fused CUDA attention kernels but not for every
-    backend SDPA can dispatch to -- the CPU one has none -- and where there is no
-    formula the op contributes zero rather than failing. So the flag says which
-    number you are holding, and it matters that the shortfall is not uniform
-    across arms: it drops exactly the term an attention-heavy variant spends most
-    of its time in, which would flatter it against a feed-forward-heavy one.
-    """
-    was_training = model.training
-    model.train()
-    with FlopCounterMode(display=False) as counter:
-        model(inputs, mask)
-    forward = counter.get_total_flops()
-    with FlopCounterMode(display=False) as counter:
-        model(inputs, mask).sum().backward()
-    total = counter.get_total_flops()
-    ops = {str(op): int(value) for op, value
-           in counter.get_flop_counts().get("Global", {}).items()}
-    # A throwaway loss and no optimiser step, so the weights are untouched -- but
-    # that backward left gradients behind, and the caller's first real step must
-    # not inherit them.
-    model.zero_grad(set_to_none=True)
-    model.train(was_training)
-
-    positions = max(inputs.shape[0] * inputs.shape[1], 1)
-    return {"forward": forward,
-            "backward": total - forward,
-            "total": total,
-            "per_position": total / positions,
-            "attention_counted": any("scaled_dot_product" in op for op in ops),
-            "by_op": dict(sorted(ops.items(), key=lambda item: -item[1]))}
 
 
 def log_configs(writer: SummaryWriter, variant: Variant, config: ModelConfig, args,
@@ -1063,11 +756,11 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     if args.compile:
         LOGGER.info(f"  {label}: compile + warmup took {warmup_sec:.1f}s (excluded from timings)")
 
-    initial = diagnose_modules(model, data.diag, pad, causal)
+    initial = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
     curve: list[tuple[int, float, float]] = []
     elapsed, window_start = 0.0, None
     loss_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    loss_count, grad_totals, weight_totals = 0, {}, {}
+    loss_count, grad_totals, weight_totals, update_totals = 0, {}, {}, {}
     # Mirror loss_sum/loss_count: accumulated on device, resolved once per
     # evaluation, so per-step clipping telemetry adds no per-step sync.
     clip_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
@@ -1107,14 +800,15 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         loss = forward_backward(train.items[data.schedule[step - 1]])
         if args.amp:
             scaler.unscale_(optimiser)
-        # Snapshotted where train.py snapshots: after unscale_, so the numbers are
-        # true gradients rather than loss-scaled ones, and before clipping, so they
-        # describe the gradient the step produced rather than the one --grad-clip
-        # allowed through. Only on steps that will be logged -- train.py pays this
-        # every 100 steps, this pays it once per evaluation.
+        # Snapshotted where a training run snapshots: after unscale_, so the
+        # numbers are true gradients rather than loss-scaled ones, and before
+        # clipping, so they describe the gradient the step produced rather than
+        # the one --grad-clip allowed through. Only on steps that will be logged:
+        # once per evaluation here, once per --log-every window in training.
         if evaluating:
             grad_totals = gradient_norms(model)
             weight_totals = weight_norms(model)
+            before_step = snapshot_parameters(model)
         # clip_grad_norm_ returns the pre-clip total norm it measured. It runs
         # every step regardless, so taking the return is free -- and it is the
         # only way to see how OFTEN clipping fires, which the every-evaluation
@@ -1124,6 +818,9 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         clip_hits += (total_norm.detach() > args.grad_clip).float()
         clip_count += 1
         scaler.step(optimiser)
+        if evaluating:
+            update_totals = update_norms(model, before_step)
+            del before_step
         scaler.update()
         scheduler.step()
         # Accumulated on device: reading the loss every step would reintroduce
@@ -1147,13 +844,6 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("loss/val", val_loss, step, walltime=walltime)
             writer.add_scalar("loss/train", train_loss, step, walltime=walltime)
             writer.add_scalar("loss/gap", gap, step, walltime=walltime)
-            # Running AULC over steps: at each evaluation, the mean val loss of
-            # the run SO FAR. Charted rather than only summarised because the
-            # step it crosses another variant's trace is the step that arm's
-            # lead actually began, which a single end-of-run scalar cannot say.
-            # Cheap, and the clock is stopped here (see the window above).
-            writer.add_scalar("loss/aulc", aulc(curve, 0), step, walltime=walltime)
-            writer.add_scalar("loss/ppl_val", math.exp(min(val_loss, 20.0)), step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
             # Accumulated on device across the window, exactly like loss_sum above,
             # so the per-step pre-clip norm costs no per-step sync. grad_norm is
@@ -1168,18 +858,18 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             if args.amp:
                 writer.add_scalar("optim/grad_scale", scaler.get_scale(), step, walltime=walltime)
 
-            # param/grad/* uses train.py's buckets, so a variant's gradient trace
-            # reads against a real training run's without translating anything.
-            # param/weight/* is the same decomposition of the weights themselves,
-            # and exists so param/ratio/* can be formed: lr * ||grad|| / ||weight||
+            # param/* is the tree a training run writes, from the same code, so a
+            # variant's trace reads against a real run's without translating anything.
+            # param/norm/* is the same decomposition of the weights themselves,
+            # and exists so param/update_ratio/* can be formed: ||step update|| / ||weight||
             # is the scale-free number that says whether a component is learning
             # too fast or has stopped, which neither half tells you alone.
-            parameters = resolve_parameters(grad_totals, weight_totals,
-                                            scheduler.get_last_lr()[0])
+            parameters = resolve_parameters(grad_totals, weight_totals, update_totals)
             for tag, value in parameters.items():
                 writer.add_scalar(tag, value, step, walltime=walltime)
-            writer.add_scalar("perf/elapsed_sec", elapsed, step, walltime=walltime)
-            writer.add_scalar("perf/ms_per_step", elapsed / step * 1e3, step, walltime=walltime)
+            # Cumulative averages over `elapsed`, so ms/step and elapsed seconds
+            # would be this curve rescaled; the RELATIVE x-axis already shows the
+            # latter, since walltime = anchor + elapsed.
             writer.add_scalar("perf/tokens_per_sec",
                               train.total_inputs / len(train) * step / max(elapsed, 1e-9),
                               step, walltime=walltime)
@@ -1192,22 +882,18 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("perf/tflops",
                               flops_per_step * step / max(elapsed, 1e-9) / 1e12,
                               step, walltime=walltime)
-            if DEVICE.type == "cuda":
-                # A curve, not just the end-of-run number in summary.json: peak
-                # allocation moves with the step, and two arms can share a final
-                # peak while one of them spent the run near it.
-                writer.add_scalar("perf/peak_mem_mb",
-                                  torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2,
-                                  step, walltime=walltime)
+            # No peak-memory curve: the peak stats are reset once, before warmup,
+            # and every batch has the same shape, so it would sit at its final
+            # value from the first step. That value goes to summary.json and HPARAMS.
 
             collapse = None
             # Tracked over training, not just start/end: representation collapse
             # is a trajectory, and the depth profile is the thing to compare.
             if diag_index % args.diag_every == 0 or step == args.steps:
-                diagnostics = diagnose_modules(model, data.diag, pad, causal)
+                diagnostics = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
                 for tag, value in diagnostics.items():
                     writer.add_scalar(tag, value, step, walltime=walltime)
-                collapse = diagnostics.get("collapse/output/mean")
+                collapse = diagnostics.get("stream/collapse/mean")
             diag_index += 1
 
             postfix = {"train": f"{train_loss:6.3f}", "val": f"{val_loss:6.3f}",
@@ -1218,7 +904,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     progress.close()
 
-    final = diagnose_modules(model, data.diag, pad, causal)
+    final = diagnose_modules(model, data.diag, build_mask(data.diag, pad, causal), data.diag != pad)
     peak_mb = (torch.cuda.max_memory_allocated(DEVICE) / 1024 ** 2) if DEVICE.type == "cuda" else 0.0
     # Over steps, which every arm shares by construction, so this one is
     # comparable as it stands. The seconds-axis area is NOT computed here: it is
@@ -1259,8 +945,8 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         "warmup_sec": warmup_sec,
         "peak_mb": peak_mb,
         "tokens_per_sec": train.total_inputs / len(train) * args.steps / max(elapsed, 1e-9),
-        "collapse_start": layer_profile(initial, "collapse/output"),
-        "collapse_end": layer_profile(final, "collapse/output"),
+        "collapse_start": layer_profile(initial, "stream/collapse"),
+        "collapse_end": layer_profile(final, "stream/collapse"),
         "diagnostics": final,
         "param_norms": parameters,
     }
@@ -1343,7 +1029,7 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
 
     print(rule)
     print(f"\ntensorboard --logdir {run_dir}")
-    print("  loss/*, collapse/*, attn/*, ffn/*, param/* and perf/* carry the same tag in every")
+    print("  loss/*, stream/*, attn/*, ffn/*, param/* and perf/* carry the same tag in every")
     print("  run, so each chart overlays them all. attn/* and ffn/* hold the same four measurements")
     print("  per sublayer, so reading them side by side says which branch drove the block.")
     print("  Switch the x-axis to RELATIVE for loss against seconds of training compute")
