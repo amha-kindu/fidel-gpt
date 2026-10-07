@@ -178,6 +178,28 @@ def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, 
     )
 
 
+NO_DECAY_PARAMS: tuple[str, ...] = ()
+
+
+def build_param_groups(model: nn.Module, weight_decay: float, no_decay: tuple[str, ...] = NO_DECAY_PARAMS) -> list[dict]:
+    decayed: list[nn.Parameter] = []
+    undecayed: list[nn.Parameter] = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.rsplit(".", 1)[-1] in no_decay:
+            undecayed.append(param)
+        else:
+            decayed.append(param)
+
+    groups = [{"params": decayed, "weight_decay": weight_decay}]
+    if undecayed:
+        groups.append({"params": undecayed, "weight_decay": 0.0})
+
+    return groups
+
+
 def set_trainable_params(model: nn.Module, trainable_modules: dict, for_inference: bool = False):
     if trainable_modules is None and not for_inference:
         return  # leave all parameters trainable (full-model finetuning)

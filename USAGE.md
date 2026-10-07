@@ -97,7 +97,7 @@ python train.py \
 | `--seq-len` | `50` | Context window length |
 | `--ff-dim` | `2048` | Feed-forward inner dimension |
 | `--dropout` | `0.1` | Dropout probability |
-| `--norm-strategy` | `pre-ln` | Normalization scheme — one of `pre-ln`, `pre-rms`, `post-ln`, `post-rms`, `deepnorm`, `rootdepth-ln`, `rootdepth-rms` (see below) |
+| `--norm-strategy` | `pre-ln` | Normalization scheme — one of `pre-ln`, `pre-rms`, `post-ln`, `post-rms`, `deepnorm` (see below) |
 
 ##### Normalization strategies
 
@@ -113,29 +113,14 @@ attention or the feed-forward branch:
 | `pre-*` | `x + Sublayer(Norm(x))` | Default (`pre-ln`). Stable, needs a final `norm_f`. |
 | `post-*` | `Norm(x + Sublayer(x))` | Original Transformer placement; sensitive to warmup at depth. |
 | `deepnorm` | `LN(α·x + Sublayer(x))`, `α = (2N)^0.25` | Also down-scales the branch weights at init by `β = (8N)^-0.25` (feed-forward, attention output, and the V slice of the fused `Wqkv`). β applies to freshly initialized models only, not to `--resume` or `--init-weights`. |
-| `rootdepth-*` | `x + α·Sublayer(Norm(x))`, `α = gain/sqrt(2N)` | Pre-norm placement with both residual branches damped by `α`. `gain` is a `ModelConfig` field (default `1.0`) — see below. |
 
 `post-*` and `deepnorm` end each block in a normalization, so the final `norm_f` is allocated
 but unused.
 
 Checkpoints predating the `-ln`/`-rms` split carry the old names and need `norm_strategy`
-renamed before they will load: `pre` → `pre-ln`, `post` → `post-ln`, `rootdepth` →
-`rootdepth-rms` (old `rootdepth` used `RMSNorm` throughout). Checkpoints older than the flag
-itself carry `post_norm`, which `ModelConfig.__setstate__` maps to `pre`/`post` — the same
-rename then applies.
-
-##### `gain` under `rootdepth-*`
-
-Every embedding initializes at std `0.02`, so `gain` sets the balance between what the
-embedding contributes to the residual stream and what the `2N` damped branches add on top of
-it. At `gain = 1.0` and 6 layers the branches dominate the stream from the first block, and
-the token identity the LM head reads is largely buried at init; lowering `gain` restores it.
-
-A sweep at 6 layers × 64 dim found a broad optimum around `0.03`, with every value from
-`0.008` to `0.07` indistinguishable at that budget. `α` already carries a `(2N)^-0.5` factor,
-but the useful `gain` still depends on depth and embedding scale, so re-check it if either
-changes. `gain` is not exposed on `train.py`; set it through a config file, or per variant in
-`compare_models.py` (`--variant "a:norm_strategy=rootdepth-rms,gain=0.03"`).
+renamed before they will load: `pre` → `pre-ln`, `post` → `post-ln`. Checkpoints older than
+the flag itself carry `post_norm`, which `ModelConfig.__setstate__` maps to `pre`/`post` — the
+same rename then applies.
 
 #### Training hyperparameters
 

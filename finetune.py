@@ -16,7 +16,7 @@ from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from torch.utils.data import RandomSampler
 from dataset import FineTuningDataset, MultiTaskDataset, PackedFineTuningDataset
-from utils import EarlyStopping, init_sdp_backend, log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params
+from utils import EarlyStopping, build_param_groups, init_sdp_backend,log_confidence_metrics, log_gradients, log_weight_norms, save_checkpoint, set_trainable_params
 from train import validate
 
 
@@ -32,9 +32,8 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
     optimizer = torch.optim.AdamW(
-        params=[p for p in model.parameters() if p.requires_grad],
+        params=build_param_groups(model, config.weight_decay),
         lr=config.init_lr,
-        weight_decay=config.weight_decay,
         betas=(config.beta1, config.beta2),
         eps=config.epsilon
     )

@@ -21,7 +21,7 @@ from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
-from utils import EarlyStopping, init_sdp_backend, log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint
+from utils import EarlyStopping, build_param_groups, init_sdp_backend,log_gradients, log_weight_norms, log_confidence_metrics, save_checkpoint
 
 
 def data_size(paths: str) -> int:
@@ -54,9 +54,8 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
     optimizer = torch.optim.AdamW(
-        params=[p for p in model.parameters() if p.requires_grad],
+        params=build_param_groups(base_model, config.weight_decay),
         lr=config.init_lr,
-        weight_decay=config.weight_decay,
         betas=(config.beta1, config.beta2),
         eps=config.epsilon
     )
@@ -316,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, help="Dropout probability")
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--attn-dim", type=int, help="Dimensionality of the attention layer, i.e. what Wqkv projects up to and what the heads divide (default: embed_dim)")
-    parser.add_argument("--norm-strategy", type=str, default=None, choices=list(ModelConfig.NORM_STRATEGIES), help="Normalization scheme. The suffix picks the norm ('-ln' is LayerNorm, '-rms' is RMSNorm without bias); the prefix picks the placement: 'pre-*' is x + Sublayer(Norm(x)), 'post-*' is Norm(x + Sublayer(x)), 'rootdepth-*' is pre-norm with both branches scaled by alpha=gain/sqrt(2N). 'deepnorm' is post-LayerNorm with the residual scaled by alpha=(2N)^0.25 and branch weights by beta=(8N)^-0.25. N is n_decoders (default: pre-ln)")
+    parser.add_argument("--norm-strategy", type=str, default=None, choices=list(ModelConfig.NORM_STRATEGIES), help="Normalization scheme. The suffix picks the norm ('-ln' is LayerNorm, '-rms' is RMSNorm without bias); the prefix picks the placement: 'pre-*' is x + Sublayer(Norm(x)), 'post-*' is Norm(x + Sublayer(x)).'deepnorm' is post-LayerNorm with the residual scaled by alpha=(2N)^0.25 and branch weights by beta=(8N)^-0.25. N is n_decoders (default: pre-ln)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")

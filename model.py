@@ -159,8 +159,6 @@ class DecoderModule(nn.Module):
 
         if self.strategy == "deepnorm":
             self.alpha = (2 * config.n_decoders) ** 0.25
-        elif "rootdepth" in self.strategy:
-            self.alpha = config.gain * (2 * config.n_decoders) ** -0.5
         else:
             self.alpha = 1.0
 
@@ -186,10 +184,6 @@ class DecoderModule(nn.Module):
             x_update, new_kv = self.attention(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = self.norm1(self.alpha * x + self.dropout(x_update))
             x = self.norm2(self.alpha * x + self.dropout(self.feed_forward(x)))
-        elif "rootdepth" in self.strategy:
-            x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
-            x = x + self.alpha * self.dropout(x_update)
-            x = x + self.alpha * self.dropout(self.feed_forward(self.norm2(x)))
         else:
             x_update, new_kv = self.attention(self.norm1(x), attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             x = x + self.dropout(x_update)
@@ -305,7 +299,7 @@ class GPTmodel(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 elif isinstance(m, nn.Embedding):
-                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(m.weight, mean=0.0, std=config.embed_std)
                 elif isinstance(m, (nn.LayerNorm, nn.RMSNorm)):
                     if m.weight is not None:
                         nn.init.ones_(m.weight)
