@@ -148,6 +148,7 @@ same rename then applies.
 | `--max-checkpoints-to-keep` | `5` | Delete the oldest checkpoint once this many exist |
 | `--validate-every` | `100` | Run validation every N weight updates |
 | `--log-every` | `100` | Weight updates per diagnostics window: `loss/curves` train, `optim/*`, `param/*`, `perf/*` (see `DIAGNOSTICS.md`) |
+| `--gsnr-samples` | `64` | Sequences per `param/gsnr/*` and `optim/noise_scale` measurement: a fresh training batch, split into `--gsnr-chunks` chunks, independent of `--batch-size` (see `DIAGNOSTICS.md`) |
 | `--gsnr-chunks` | `8` | Chunks the probe batch is split into for `param/gsnr/*` and `optim/noise_scale` at each validation; below 2 disables them (see `DIAGNOSTICS.md`) |
 | `--vt-ratio` | `1.0` | Fraction of steps-since-last-validation to use as validation batch count |
 | `--es-patience` | `10000` | Early-stopping patience (in weight-update steps) |

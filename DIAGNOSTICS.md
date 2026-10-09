@@ -63,6 +63,7 @@ optim/
 ├── lr                          learning rate
 ├── grad_norm                   mean pre-clip global gradient norm over the window
 ├── clip_frac                   share of the window's steps that were clipped
+├── skip_frac                   share of the window's steps AMP skipped
 ├── grad_scale                  AMP loss scale (mixed precision only)
 └── noise_scale                 gradient noise scale ≈ critical batch size, in sequences
 param/
@@ -110,8 +111,8 @@ Read in forward-pass order, the probe families trace one token's path through th
 |---|---|---|
 | `loss/curves {train}`, `optim/*`, `param/*`, `perf/*` — except the two below | once per **window** of `log_every` optimiser steps (default 100) | the training batches |
 | `loss/curves {val}`, `loss/gap` | at every validation | the validation set |
-| `embedding/*` `attn/*` `ffn/*` `stream/*` `head/*` | at every validation | one **fixed probe batch**, drawn once from the validation data at the start of the run, with its labels |
-| `param/gsnr/*`, `optim/noise_scale` | at every validation | the same probe batch, split into `gsnr_chunks` chunks |
+| `embedding/*` `attn/*` `ffn/*` `stream/*` `head/*` | at every validation | one **fixed probe batch**, drawn once from the validation data at the start of the run |
+| `param/gsnr/*`, `optim/noise_scale` | at every validation | a **fresh training batch** of `gsnr_samples` sequences (default 64) the model has not been updated on, split into `gsnr_chunks` chunks |
 | `ModelCensus` | once, at step 0 | — |
 
 Every step is an **optimiser step**: under gradient accumulation, one step spans
@@ -180,8 +181,9 @@ can be negative early in a run; watch the trend.
 | tag | value | read it as |
 |---|---|---|
 | `optim/lr` | the scheduler's learning rate after the window's last step — the rate the **next** step will use | a sanity check that warmup and decay land where the schedule puts them |
-| `optim/grad_norm` | mean, over the window's steps, of the global gradient norm **before** clipping (after unscaling under AMP) | the gradient's size the optimiser was fed; spikes are the instability to look for |
-| `optim/clip_frac` | fraction of the window's steps whose pre-clip norm exceeded `max_norm` | whether `optim/lr` is telling the truth |
+| `optim/grad_norm` | mean, over the window's non-skipped steps, of the global gradient norm **before** clipping (after unscaling under AMP) | the gradient's size the optimiser was fed; spikes are the instability to look for |
+| `optim/clip_frac` | fraction of the window's non-skipped steps whose pre-clip norm exceeded `max_norm` | whether `optim/lr` is telling the truth |
+| `optim/skip_frac` | fraction of the window's steps whose gradient was not finite — under AMP, the steps `GradScaler` skipped | how many steps the window lost |
 | `optim/grad_scale` | the AMP loss scale at the window's end (mixed precision only) | repeated halving means steps are producing inf/NaN and being skipped |
 
 **`optim/clip_frac` near 1** means almost every step is rescaled to the clip threshold: the
@@ -189,8 +191,9 @@ step size is set by `max_norm`, not the learning rate, and the effective learnin
 not the one on `optim/lr`. Nothing else in the tree shows that.
 
 **`optim/grad_scale` falling** means the run is training on fewer steps than its x-axis
-says. A skipped step also reads as `param/update_ratio` exactly 0 if it lands on a window's
-last step.
+says; `optim/skip_frac` counts them. A skipped step is left out of `grad_norm` and
+`clip_frac` — its norm is inf, and one inf would make the whole window's mean inf — and
+reads as `param/update_ratio` exactly 0 if it lands on a window's last step.
 
 ---
 
@@ -282,10 +285,13 @@ on — and how much is **noise** from which sequences happened to be sampled. No
 the tree separates the two: `param/grad/*` and `optim/grad_norm` measure the gradient's
 size, which signal and noise both contribute to.
 
-Measured at every validation, on the fixed probe batch, as a step of its own:
+Measured at every validation as a step of its own, on a **fresh training batch** of
+`gsnr_samples` sequences (default 64) — one the model has not been updated on, a new one
+each time. It is the estimator's big batch and is independent of the training batch size;
+the chunks run one at a time, so memory follows the chunk size, not `gsnr_samples`.
 
-1. The probe batch is split into `K = gsnr_chunks` equal chunks of `b` sequences (default
-   `K = 8`).
+1. The batch is split into `K = gsnr_chunks` equal chunks of `b = gsnr_samples / K`
+   sequences (default `K = 8`, so `b = 8`).
 2. Each chunk's gradient `g_k` of the plain cross-entropy loss is taken separately, in eval
    mode, without touching the training step's gradients.
 3. Per group, from the chunk gradients:
@@ -658,10 +664,14 @@ across ranks.
 **`param/*` and the probes are snapshots**, taken at one step and on one batch respectively;
 `optim/*` and `perf/*` are window means. Expect the former to be noisier.
 
-**Gradient noise is measured on validation data, in eval mode, with plain cross-entropy.**
-The training gradient also carries dropout's noise and, when set, label smoothing, so
-`param/gsnr/*` reads the data's noise alone and `optim/noise_scale` the batch size that noise
-calls for.
+**Gradient noise is measured on training data**, the distribution the optimiser is
+minimising, in eval mode with plain cross-entropy — so dropout's noise and label smoothing
+are not part of it. A validation batch would add a persistent slope toward the validation
+distribution to the signal and read the noise scale low. Because the signal is measured
+at the weights the schedule left the model at, the noise scale rises roughly as `1/lr`
+during a decay and is unresolvable at its very end; read batch-size conclusions from the
+high-learning-rate part of the run. The batch is fresh each time, so single points jitter
+more than a fixed batch's would — read the trend.
 
 ---
 

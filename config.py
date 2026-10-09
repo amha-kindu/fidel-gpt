@@ -170,6 +170,9 @@ class TrainingConfig(Config):
         self.log_every: int = kwargs.get("log_every", 100)
         # Chunks the probe batch is split into for param/gsnr/* and optim/noise_scale; < 2 disables them.
         self.gsnr_chunks: int = kwargs.get("gsnr_chunks", 8)
+        # Sequences per param/gsnr/* and optim/noise_scale measurement: the estimator's big
+        # batch, drawn fresh from the training data and split into gsnr_chunks chunks.
+        self.gsnr_samples: int = kwargs.get("gsnr_samples", 64)
         self.training_data: str = kwargs.get("training_data", None)
         self.validation_data: str = kwargs.get("validation_data", None)
         self.finetuning: bool = kwargs.get("finetuning", False)
