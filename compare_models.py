@@ -36,6 +36,17 @@ overrides, given on the command line:
     --variant flat:model=model2.GPTWide           # a DIFFERENT architecture
     --variant flat6:model=model2.GPTWide,n_decoders=6
 
+A variant may also override its own training settings -- lr, weight_decay, beta1,
+beta2, grad_clip, warmup_frac and seed (init/dropout only; the data order stays
+the shared --seed's) -- so learning-rate and seed sweeps are just more arms:
+
+    --variant lr1e-3:lr=0.001 --variant lr2e-3:lr=0.002
+    --variant pen-lr2e-3:model=model2.StreamPenaltyModel,stream_penalty=0.01,lr=0.002
+    --variant s1:seed=1 --variant s2:seed=2
+
+Knobs that shape the shared batch schedule or timing (steps, batch_size,
+eval_every, ...) stay global flags; a variant that sets one is refused.
+
 `model=` is the one key that is not a ModelConfig field: it names an importable
 nn.Module subclass ('module.Class', or a bare 'Class' from model.py), and
 `--model` sets the default for variants that do not name one. So the comparison
@@ -116,6 +127,19 @@ DEFAULT_MODEL = "model.GPTmodel"
 
 # The one override key that is not a ModelConfig field.
 MODEL_KEY = "model"
+
+# Training knobs a variant may override alongside its ModelConfig fields, keyed by
+# the argparse dest they replace, with the type to coerce to. Only knobs that act
+# inside one arm's training belong here: `seed` re-seeds that arm's init and
+# dropout, while the data order stays pinned by the shared --seed (see DataPlan).
+TRAINING_KEYS = {"lr": float, "weight_decay": float, "beta1": float, "beta2": float,
+                 "grad_clip": float, "warmup_frac": float, "seed": int}
+
+# Run knobs that look per-arm but are not: they shape the shared batch schedule,
+# the evaluation grid or the timing setup, which every arm must agree on for the
+# comparison to mean anything. Named so the error can say where to set them.
+SHARED_RUN_KEYS = ("steps", "batch_size", "eval_every", "max_samples", "val_samples",
+                   "warmup_steps", "amp", "compile", "compile_mode")
 
 # Substrings that identify the attention submodule of a decoder block. Matched on
 # the attribute NAME, not on the type: the whole point of comparing two models is
@@ -212,14 +236,25 @@ def config_class(cls: type) -> type:
     return resolved
 
 
-def parse_overrides(text: str, default_model: str) -> tuple[dict, str | None]:
-    """key=value,... -> (config overrides, model path or None).
+def coerce_training(key: str, raw: str):
+    caster = TRAINING_KEYS[key]
+    try:
+        return caster(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{key}' expects {caster.__name__}, got '{raw}'")
+
+
+def parse_overrides(text: str, default_model: str) -> tuple[dict, dict, str | None]:
+    """key=value,... -> (config overrides, training overrides, model path or None).
 
     `model=` is pulled out rather than coerced, because it is the one key that
     names a class instead of a config field. It is also read FIRST, in a pass of
     its own, because which fields exist depends on which architecture this arm
     builds -- `cp_fast` is a real field for RotaryScaleGPT and a typo for
     anything else, and that cannot be decided before the class is known.
+
+    Keys in TRAINING_KEYS (lr, weight_decay, ...) are training overrides rather
+    than config fields; a key that is both is refused rather than guessed at.
     """
     items = []
     model = None
@@ -239,7 +274,21 @@ def parse_overrides(text: str, default_model: str) -> tuple[dict, str | None]:
         items.append((key, value))
 
     template = config_class(resolve_model(model or default_model))()
-    return {key: coerce(key, value, template) for key, value in items}, model
+    config, training = {}, {}
+    for key, value in items:
+        if key in TRAINING_KEYS:
+            if hasattr(template, key):
+                raise argparse.ArgumentTypeError(
+                    f"'{key}' is both a training setting and a {type(template).__name__} "
+                    "field, so it is ambiguous here; rename the config field")
+            training[key] = coerce_training(key, value)
+        elif key in SHARED_RUN_KEYS and not hasattr(template, key):
+            raise argparse.ArgumentTypeError(
+                f"'{key}' is shared by every variant (it shapes the common batch schedule, "
+                f"evaluation grid or timing); set it with --{key.replace('_', '-')}")
+        else:
+            config[key] = coerce(key, value, template)
+    return config, training, model
 
 
 def resolve_model(path: str) -> type:
@@ -270,7 +319,8 @@ class Variant(NamedTuple):
     label: str
     model: str          # dotted path, kept for the report and summary.json
     cls: type
-    overrides: dict
+    overrides: dict     # ModelConfig fields
+    training: dict      # TRAINING_KEYS, replacing the matching flags for this arm only
 
 
 def parse_variant(text: str, default_model: str) -> Variant:
@@ -282,9 +332,19 @@ def parse_variant(text: str, default_model: str) -> Variant:
     name = name.strip()
     if not name:
         raise argparse.ArgumentTypeError(f"variant '{text}' has an empty name")
-    overrides, model = parse_overrides(spec, default_model)
+    overrides, training, model = parse_overrides(spec, default_model)
     model = model or default_model
-    return Variant(name, model, resolve_model(model), overrides)
+    return Variant(name, model, resolve_model(model), overrides, training)
+
+
+def variant_args(args: argparse.Namespace, variant: Variant) -> argparse.Namespace:
+    """The run arguments as this arm sees them: the flags, with its training overrides on top."""
+    return argparse.Namespace(**{**vars(args), **variant.training})
+
+
+def describe(variant: Variant) -> str:
+    settings = {**variant.overrides, **variant.training}
+    return ", ".join(f"{key}={value}" for key, value in settings.items()) or "no overrides"
 
 
 # --------------------------------------------------------------------------- #
@@ -653,13 +713,16 @@ def log_configs(writer: SummaryWriter, variant: Variant, config: ModelConfig, ar
          "base_config": args.base_config}), 0)
     writer.add_text("Variant", fenced_json(
         {"label": variant.label, "model": variant.model, "overrides": variant.overrides,
-         "data_fingerprint": fingerprint}), 0)
+         "training": variant.training, "data_fingerprint": fingerprint}), 0)
     writer.add_text("Environment", fenced_json(ENV), 0)
 
 
 def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         pad: int, causal: torch.Tensor, run_dir: str) -> dict:
     label, overrides = variant.label, variant.overrides
+    # Everything below reads this arm's own training settings (lr, seed, ...) off
+    # `args`, including the ComparisonConfig and hparams it logs.
+    args = variant_args(args, variant)
     # Checked BEFORE anything is built, so a variant that would train on data the
     # baseline never saw fails immediately rather than after producing a full set
     # of plausible-looking curves that are not comparable to anything.
@@ -960,6 +1023,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         "label": label,
         "model": variant.model,
         "overrides": overrides,
+        "training": variant.training,
         "config": config.to_dict(),
         "data_fingerprint": observed,
         "attn_params": attn_params,
@@ -1076,7 +1140,8 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
                    "args": {k: v for k, v in vars(args).items()
                             if k not in ("base_config", "variants")},
                    "base_config": args.base_config,
-                   "variants": [{"label": v.label, "model": v.model, "overrides": v.overrides}
+                   "variants": [{"label": v.label, "model": v.model, "overrides": v.overrides,
+                                 "training": v.training}
                                 for v in args.variants],
                    "data_fingerprint": fingerprint,
                    "results": results}, handle, indent=2, default=str)
@@ -1100,7 +1165,9 @@ def parse_args() -> argparse.Namespace:
                              "rest are reported against. Any ModelConfig field is settable, so an "
                              "ablation needs no code change; 'model=<module.Class>' additionally "
                              "trains a DIFFERENT architecture in that arm, e.g. "
-                             "'flat:model=model2.GPTWide'. With none given the run trains only "
+                             "'flat:model=model2.GPTWide'. Per-arm training settings ("
+                             f"{', '.join(TRAINING_KEYS)}) are accepted too, e.g. "
+                             "'hot:lr=0.002'. With none given the run trains only "
                              f"the baseline (default: {'; '.join(DEFAULT_VARIANTS)})")
     parser.add_argument("--model", default=DEFAULT_MODEL, metavar="module.Class",
                         help="Model class for variants that do not name one themselves. Any "
@@ -1209,8 +1276,11 @@ def parse_args() -> argparse.Namespace:
         # since that is the one every variant inherits from unless it names its
         # own. A field only that architecture defines is therefore settable here
         # and lands in base_config for the arms that can read it.
-        shared, shared_model = parse_overrides(args.config, args.model)
+        shared, shared_training, shared_model = parse_overrides(args.config, args.model)
         args.base_config.update(shared)
+        # Training keys in --config are just another spelling of their flags.
+        for key, value in shared_training.items():
+            setattr(args, key, value)
         # --config model=... is the same knob as --model, so an explicit --model wins
         # and otherwise either spelling sets the default the variants inherit.
         args.model = args.model if args.model != DEFAULT_MODEL else (shared_model or args.model)
@@ -1293,8 +1363,7 @@ def main() -> None:
                 f"batches {'preloaded' if preload else 'streamed'} ({footprint / 1024 ** 2:.0f} MiB)")
     described = []
     for variant in args.variants:
-        overrides = ", ".join(f"{key}={value}" for key, value in variant.overrides.items())
-        described.append(f"{variant.label} = {variant.model} ({overrides or 'no overrides'})")
+        described.append(f"{variant.label} = {variant.model} ({describe(variant)})")
     LOGGER.info(f"variants: {'; '.join(described)}")
     if len(args.variants) == 1:
         LOGGER.warning("only one variant -- this trains a baseline and compares it to itself. "
