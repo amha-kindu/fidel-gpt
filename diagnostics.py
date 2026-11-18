@@ -116,6 +116,19 @@ def diagnose_modules(model: torch.nn.Module, inputs: torch.Tensor,
     if not sites:
         return {}                       # a model without probed modules emits nothing, not zeros
 
+    # Two probes of one family on one module write the same tags, and the Recorder
+    # keeps the last -- which for attn/ffn is measured against a residual stream the
+    # first one already advanced (ProbeContext.residual_stream). Fail instead.
+    seen: dict[tuple[int, str], str] = {}
+    for name, module, probe in sites:
+        key = (id(module), probe.family)
+        if key in seen:
+            raise RuntimeError(
+                f"probe family '{probe.family}' is registered more than once for '{name}' "
+                f"({type(module).__name__}). A subclass is already matched by its base "
+                "class's isinstance probe; register a new family name instead.")
+        seen[key] = name
+
     rec = Recorder()
     ctx = probes.ProbeContext(valid)
     handles = []
