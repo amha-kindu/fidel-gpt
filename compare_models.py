@@ -43,6 +43,14 @@ is between arbitrary architectures, not only between configurations of one -- an
 neither a class name nor a config field name is hardcoded anywhere in this file.
 `--config` sets the shared config base every variant starts from.
 
+muP (mup.py) is model config: mup_width names the width the lr was tuned at, and
+wider arms then train with per-layer lr / init / weight decay that keep their
+dynamics the base's. At the base width it is the standard model exactly:
+
+    --embed-dim 128 --ff-dim 512 --heads 4 --lr 0.006
+    --variant "base:mup_width=128"
+    --variant "w512:embed_dim=512,heads=8,ff_dim=1362,mup_width=128,mup_ff=512,mup_head=32"
+
 Nothing in this script knows what is inside a model beyond two structural
 assumptions, both of which GPTmodel subclasses satisfy for free: the blocks live
 in `model.decoders`, and each block holds exactly one attention submodule whose
@@ -82,6 +90,7 @@ from dataset import TextStreamDataset
 from diagnostics import (ClipStats, GradientEstimator, diagnose_modules, fenced_json, flop_census, gradient_norms,
                          parameter_census, resolve_parameters, snapshot_parameters,
                          update_norms, weight_norms)
+import mup
 from utils import build_param_groups, get_causal_mask
 
 # model classes are NOT imported here: every arm names its own, and resolve_model
@@ -608,7 +617,7 @@ def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
     # CUDA, and applies identically to every variant, so it does not tilt the
     # comparison it speeds up.
     fused = DEVICE.type == "cuda" and args.fused
-    return torch.optim.AdamW(build_param_groups(model, args.weight_decay), lr=args.lr, weight_decay=args.weight_decay,
+    return torch.optim.AdamW(build_param_groups(model, args.weight_decay, lr=args.lr), lr=args.lr, weight_decay=args.weight_decay,
                              betas=(args.beta1, args.beta2), fused=fused)
 
 
@@ -694,6 +703,8 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     # that were asked for.
     config = getattr(model, "config", config)
     log_configs(writer, variant, config, args, observed)
+    if mup.enabled(config):
+        LOGGER.info(f"  {label}: {mup.describe(model)}")
 
     # Measured on the eager module and on a real training batch, so the FLOPs are
     # the ones a step actually costs at this shape. Before the compile below and
