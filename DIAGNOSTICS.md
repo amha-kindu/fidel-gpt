@@ -22,9 +22,10 @@ tensorboard --logdir <tb_log_dir>
     - [`loss/gap`](#lossgap)
   - [`optim/*` — the optimiser](#optim--the-optimiser)
   - [`param/*` — where the gradient goes and what it moves](#param--where-the-gradient-goes-and-what-it-moves)
-    - [`param/grad/<group>`](#paramgradgroup)
-    - [`param/norm/<group>`](#paramnormgroup)
+    - [`param/grad_rms/<group>`](#paramgrad_rmsgroup)
+    - [`param/rms_norm/<group>`](#paramrms_normgroup)
     - [`param/update_ratio/<group>`](#paramupdate_ratiogroup)
+    - [`param/norm/<group>/<site>`](#paramnormgroupsite)
   - [`perf/*` — cost](#perf--cost)
   - [Gradient noise — `param/gsnr/*` and `optim/noise_scale`](#gradient-noise--paramgsnr-and-optimnoise_scale)
     - [`param/gsnr/<group>`](#paramgsnrgroup)
@@ -35,12 +36,11 @@ tensorboard --logdir <tb_log_dir>
     - [The shared measurements](#the-shared-measurements)
     - [`embedding/*` — what the embedding table hands the stack](#embedding--what-the-embedding-table-hands-the-stack)
     - [`attn/*` and `ffn/*` — sublayer health](#attn-and-ffn--sublayer-health)
-      - [`<s>/input_norm`](#sinput_norm)
       - [`<s>/update_ratio`](#supdate_ratio)
       - [`<s>/update_cos`](#supdate_cos)
       - [`<s>/update_isotropy`](#supdate_isotropy)
     - [`stream/*` — the residual stream between blocks](#stream--the-residual-stream-between-blocks)
-      - [`stream/norm`](#streamnorm)
+      - [`stream/rms_norm`](#streamrms_norm)
       - [`stream/collapse`](#streamcollapse)
     - [`head/*` — what the output head reads and how sharply it answers](#head--what-the-output-head-reads-and-how-sharply-it-answers)
   - [TEXT — `ModelCensus`](#text--modelcensus)
@@ -61,15 +61,15 @@ loss/
 └── gap                         val − train
 optim/
 ├── lr                          learning rate
-├── grad_norm                   mean pre-clip global gradient norm over the window
-├── clip_frac                   share of the window's steps that were clipped
+├── grad_raw                    mean pre-clip global gradient L2 norm over the window├── clip_frac                   share of the window's steps that were clipped
 ├── skip_frac                   share of the window's steps AMP skipped
 ├── grad_scale                  AMP loss scale (mixed precision only)
 └── noise_scale                 gradient noise scale ≈ critical batch size, in sequences
 param/
-├── grad/<group>                ‖grad‖, before clipping
-├── norm/<group>                ‖W‖, before the optimiser step
-├── update_ratio/<group>        ‖W_after − W_before‖ / ‖W_before‖ across one step
+├── grad_rms/<group>            rms(grad), before clipping
+├── rms_norm/<group>            rms(W), before the optimiser step
+├── norm/<group>/<site>         rms of a norm layer's gains — norm1, norm2, norm_f
+├── update_ratio/<group>        rms(W_after − W_before) / rms(W_before) across one step
 └── gsnr/<group>                gradient signal-to-noise ratio, per sequence
 perf/
 ├── tokens_per_sec              non-pad input tokens per second of training
@@ -79,22 +79,18 @@ embedding/                      the embedding table's output             (layer_
 ├── isotropy                    share of the available directions in use
 └── collapse                    mean pairwise cosine between distinct token ids
 attn/                           the attention sublayer, per block
-├── input_norm                  ‖input‖ — norm1's gains under pre-norm
-├── update_ratio                ‖update‖ / ‖stream‖
+├── update_ratio                rms(update) / rms(stream)
 ├── update_cos                  cos(update, stream)
 └── update_isotropy             share of the available directions the update uses
-ffn/                            the feed-forward sublayer, per block — same four
-├── input_norm                  ‖input‖ — norm2's gains under pre-norm
+ffn/                            the feed-forward sublayer, per block — same three
 ├── update_ratio
 ├── update_cos
 └── update_isotropy
 stream/                         each block's output, per block
-├── norm                        ‖x‖ of the residual stream
+├── rms_norm                    rms(x) of the residual stream
 └── collapse                    mean pairwise cosine between tokens
 head/                           the output projection                    (layer_00)
-├── input_norm                  ‖input‖ — norm_f's gains under pre-norm
 ├── isotropy                    of what the head reads
-├── collapse                    of what the head reads
 └── logit_std                   per-token spread of the logits
 TEXT
 └── ModelCensus                 parameter counts per group, FLOPs per batch by op
@@ -127,19 +123,25 @@ that closes a window.
 ## Conventions
 
 **Per layer, always.** A probe measured in more than one decoder block is written once per
-block, plus three reductions over blocks:
+block, plus two reductions over blocks:
 
 ```
 stream/collapse/layer_00   stream/collapse/layer_01   ...
-stream/collapse/mean       stream/collapse/min        stream/collapse/max
+stream/collapse/mean       stream/collapse/std
 ```
 
 A mean alone hides a single bad layer: one collapsing block in a six-block stack moves the
-mean by a sixth of its excursion. `/min` and `/max` make a single-layer anomaly visible on a
-summary chart; when they part from `/mean`, open the per-layer chart.
+mean by a sixth of its excursion. `/std` — the population standard deviation across blocks —
+makes a single-layer anomaly visible on a summary chart; when it jumps, open the per-layer
+chart. It replaces `/min` and `/max`, which as extremes widen with every block added and so
+read differently at different depths.
 
-A probe measured in **one place** — `embedding/*`, `head/*` — has only `layer_00`. Its mean,
-min and max would be three more copies of the same number.
+`/mean` and `/std` still move with depth for any metric that trends along the stack
+(`stream/rms_norm` under `pre-*` grows with depth, so a deeper model's mean is larger).
+Compare models of different depth layer by layer.
+
+A probe measured in **one place** — `embedding/*`, `head/*` — has only `layer_00`. Its mean
+would be another copy of the same number and its std 0.
 
 **Masked reductions.** Every probe reduction runs over valid (non-pad) positions only.
 Padding tokens share one embedding, so pad–pad pairs would sit at cosine ≈ 1 and inflate
@@ -181,8 +183,7 @@ can be negative early in a run; watch the trend.
 | tag | value | read it as |
 |---|---|---|
 | `optim/lr` | the scheduler's learning rate after the window's last step — the rate the **next** step will use | a sanity check that warmup and decay land where the schedule puts them |
-| `optim/grad_norm` | mean, over the window's non-skipped steps, of the global gradient norm **before** clipping (after unscaling under AMP) | the gradient's size the optimiser was fed; spikes are the instability to look for |
-| `optim/clip_frac` | fraction of the window's non-skipped steps whose pre-clip norm exceeded `max_norm` | whether `optim/lr` is telling the truth |
+| `optim/grad_raw` | mean, over the window's non-skipped steps, of the global gradient L2 norm **before** clipping (after unscaling under AMP) — the number `max_norm` is compared against | the gradient's size the optimiser was fed; spikes are the instability to look for || `optim/clip_frac` | fraction of the window's non-skipped steps whose pre-clip norm exceeded `max_norm` | whether `optim/lr` is telling the truth |
 | `optim/skip_frac` | fraction of the window's steps whose gradient was not finite — under AMP, the steps `GradScaler` skipped | how many steps the window lost |
 | `optim/grad_scale` | the AMP loss scale at the window's end (mixed precision only) | repeated halving means steps are producing inf/NaN and being skipped |
 
@@ -191,7 +192,7 @@ step size is set by `max_norm`, not the learning rate, and the effective learnin
 not the one on `optim/lr`. Nothing else in the tree shows that.
 
 **`optim/grad_scale` falling** means the run is training on fewer steps than its x-axis
-says; `optim/skip_frac` counts them. A skipped step is left out of `grad_norm` and
+says; `optim/skip_frac` counts them. A skipped step is left out of `grad_raw` and
 `clip_frac` — its norm is inf, and one inf would make the whole window's mean inf — and
 reads as `param/update_ratio` exactly 0 if it lands on a window's last step.
 
@@ -199,8 +200,10 @@ reads as `param/update_ratio` exactly 0 if it lands on a window's last step.
 
 ## `param/*` — where the gradient goes and what it moves
 
-Three families over one decomposition of the parameters, all taken at the **last step of
-each window**:
+Four families over one decomposition of the parameters, all taken at the **last step of
+each window**. Every size is an **RMS** — the L2 norm over √(element count) — so it does not
+grow with a group's size: groups of different sizes, and models of different widths, read on
+one axis. Ratios are unchanged by this.
 
 | group | covers |
 |---|---|
@@ -209,25 +212,27 @@ each window**:
 | `Projection` | the output head |
 | `NormF` | everything else — `norm_f` in the standard model |
 
-### `param/grad/<group>`
+### `param/grad_rms/<group>`
 
-‖grad‖ per group, after unscaling and **before** clipping, so it describes the gradient the
-step produced rather than what clipping let through. The groups' root summed square is that
-step's global pre-clip norm — one sample of what `optim/grad_norm` averages.
+rms(grad) per group, over the elements that received a gradient, after unscaling and
+**before** clipping, so it describes the gradient the step produced rather than what
+clipping let through. `optim/grad_raw` stays the global **L2** norm, because that is what
+`max_norm` is compared against.
 
 Compare a group's share of the gradient with its share of the parameters in
 `ModelCensus`: a block holding 30% of the weights and 3% of the gradient has stopped
 learning, and neither number says so alone.
 
-### `param/norm/<group>`
+### `param/rms_norm/<group>`
 
-‖W‖ per group, before the optimiser step — named to mirror `stream/norm`. On its own it
-mostly tracks initialisation and weight decay; its job is to be the denominator of the
-ratio below.
+rms(W) per group, before the optimiser step. On its own it mostly tracks initialisation and
+weight decay; its job is to be the denominator of the ratio below. RMS removes the group's
+size but not the init: a hidden matrix starts at rms ∝ 1/√fan_in, so across widths it still
+reads lower in the wider model.
 
 ### `param/update_ratio/<group>`
 
-`‖W_after − W_before‖ / ‖W_before‖` across one optimiser step: the fraction of its own
+`rms(W_after − W_before) / rms(W_before)` across one optimiser step: the fraction of its own
 magnitude a group **actually moved**.
 
 ```
@@ -238,20 +243,32 @@ magnitude a group **actually moved**.
 
 It is **measured, not predicted from the gradient**. Under AdamW each element moves by
 roughly `lr` whatever its gradient's size, plus the decoupled weight decay, so
-`lr · ‖grad‖ / ‖W‖` would track the gradient's scale rather than the step. The measured
+`lr · rms(grad) / rms(W)` would track the gradient's scale rather than the step. The measured
 update already includes clipping, Adam's normalisation, weight decay and the scheduled
 learning rate.
 
 The only **scale-free** number in this section, and therefore the only one comparable
 *between groups* and *between runs* of different widths or initialisations.
 
-Only trainable parameters contribute to the update; `param/norm` counts every parameter.
-With part of a group frozen (LoRA, partial fine-tuning), the ratio is the trainable part's
-movement relative to the whole group.
+Only trainable parameters move, but the update's rms is taken over **every** element of the
+group, frozen ones counting as zero movement — the same elements `param/rms_norm` averages over,
+so the ratio equals the L2 ratio exactly. With part of a group frozen (LoRA, partial
+fine-tuning), it is the trainable part's movement relative to the whole group.
 
 Costs one copy of the trainable weights per window.
 
-All three are single-step samples, so expect them to be noisier than the window means in
+### `param/norm/<group>/<site>`
+
+The rms of one norm layer's elementwise gains: `norm1` and `norm2` under each
+`Decoder<i>`, `norm_f` under `NormF` (e.g. `param/norm/Decoder3/norm2`,
+`param/norm/NormF/norm_f`). 1 at init. A norm the forward pass never calls — `norm_f` under
+`post-*` and `deepnorm` — gets no gradient and is left out rather than logged as a flat 1.
+
+A norm's output has rms ≈ this gain whatever its input, so under `pre-*` it is the scale
+attention (`norm1`), the feed-forward (`norm2`) and the head (`norm_f`) are actually handed.
+Under `post-*` and `deepnorm` it is roughly where `stream/rms_norm` sits.
+
+All four are single-step samples, so expect them to be noisier than the window means in
 `optim/*`.
 
 ---
@@ -282,7 +299,7 @@ compute. Tokens count non-pad inputs only.
 
 How much of the gradient is **signal** — the direction the whole data distribution agrees
 on — and how much is **noise** from which sequences happened to be sampled. Nothing else in
-the tree separates the two: `param/grad/*` and `optim/grad_norm` measure the gradient's
+the tree separates the two: `param/grad_rms/*` and `optim/grad_raw` measure the gradient's
 size, which signal and noise both contribute to.
 
 Measured at every validation as a step of its own, on a **fresh training batch** of
@@ -387,11 +404,18 @@ attention was handed the stream itself (post-norm, DeepNorm), the feed-forward's
 is the stream too. Only tensor identity is inspected, never the norm strategy, so the same
 code reads every placement.
 
+Under `deepnorm` each update is added to `alpha · x`, not `x` (`alpha = (2N)^0.25`, set by
+depth), so the stream is taken as `alpha · x` — the block's `alpha`, 1 everywhere else.
+Against the unscaled `x`, `update_ratio` would read `alpha` times too high, and by more in
+a deeper model.
+
 ### The shared measurements
 
 Four quantities recur across families, each defined once.
 
-**norm** — mean ‖x‖ over valid tokens.
+**norm** — mean per-token rms(x) = ‖x‖/√width over valid tokens. RMS rather than ‖x‖ so the
+value is a per-coordinate scale that reads the same at any `embed_dim` (the quantity muP
+holds fixed); every ratio of two such sizes is unchanged.
 
 **collapse** — mean pairwise cosine similarity between token representations, over pairs
 **within each sequence**, excluding self-pairs and any pair touching padding.
@@ -435,7 +459,7 @@ The head's mirror image, read off the embedding table's output. Measured once (`
 | `embedding/collapse` | mean pairwise cosine between **distinct** token ids in the probe batch | ≈ 0 |
 
 **`embed_std`** is the scale block 0's residual stream starts at, and so what block 0's
-`update_ratio`s are measured against. Watch it against `stream/norm` at layer 0: under
+`update_ratio`s are measured against. Watch it against `stream/rms_norm` at layer 0: under
 pre-norm the embedding is a small fraction of the stream from the first block on.
 
 **`collapse` uses distinct ids**, one vector per id present in the batch, with pairs taken
@@ -443,41 +467,30 @@ across the whole batch. Repeats of one id embed identically, so the per-sequence
 elsewhere would mostly measure how often the batch repeats itself, not how far apart the
 table keeps its words. Rising means the table is pulling its words together.
 
-There is no `input_norm` here: the table's input is token ids.
-
 ---
 
 ### `attn/*` and `ffn/*` — sublayer health
 
-Both residual branches carry the **same four measurements under the same definitions**,
+Both residual branches carry the **same three measurements under the same definitions**,
 computed by one shared function so they cannot drift apart. That is what makes the pair
 useful: a block-level number says something changed, and the pair says **which branch did
 it**.
 
 | tag | attention | feed-forward |
 |---|---|---|
-| `input_norm` | `attn/input_norm` | `ffn/input_norm` |
 | `update_ratio` | `attn/update_ratio` | `ffn/update_ratio` |
 | `update_cos` | `attn/update_cos` | `ffn/update_cos` |
 | `update_isotropy` | `attn/update_isotropy` | `ffn/update_isotropy` |
 
 Below, `<s>` stands for either prefix.
 
-#### `<s>/input_norm`
-
-Mean ‖input‖ of what the sublayer was **handed**.
-
-Under `pre-*` that is `norm1(x)` for attention and `norm2(x)` for the feed-forward, whose
-size is set entirely by the norm's learned gains: the stream's own scale is divided out.
-So this pair, with `head/input_norm` for `norm_f`, **tracks every norm in the model**. It
-reads √`embed_dim` at init (unit gains), and moves exactly as the gains learn.
-
-Under `post-*` and `deepnorm` the sublayer reads the stream itself, so this repeats a
-`stream/norm` value rather than reading any gains.
+There is no input-size tag: under `pre-*` the input is a norm's output, whose size is the
+norm's gains (`param/norm/<group>/<site>`); under `post-*` and `deepnorm` it is the stream,
+already in `stream/rms_norm`.
 
 #### `<s>/update_ratio`
 
-`mean(‖update‖) / mean(‖stream‖)` — the sublayer's gain into the residual stream (a ratio
+`mean(rms(update)) / mean(rms(stream))` — the sublayer's gain into the residual stream (a ratio
 of means, not a mean of ratios).
 
 ```
@@ -485,11 +498,11 @@ of means, not a mean of ratios).
 →0     the branch has switched itself off; the residual path is routing around it
 ```
 
-Under pre-norm, block 0's stream is the bare embedding — about `embed_std · √embed_dim`,
+Under pre-norm, block 0's stream is the bare embedding — rms about `embed_std`,
 small — so block 0's ratios read well above 1 at init. That is real: early in training the
 branches swamp the embedding. On a six-block, 64-wide pre-norm model at init,
 `attn/update_ratio` measured ≈ 9 at layer 0 and ≈ 0.5 at layer 5, as the stream grew from
-≈ 1.9 to ≈ 12. Read each block against its own trajectory before reading an absolute value
+rms ≈ 0.24 to ≈ 1.5. Read each block against its own trajectory before reading an absolute value
 as a fault.
 
 #### `<s>/update_cos`
@@ -535,14 +548,14 @@ pair of blocks, and the last block's output is what `norm_f` and the head read.
 
 | tag | measures |
 |---|---|
-| `stream/norm` | mean ‖x‖ of the residual stream — the scale every `attn/*` and `ffn/*` update is measured against |
+| `stream/rms_norm` | mean rms(x) of the residual stream — the scale every `attn/*` and `ffn/*` update is measured against |
 | `stream/collapse` | [collapse](#the-shared-measurements) of the stream, within each sequence |
 
-#### `stream/norm`
+#### `stream/rms_norm`
 
 Under `pre-*` the stream is never normalised, so it grows with depth as each branch adds to
 it; that growth is what pre-norm does not bound, and the thing to watch. Under `post-*` and
-`deepnorm` every block ends in a norm, so it sits near √`embed_dim` times that norm's gains.
+`deepnorm` every block ends in a norm, so it sits near that norm's gain (`param/norm/Decoder<i>/norm2`).
 
 #### `stream/collapse`
 
@@ -563,19 +576,17 @@ nothing target-relative — accuracy, calibration, per-token loss — is here.
 
 | tag | measures |
 |---|---|
-| `head/input_norm` | mean ‖input‖ of what the head reads. Under `pre-*` that is `norm_f`'s output, so it tracks `norm_f`'s learned gains (√`embed_dim` at init); under `post-*` and `deepnorm` it is the last block's output |
 | `head/isotropy` | [isotropy](#the-shared-measurements) of the head's input |
-| `head/collapse` | [collapse](#the-shared-measurements) of the head's input |
 | `head/logit_std` | per-token spread of the logits across the vocabulary |
 
 **`head/isotropy`** is the head's raw material: a rank-starved input caps what any head can
 discriminate, however well trained. Read it against the last block's
 `ffn/update_isotropy` to see whether the narrowing happened in the stack or at `norm_f`.
 
-**`head/collapse` against the last layer of `stream/collapse`** is what `norm_f` does to
-collapse. Under `-rms`, `norm_f` only rescales each token and weights channels by its gains,
-so the two start equal and part only as those gains learn. Under `-ln` the per-token
-centring moves it as well.
+There is no `head/collapse`: the head reads the last block's output, or under `pre-*` a
+per-token rescale of it, so it would repeat the last layer of `stream/collapse` (to within
+1e-3 under `pre-ln`) for the cost of another (B, S, S) cosine matrix. The input's size is
+`param/norm/NormF/norm_f` under `pre-*` and the last `stream/rms_norm` otherwise.
 
 **`head/logit_std`** is the temperature the head has taught itself. Rising while
 `loss/curves {val}` is flat is a head sharpening rather than learning.
@@ -610,9 +621,9 @@ The diagnostic that identifies a *cause* is usually a combination.
 
 | pattern | reading |
 |---|---|
-| `optim/grad_norm` spiking **+** one branch's `update_ratio` high | that branch is over-writing the stream — lower the learning rate or check its output scale |
+| `optim/grad_raw` spiking **+** one branch's `update_ratio` high | that branch is over-writing the stream — lower the learning rate or check its output scale |
 | `optim/clip_frac` → 1 | the step size is set by `max_norm`, not `optim/lr` |
-| `param/update_ratio/<group>` ≪ others **+** `param/grad/<group>` small | that group has stopped learning |
+| `param/update_ratio/<group>` ≪ others **+** `param/grad_rms/<group>` small | that group has stopped learning |
 | `param/gsnr/<group>` ≪ 1 **+** `param/update_ratio/<group>` healthy | that group is moving, but mostly on noise |
 | `param/gsnr/*` falling **+** `loss/gap` widening | the gradient is turning into noise the model is fitting |
 | `optim/noise_scale` ≫ sequences per step | a larger batch would buy fewer steps; the batch is below the critical size |
@@ -622,14 +633,14 @@ The diagnostic that identifies a *cause* is usually a combination.
 | `stream/collapse` flat **+** `attn/update_isotropy` falling | heads converging onto a single operator |
 | either `update_ratio` → 0 | that branch is being routed around; its parameters are dead weight |
 | `attn/update_ratio` ≫ `ffn/update_ratio` (or the reverse) | the block is effectively one branch |
-| `stream/norm` growing without bound | residual-stream blow-up — find the branch whose `update_ratio` stays high while it grows |
-| `stream/norm` growing **+** `update_ratio` falling at a steady ‖update‖ | the stream is outgrowing the branches; deeper blocks are losing their say |
-| `attn/input_norm` and `ffn/input_norm` diverging under `pre-*` | `norm1` and `norm2` gains have learned different scales |
+| `stream/rms_norm` growing without bound | residual-stream blow-up — find the branch whose `update_ratio` stays high while it grows |
+| `stream/rms_norm` growing **+** `update_ratio` falling at a steady rms(update) | the stream is outgrowing the branches; deeper blocks are losing their say |
+| `param/norm/Decoder<i>/norm1` and `…/norm2` diverging under `pre-*` | `norm1` and `norm2` gains have learned different scales |
 | `head/isotropy` ≪ last block's `ffn/update_isotropy` | the narrowing happened at `norm_f`, not in the stack |
 | `embedding/collapse` rising | the table is pulling its words together |
 | `head/logit_std` rising **+** `loss/curves {val}` flat | the head is sharpening, not learning |
 | `perf/tokens_per_sec` falling **+** `perf/tflops` steady | more arithmetic per token, not a slower device |
-| one layer's `/max` far from `/mean` | a single-layer anomaly; open the per-layer chart before concluding anything |
+| a tag's `/std` jumping while `/mean` holds | a single-layer anomaly; open the per-layer chart before concluding anything |
 
 ---
 
@@ -692,9 +703,9 @@ def _mynorm(module, inputs, output, ctx):
 It runs inside a forward hook and returns `{metric: 0-dim tensor}`, left on the device. Tags
 are filed as `<family>/<site>/<metric>`, where the site is the module's attribute name
 (`norm1`, `Wqkv`, …) — or as `<family>/<metric>` with `per_site=False`, for a module that
-occurs at most once per block — and get the per-layer and `/mean` `/min` `/max` suffixes
+occurs at most once per block — and get the per-layer and `/mean` `/std` suffixes
 like every other probe.
 
-`ctx` provides the masked reductions every probe here uses — `mean`, `std`, `fraction`,
-`collapse`, `unique_collapse`, `isotropy` — so padding is excluded without the probe having
+`ctx` provides the masked reductions every probe here uses — `mean`, `std`, `rms`, `mean_rms`,
+`channel_std`, `fraction`, `collapse`, `unique_collapse`, `isotropy` — so padding is excluded without the probe having
 to remember to.

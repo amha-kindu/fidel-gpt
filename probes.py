@@ -68,6 +68,10 @@ class ProbeContext:
         # The residual stream at the current point of the forward pass. The driver
         # sets it to each decoder block's input; residual_stream advances it.
         self.stream: torch.Tensor | None = None
+        # What the block multiplies the stream by before adding an update to it:
+        # x_next = scale * x + update. 1 except under DeepNorm (alpha = (2N)^0.25).
+        # The driver sets it from the block's `alpha`, alongside `stream`.
+        self.residual_scale: float = 1.0
 
     def residual_stream(self, sublayer_input: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
         """The residual stream a sublayer's update is added to, and advance past it.
@@ -83,11 +87,16 @@ class ProbeContext:
 
         Only the identity of the tensor is inspected, never a module or its norm
         strategy, so the same code reads every placement.
+
+        The returned stream is scaled by `residual_scale`: the update is added to
+        scale * x, not x, and DeepNorm's alpha grows with depth -- measured against
+        the unscaled x, update_ratio would read alpha times too high.
         """
+        scale = self.residual_scale
         if self.stream is None or sublayer_input is self.stream:
             self.stream = None
-            return sublayer_input
-        stream = self.stream
+            return sublayer_input * scale if scale != 1.0 else sublayer_input
+        stream = self.stream * scale if scale != 1.0 else self.stream
         self.stream = stream + update.to(stream.dtype)
         return stream
 
@@ -104,6 +113,31 @@ class ProbeContext:
         """Standard deviation over valid positions, reduced to a scalar."""
         centred = values.float() - self.mean(values)
         return self.mean(centred.square()).clamp_min(0).sqrt()
+
+    @staticmethod
+    def rms(hidden: torch.Tensor) -> torch.Tensor:
+        """Per-token rms across the last axis, (..., 1) float32.
+
+        RMS rather than the L2 norm everywhere in the probes: it is the L2 norm over
+        sqrt(width), so a size reads the same at any embed_dim -- a per-coordinate
+        scale, the quantity muP holds fixed -- and ratios of sizes are unchanged.
+        """
+        return hidden.float().square().mean(dim=-1, keepdim=True).sqrt()
+
+    def mean_rms(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Mean per-token rms over valid positions, reduced to a scalar."""
+        return self.mean(self.rms(hidden))
+
+    def channel_std(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Per-token standard deviation across the last axis, mean over valid positions.
+
+        Population std (no Bessel correction), like `std`. The per-token moments are
+        reduced with dtype=float32 rather than by casting first, so a vocabulary-wide
+        tensor such as the logits is never copied to float32 whole.
+        """
+        mean = hidden.mean(dim=-1, keepdim=True, dtype=torch.float32)
+        mean_square = hidden.square().mean(dim=-1, keepdim=True, dtype=torch.float32)
+        return self.mean((mean_square - mean.square()).clamp_min(0).sqrt())
 
     def fraction(self, predicate: torch.Tensor) -> torch.Tensor:
         """Fraction of valid positions where a bool tensor is True."""
@@ -218,7 +252,7 @@ def register(family: str, match: Callable[[torch.nn.Module], bool], per_site: bo
                        `attn/update_ratio` says everything `attn/attention/
                        update_ratio` would.
 
-    Either way the driver appends the per-layer and mean/min/max reductions, and
+    Either way the driver appends the per-layer and mean/std reductions, and
     several probes may match one module: a family is one question asked of it,
     not one hook.
     """

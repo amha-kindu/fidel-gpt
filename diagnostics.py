@@ -47,16 +47,18 @@ class Recorder:
         self._values.append(value.detach().float().reshape(()))
 
     def resolve(self) -> dict[str, float]:
-        """(tag, layer) -> scalars, plus a mean/min/max reduction over layers.
+        """(tag, layer) -> scalars, plus a mean/std reduction over layers.
 
         Reporting only the mean once hid a real finding: mid-stack collapse at
         one layer was invisible in the average, because the deepest layer was
         fine and a six-layer mean dilutes one bad layer sixfold. Any scalar
-        worth watching is worth watching per layer, and the extremes are what
-        make a single-layer anomaly visible on a summary chart.
+        worth watching is worth watching per layer; the std (population, over
+        layers) is what makes a single-layer anomaly visible on a summary chart.
+        It replaces min/max, which as order statistics drift wider with every
+        block added and so do not compare across depths.
 
         A tag measured at one site only (head/*, norm_f, the projection) gets no
-        reduction: its mean, min and max would be three more copies of layer_00.
+        reduction: its mean would be another copy of layer_00 and its std 0.
         """
         if not self._values:
             return {}
@@ -73,9 +75,9 @@ class Recorder:
                 values.append(layers[layer])
             if len(values) == 1:
                 continue
-            out[f"{tag}/mean"] = sum(values) / len(values)
-            out[f"{tag}/min"] = min(values)
-            out[f"{tag}/max"] = max(values)
+            mean = sum(values) / len(values)
+            out[f"{tag}/mean"] = mean
+            out[f"{tag}/std"] = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
         return out
 
 
@@ -85,7 +87,7 @@ def site_of(name: str) -> tuple[str, int]:
 
     The role is the leaf attribute -- norm1, norm2, norm_f, Wqkv, Wo, Wug, Wd --
     so one tag follows the same structural position across every block, and the
-    depth is the decoder index so the per-layer/mean/min/max split lands on the
+    depth is the decoder index so the per-layer/mean/std split lands on the
     same axis as attn/* and ffn/*. Anything outside a decoder block is filed at
     layer 0. `projection.linear` is renamed for its parent, since `linear` says
     nothing about where it sits.
@@ -149,8 +151,10 @@ def diagnose_modules(model: torch.nn.Module, inputs: torch.Tensor,
 
     # Each block's input is the residual stream, whatever is inside the block;
     # attn/* and ffn/* measure their updates against it (ProbeContext.residual_stream).
-    def mark_stream(_block, args):
+    # The residual scale too: DeepNorm adds each update to alpha * x.
+    def mark_stream(block, args):
         ctx.stream = args[0]
+        ctx.residual_scale = float(getattr(block, "alpha", 1.0))
     for block in getattr(model, "decoders", ()):
         handles.append(block.register_forward_pre_hook(mark_stream))
 
@@ -167,44 +171,77 @@ def diagnose_modules(model: torch.nn.Module, inputs: torch.Tensor,
 
 
 def gradient_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Squared gradient norm per component, bucketed by utils.component_key.
+    """Mean squared gradient per component, bucketed by utils.component_key.
 
     The buckets -- Embedding, Projection, Decoder<i> per block, NormF for the
-    rest -- are the param/grad/* groups. Taken after unscale_ and before
+    rest -- are the param/grad_rms/* groups. Taken after unscale_ and before
     clipping, so it describes the gradient the step produced rather than what
     clipping let through.
+
+    A mean square, so resolve_parameters reports an RMS: the L2 norm grows with
+    the number of elements, and an RMS lets components of different sizes, and
+    models of different widths, be read on one axis. Averaged over the elements
+    that have a gradient.
 
     Returned as 0-dim device tensors rather than floats: this runs inside the
     training step, and an .item() per parameter would be one device sync per
     parameter. resolve_parameters turns them into numbers in one transfer.
     """
-    totals: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        key = component_key(name)
-        norm_sq = torch.linalg.vector_norm(param.grad.detach().float().view(-1)).square()
-        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
-    return totals
+    return _mean_squares((name, param.grad) for name, param in model.named_parameters()
+                         if param.grad is not None)
 
 
 def weight_norms(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Squared weight norm per component, in the same buckets as the gradients.
+    """Mean squared weight per component, in the same buckets as the gradients.
 
     The counterpart to gradient_norms, sharing utils.component_key so the two
-    decompositions line up term for term. On its own a weight norm says little;
-    paired with the update norm it gives the scale-free ratio below, which is
-    the number that actually says whether a component is learning.
+    decompositions line up term for term. On its own a weight's size says little;
+    paired with the update's it gives the scale-free ratio below, which is the
+    number that actually says whether a component is learning.
 
     Same 0-dim-device-tensor discipline: this runs inside the training step, and
     an .item() per parameter would be one device sync per parameter.
     """
+    return _mean_squares(model.named_parameters())
+
+
+def _mean_squares(named, counts: dict[str, int] | None = None) -> dict[str, torch.Tensor]:
+    """sum(x^2) / n per component of (name, tensor) pairs. n is each component's
+    element count among the pairs, or `counts[component]` when given."""
     totals: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
+    sizes: dict[str, int] = {}
+    for name, tensor in named:
         key = component_key(name)
-        norm_sq = torch.linalg.vector_norm(param.detach().float().view(-1)).square()
-        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
-    return totals
+        sq = tensor.detach().float().square().sum()
+        totals[key] = totals[key] + sq if key in totals else sq
+        sizes[key] = sizes.get(key, 0) + tensor.numel()
+    counts = counts or sizes
+    return {key: total / max(counts[key], 1) for key, total in totals.items()}
+
+
+def norm_gains(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Mean squared gain of every norm layer, keyed '<component>/<site>'.
+
+    One entry per LayerNorm / RMSNorm with elementwise weights -- norm1 and norm2
+    per block, norm_f -- under the component its weights are bucketed in. A
+    norm's output has rms ~ rms(gain) whatever its input, so under pre-norm this
+    is the scale each sublayer and the head is actually handed.
+
+    Taken alongside gradient_norms, after the backward: a trainable norm with no
+    gradient is one the forward pass never called (norm_f under post-norm and
+    DeepNorm), and is left out rather than reported as a flat 1.
+    """
+    gains: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if not isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)) \
+                or not isinstance(weight, torch.nn.Parameter):
+            continue
+        if weight.requires_grad and weight.grad is None:
+            continue
+        site = name.rsplit(".", 1)[-1]
+        gains[f"{component_key(name + '.weight')}/{site}"] = weight.detach().float().square().mean()
+    return gains
 
 
 def snapshot_parameters(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -221,37 +258,42 @@ def snapshot_parameters(model: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 
 def update_norms(model: torch.nn.Module, before: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Squared norm of what the optimiser step just did, per component.
+    """Mean square of what the optimiser step just did, per component.
 
-    ||W_after - W_before|| in gradient_norms' buckets: the actual update,
-    including weight decay, clipping, Adam's normalisation and the schedule's lr.
-    A step the AMP scaler skipped reads as exactly 0 -- which is what happened.
+    W_after - W_before in gradient_norms' buckets: the actual update, including
+    weight decay, clipping, Adam's normalisation and the schedule's lr. A step
+    the AMP scaler skipped reads as exactly 0 -- which is what happened.
+
+    Averaged over EVERY element of the component, frozen ones counting as zero
+    movement, so that rms(update) / rms(weight) -- weight_norms averages over
+    the same elements -- is exactly ||update|| / ||weight||.
     """
-    totals: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {}
     for name, param in model.named_parameters():
-        if name not in before:
-            continue
-        key = component_key(name)
-        delta = param.detach().float() - before[name].float()
-        norm_sq = torch.linalg.vector_norm(delta.view(-1)).square()
-        totals[key] = totals[key] + norm_sq if key in totals else norm_sq
-    return totals
+        counts[component_key(name)] = counts.get(component_key(name), 0) + param.numel()
+    return _mean_squares(((name, param.detach().float() - before[name].float())
+                          for name, param in model.named_parameters() if name in before), counts)
 
 
 def resolve_parameters(grads: dict[str, torch.Tensor], weights: dict[str, torch.Tensor],
-                       updates: dict[str, torch.Tensor]) -> dict[str, float]:
-    """Gradient, weight and update-ratio scalars, in ONE host transfer.
+                       updates: dict[str, torch.Tensor],
+                       gains: dict[str, torch.Tensor] | None = None) -> dict[str, float]:
+    """Gradient, weight, update-ratio and norm-gain scalars, in ONE host transfer.
 
-    Emits three families off one sync:
+    Every size here is an RMS, not an L2 norm, so it reads the same whatever a
+    component's element count -- across components and across model widths.
+    Emits four families off one sync:
 
-      param/grad/<component>    ||grad||. Their root summed square is the step's
-                                pre-clip global norm; there is no param/grad/global
-                                because it would be one sample of the window mean
-                                optim/grad_norm already logs.
-      param/norm/<component>    ||weight||, same buckets. No global: the embedding
+      param/grad_rms/<component>
+                                rms(grad). No global: optim/grad_raw is the global
+                                L2 norm clipping acts on.
+      param/rms_norm/<component>
+                                rms(weight), same buckets. No global: the embedding
                                 and projection would dominate it.
+      param/norm/<component>/<site>
+                                rms of a norm layer's gains (norm_gains): 1 at init.
       param/update_ratio/<component>
-                                ||W_after - W_before|| / ||W_before|| across the
+                                rms(W_after - W_before) / rms(W_before) across the
                                 logged step's optimiser update: the fraction of
                                 its own magnitude a component actually moved.
                                 Roughly 1e-3 is healthy. Orders of magnitude below
@@ -259,30 +301,33 @@ def resolve_parameters(grads: dict[str, torch.Tensor], weights: dict[str, torch.
                                 loss curve keeps falling on the strength of the
                                 others; orders above is the component about to
                                 destabilise the run. Scale-free, so it is comparable
-                                BETWEEN components and between runs, which
-                                neither norm is.
+                                BETWEEN components and between runs. Identical to
+                                the L2 ratio, since both rms average over the
+                                same elements.
 
-    Grouped under param/ rather than as three top-level families because
-    TensorBoard sorts alphabetically, and the ratio is unreadable without the
-    weight norm it is formed from on the same screen.
+    Grouped under param/ rather than as top-level families because TensorBoard
+    sorts alphabetically, and the ratio is unreadable without the weight scale it
+    is formed from on the same screen.
     """
-    if not grads and not weights:
+    gains = gains or {}
+    if not grads and not weights and not gains:
         return {}
 
-    groups = (grads, weights, updates)
+    groups = (grads, weights, updates, gains)
     keys = [list(group) for group in groups]
     stacked = torch.stack([group[k] for group, ks in zip(groups, keys) for k in ks])
     values = stacked.sqrt().cpu().tolist()                      # the one and only sync
 
-    grad_norm, weight_norm, update_norm, offset = {}, {}, {}, 0
-    for norms, ks in zip((grad_norm, weight_norm, update_norm), keys):
-        norms.update(zip(ks, values[offset:offset + len(ks)]))
+    grad_rms, weight_rms, update_rms, gain_rms, offset = {}, {}, {}, {}, 0
+    for rms, ks in zip((grad_rms, weight_rms, update_rms, gain_rms), keys):
+        rms.update(zip(ks, values[offset:offset + len(ks)]))
         offset += len(ks)
 
-    resolved = {f"param/grad/{k}": v for k, v in grad_norm.items()}
-    resolved.update({f"param/norm/{k}": v for k, v in weight_norm.items()})
-    for key, update in update_norm.items():
-        weight = weight_norm.get(key)
+    resolved = {f"param/grad_rms/{k}": v for k, v in grad_rms.items()}
+    resolved.update({f"param/rms_norm/{k}": v for k, v in weight_rms.items()})
+    resolved.update({f"param/norm/{k}": v for k, v in gain_rms.items()})
+    for key, update in update_rms.items():
+        weight = weight_rms.get(key)
         if weight:
             resolved[f"param/update_ratio/{key}"] = update / weight
     return resolved
@@ -478,9 +523,10 @@ class GradientEstimator:
 
 
 class ClipStats:
-    """optim/grad_norm, optim/clip_frac and optim/skip_frac over a window of steps.
+    """optim/grad_raw, optim/clip_frac and optim/skip_frac over a window of steps.
 
     Fed the pre-clip global norm clip_grad_norm_ returns, every step, on device.
+    grad_raw is that L2 norm itself -- the number max_norm is compared against.
     A non-finite norm is an AMP overflow: GradScaler skips that step, so it is
     counted in skip_frac and left out of the other two -- one inf would otherwise
     turn the whole window's mean into inf.
@@ -513,7 +559,7 @@ class ClipStats:
         self._reset()
         out = {"optim/skip_frac": (steps - finite) / steps}
         if finite:
-            out["optim/grad_norm"] = norm_sum / finite
+            out["optim/grad_raw"] = norm_sum / finite
             out["optim/clip_frac"] = clipped / finite
         return out
 
@@ -531,7 +577,7 @@ def fenced_json(payload: dict) -> str:
 def parameter_census(model: torch.nn.Module) -> dict:
     """Where the model's parameters actually sit, bucketed by component_key.
 
-    The rule the param/grad/* tags already use, so a component's share of the
+    The rule the param/grad_rms/* tags already use, so a component's share of the
     weights reads directly against its share of the gradient norm. That pairing
     is the point: a block holding 30% of the parameters and 3% of the gradient
     has stopped learning, and neither number says so on its own.
@@ -634,11 +680,12 @@ class TrainingMonitor:
       loss/curves {train}           mean training loss over the window; val joins
                                     it on the same chart, see validated()
       optim/lr
-      optim/grad_norm               window mean of the pre-clip global norm
+      optim/grad_raw                window mean of the pre-clip global L2 norm
       optim/clip_frac               share of the window's steps that clipped
       optim/skip_frac               share of the window's steps AMP skipped (ClipStats)
       optim/grad_scale              AMP only
-      param/grad|norm|update_ratio  at the window's last step (resolve_parameters)
+      param/grad_rms|rms_norm|norm|update_ratio
+                                    at the window's last step (resolve_parameters)
       perf/tokens_per_sec           non-pad input tokens over the window's
                                     training time, all ranks
       perf/tflops                   flop_census's per-batch FLOPs scaled to the
@@ -681,6 +728,7 @@ class TrainingMonitor:
         self.grads: dict[str, torch.Tensor] = {}
         self.weights: dict[str, torch.Tensor] = {}
         self.updates: dict[str, torch.Tensor] = {}
+        self.gains: dict[str, torch.Tensor] = {}
         self.before: dict[str, torch.Tensor] | None = None
         self.train_loss: float | None = None
         self.clip_stats = ClipStats(max_norm)
@@ -707,6 +755,7 @@ class TrainingMonitor:
         if self.logs(step):
             self.grads = gradient_norms(self.model)
             self.weights = weight_norms(self.model)
+            self.gains = norm_gains(self.model)
             self.before = snapshot_parameters(self.model)
 
     def clip(self, parameters) -> torch.Tensor:
@@ -748,7 +797,7 @@ class TrainingMonitor:
                 log(tag, value, step)
             if scaler is not None:
                 log("optim/grad_scale", scaler.get_scale(), step)
-            for tag, value in resolve_parameters(self.grads, self.weights, self.updates).items():
+            for tag, value in resolve_parameters(self.grads, self.weights, self.updates, self.gains).items():
                 log(tag, value, step)
             # This rank's non-pad count times the world size: ranks draw equally
             # sized batches, so this is the global rate to within padding noise.
@@ -757,7 +806,7 @@ class TrainingMonitor:
         else:
             # Non-coordinators keep no window: drop it so the accumulators stay bounded.
             self.clip_stats.resolve()
-        self.grads, self.weights, self.updates = {}, {}, {}
+        self.grads, self.weights, self.updates, self.gains = {}, {}, {}, {}
         self._reset_window()
 
     def validated(self, step: int, val_loss: float) -> None:
