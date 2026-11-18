@@ -19,7 +19,7 @@ come from the variant itself (see DataPlan). What gets reported:
     above as loss/gap
   * per-layer attention health    -- how the sublayer is behaving in each decoder
     block, not averaged into a single scalar that hides the one bad layer
-  * per-layer gradient norms      -- param/grad/<component>, computed by the
+  * per-layer gradient norms      -- param/grad_rms/<component>, computed by the
     same code a training run uses (diagnostics.py), so a variant's gradient
     trace here reads directly against a real training run's
 
@@ -88,7 +88,7 @@ from torch.utils.tensorboard import SummaryWriter
 from config import DEVICE, ENV, LOGGER, MIXED_PRECISION_ENABLED, ModelConfig
 from dataset import TextStreamDataset
 from diagnostics import (ClipStats, GradientEstimator, diagnose_modules, fenced_json, flop_census, gradient_norms,
-                         parameter_census, resolve_parameters, snapshot_parameters,
+                         norm_gains, parameter_census, resolve_parameters, snapshot_parameters,
                          update_norms, weight_norms)
 import mup
 from utils import build_param_groups, get_causal_mask
@@ -627,7 +627,7 @@ def log_configs(writer: SummaryWriter, variant: Variant, config: ModelConfig, ar
 
     ModelConfig and Environment carry the tag and the format they carry in a
     training run, so the TEXT tab of a comparison run reads against a real one
-    without translating anything -- the same reason the param/grad/* buckets are
+    without translating anything -- the same reason the param/grad_rms/* buckets are
     shared rather than restated. ComparisonConfig is this script's answer to
     train.py's TrainingConfig: there is no TrainingConfig object here, the run
     knobs live on the parsed arguments. Variant is the one with no counterpart,
@@ -841,6 +841,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
         if evaluating:
             grad_totals = gradient_norms(model)
             weight_totals = weight_norms(model)
+            gain_totals = norm_gains(model)
             before_step = snapshot_parameters(model)
         # clip_grad_norm_ returns the pre-clip total norm it measured. It runs
         # every step regardless, so taking the return is free -- and it is the
@@ -877,7 +878,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("loss/gap", gap, step, walltime=walltime)
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
             # Accumulated on device across the window, exactly like loss_sum above.
-            # grad_norm is what --grad-clip acted against and clip_frac how often it
+            # grad_raw is what --grad-clip acted against and clip_frac how often it
             # acted -- at clip_frac ~ 1 the effective learning rate is not the one on
             # optim/lr -- both over the steps AMP did not skip; skip_frac counts those.
             for tag, value in clip_stats.resolve().items():
@@ -887,11 +888,11 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
             # param/* is the tree a training run writes, from the same code, so a
             # variant's trace reads against a real run's without translating anything.
-            # param/norm/* is the same decomposition of the weights themselves,
-            # and exists so param/update_ratio/* can be formed: ||step update|| / ||weight||
+            # param/rms_norm/* is the same decomposition of the weights themselves,
+            # and exists so param/update_ratio/* can be formed: rms(step update) / rms(weight)
             # is the scale-free number that says whether a component is learning
             # too fast or has stopped, which neither half tells you alone.
-            parameters = resolve_parameters(grad_totals, weight_totals, update_totals)
+            parameters = resolve_parameters(grad_totals, weight_totals, update_totals, gain_totals)
             for tag, value in parameters.items():
                 writer.add_scalar(tag, value, step, walltime=walltime)
             # Cumulative averages over `elapsed`, so ms/step and elapsed seconds
@@ -1057,7 +1058,7 @@ def report(results: dict[str, dict], args, run_dir: str, fingerprint: str) -> No
     print(rule)
     print(f"\ntensorboard --logdir {run_dir}")
     print("  loss/*, stream/*, attn/*, ffn/*, param/* and perf/* carry the same tag in every")
-    print("  run, so each chart overlays them all. attn/* and ffn/* hold the same four measurements")
+    print("  run, so each chart overlays them all. attn/* and ffn/* hold the same three measurements")
     print("  per sublayer, so reading them side by side says which branch drove the block.")
     print("  Switch the x-axis to RELATIVE for loss against seconds of training compute")
     print("  rather than steps.")
