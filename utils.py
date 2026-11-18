@@ -142,7 +142,16 @@ def save_checkpoint(weights: dict, model_config: ModelConfig, global_step: int, 
 NO_DECAY_PARAMS: tuple[str, ...] = ()
 
 
-def build_param_groups(model: nn.Module, weight_decay: float, no_decay: tuple[str, ...] = NO_DECAY_PARAMS) -> list[dict]:
+def build_param_groups(model: nn.Module, weight_decay: float, no_decay: tuple[str, ...] = NO_DECAY_PARAMS,
+                       lr: float | None = None) -> list[dict]:
+    """AdamW param groups. A model whose config enables muP gets per-layer lr and
+    weight decay (mup.param_groups), which needs the base `lr`."""
+    import mup
+    if mup.enabled(getattr(model, "config", None)):
+        if lr is None:
+            raise ValueError("a muP model needs build_param_groups(..., lr=base_lr)")
+        return mup.param_groups(model, lr, weight_decay, no_decay)
+
     decayed: list[nn.Parameter] = []
     undecayed: list[nn.Parameter] = []
 

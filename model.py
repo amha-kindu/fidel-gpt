@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
+import mup
 from config import *
 from probes import register
 from lora import LoRAdapter
@@ -48,6 +49,8 @@ class MultiHeadAttentionModule(nn.Module):
         self.d_head: int = config.attn_dim // config.heads
 
         self.dropout_p: float = config.dropout
+        # None is SDPA's 1/sqrt(d_head); muP with a base head dim overrides it.
+        self.scale: float | None = mup.attention_scale(config)
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.attn_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.attn_dim, config.embed_dim, bias=False)
     
@@ -118,6 +121,7 @@ class MultiHeadAttentionModule(nn.Module):
             attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=is_causal,
+            scale=self.scale,
         )
 
         # (N_BATCHES, HEADS, SEQ_LEN, d_head) -> (N_BATCHES, SEQ_LEN, HEADS, d_head)
@@ -196,11 +200,14 @@ class ProjectionModule(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
+        # muP's output multiplier, base_embed_dim / embed_dim; 1 without muP.
+        self.output_mult: float = mup.output_multiplier(config)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        logits = self.linear(x)
+        return logits if self.output_mult == 1.0 else logits * self.output_mult
 
 
 class GPTmodel(nn.Module):
@@ -308,6 +315,11 @@ class GPTmodel(nn.Module):
                         nn.init.zeros_(m.bias)
 
             model.apply(init_weights)
+
+            if mup.enabled(config):
+                # Hidden matrices and the head to their muP variances; identical to
+                # the init above when embed_dim is the base width.
+                mup.init_(model)
 
             if config.norm_strategy == "deepnorm":
                 # DeepNorm's other half: shrink the residual branch at init so the alpha

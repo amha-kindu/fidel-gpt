@@ -32,7 +32,7 @@ def finetune(config: TrainingConfig, model: GPTmodel, finetune_dataset: MultiTas
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
     optimizer = torch.optim.AdamW(
-        params=build_param_groups(model, config.weight_decay),
+        params=build_param_groups(model, config.weight_decay, lr=config.init_lr),
         lr=config.init_lr,
         betas=(config.beta1, config.beta2),
         eps=config.epsilon

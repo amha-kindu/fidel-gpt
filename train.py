@@ -13,6 +13,7 @@ from torch.nn.attention import SDPBackend
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler, RandomSampler, DataLoader
 
+import mup
 from config import *
 from model import GPTmodel
 from tensorboard_logger import TensorboardLogger
@@ -59,7 +60,7 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
     early_stopping = EarlyStopping(patience=config.es_patience, min_delta=config.es_min_delta)
 
     optimizer = torch.optim.AdamW(
-        params=build_param_groups(base_model, config.weight_decay),
+        params=build_param_groups(base_model, config.weight_decay, lr=config.init_lr),
         lr=config.init_lr,
         betas=(config.beta1, config.beta2),
         eps=config.epsilon
@@ -305,6 +306,9 @@ if __name__ == "__main__":
     parser.add_argument("--ff-dim", type=int, help="Dimensionality of the feed forward layer")
     parser.add_argument("--attn-dim", type=int, help="Dimensionality of the attention layer, i.e. what Wqkv projects up to and what the heads divide (default: embed_dim)")
     parser.add_argument("--norm-strategy", type=str, default=None, choices=list(ModelConfig.NORM_STRATEGIES), help="Normalization scheme. The suffix picks the norm ('-ln' is LayerNorm, '-rms' is RMSNorm without bias); the prefix picks the placement: 'pre-*' is x + Sublayer(Norm(x)), 'post-*' is Norm(x + Sublayer(x)).'deepnorm' is post-LayerNorm with the residual scaled by alpha=(2N)^0.25 and branch weights by beta=(8N)^-0.25. N is n_decoders (default: pre-ln)")
+    parser.add_argument("--mup-width", type=int, help="muP: the embed_dim the hyperparameters (lr, init, schedule) were tuned at. Hidden matrices get lr x base/fan_in, init variance ~1/fan_in and weight decay x fan_in/base; logits are multiplied by base/embed_dim. Identical to the standard model at embed_dim == base. 0 disables (default: 0)")
+    parser.add_argument("--mup-ff", type=int, help="muP: the base model's ff_dim, when the ff ratio differs from the base's (default: 0 = ff_dim scales with embed_dim)")
+    parser.add_argument("--mup-head", type=int, help="muP: the base model's head dim; attention logits then scale as sqrt(base)/d_head instead of 1/sqrt(d_head). Set it when width grows by widening heads (default: 0 = unchanged)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")
@@ -406,6 +410,7 @@ if __name__ == "__main__":
         LOGGER.info(f"Using training config: {numerical_configs}")
         LOGGER.info(f"Initiating training with {'mixed-precision' if MIXED_PRECISION_ENABLED else 'single-precision'}...")
         LOGGER.info(f"Using model config: {model_config}")
+        LOGGER.info(mup.describe(model))
         LOGGER.info(f"Model size: {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
