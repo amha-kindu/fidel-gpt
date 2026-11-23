@@ -115,15 +115,8 @@ class ModelConfig(Config):
         self.embed_mult: float = kwargs.get("embed_mult", 1.0)
         self.qk_norm: bool = kwargs.get("qk_norm", False)
         self.stream_penalty: float = kwargs.get("stream_penalty", 0.0)
-        # muP (see mup.py). mup_width is the width the hyperparameters were
-        # tuned at; 0 turns muP off and leaves the standard parametrisation untouched.
-        # At embed_dim == mup_width the two coincide exactly.
         self.mup_width: int = kwargs.get("mup_width", 0)
-        # The base model's ff_dim. 0 assumes ff_dim scales with embed_dim; set it when
-        # the ff ratio differs from the base's (e.g. base 512 at 128 vs 1362 at 512).
         self.mup_ff: int = kwargs.get("mup_ff", 0)
-        # The base model's head dim. 0 keeps 1/sqrt(d_head) attention; set it when
-        # width grows by widening heads, so logits scale as sqrt(base)/d_head.
         self.mup_head: int = kwargs.get("mup_head", 0)
 
     def update(self, skip: list[str] = [], **kwargs):

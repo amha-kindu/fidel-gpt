@@ -13,9 +13,9 @@ from torch.nn.attention import SDPBackend
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler, RandomSampler, DataLoader
 
-import mup
 from config import *
 from model import GPTmodel
+from parametrization import Parametrization
 from tensorboard_logger import TensorboardLogger
 from lr_schedulers import LRScheduler, get_lr_scheduler
 from dataset import NLPDataset, TextDataset, TextStreamDataset, PackedTextStreamDataset
@@ -416,7 +416,7 @@ if __name__ == "__main__":
         LOGGER.info(f"Using training config: {numerical_configs}")
         LOGGER.info(f"Initiating training with {'mixed-precision' if MIXED_PRECISION_ENABLED else 'single-precision'}...")
         LOGGER.info(f"Using model config: {model_config}")
-        LOGGER.info(mup.describe(model))
+        LOGGER.info(Parametrization.from_config(model.config).describe(model))
         LOGGER.info(f"Model size: {sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2):.2f}MB")
         LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 

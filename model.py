@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
-import mup
 from config import *
 from probes import register
 from lora import LoRAdapter
 from cache import SlidingKVCache
+from parametrization import Parametrization
 
 
 class EmbeddingModule(nn.Module):
@@ -51,8 +51,9 @@ class MultiHeadAttentionModule(nn.Module):
         self.d_head: int = config.attn_dim // config.heads
 
         self.dropout_p: float = config.dropout
+        parametrization = Parametrization.from_config(config)
         # None is SDPA's 1/sqrt(d_head); muP with a base head dim overrides it.
-        self.scale: float | None = mup.attention_scale(config)
+        self.scale: float | None = parametrization.attention_scale()
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.attn_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.attn_dim, config.embed_dim, bias=False)
         # QK-norm: per-head RMSNorm on query and key, so the logits' scale is set by
@@ -210,7 +211,7 @@ class ProjectionModule(nn.Module):
         super().__init__()
         self.linear = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         # muP's output multiplier, base_embed_dim / embed_dim; 1 without muP.
-        self.output_mult: float = mup.output_multiplier(config)
+        self.output_mult: float = Parametrization.from_config(config).output_multiplier()
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, VOCAB_SIZE)
@@ -343,10 +344,11 @@ class GPTmodel(nn.Module):
 
             model.apply(init_weights)
 
-            if mup.enabled(config):
+            parametrization = Parametrization.from_config(config)
+            if parametrization:
                 # Hidden matrices and the head to their muP variances; identical to
                 # the init above when embed_dim is the base width.
-                mup.init_(model)
+                parametrization.init_(model)
 
             if config.norm_strategy == "deepnorm":
                 # DeepNorm's other half: shrink the residual branch at init so the alpha
