@@ -309,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--mup-width", type=int, help="muP: the embed_dim the hyperparameters (lr, init, schedule) were tuned at. Hidden matrices get lr x base/fan_in, init variance ~1/fan_in and weight decay x fan_in/base; logits are multiplied by base/embed_dim. Identical to the standard model at embed_dim == base. 0 disables (default: 0)")
     parser.add_argument("--mup-ff", type=int, help="muP: the base model's ff_dim, when the ff ratio differs from the base's (default: 0 = ff_dim scales with embed_dim)")
     parser.add_argument("--mup-head", type=int, help="muP: the base model's head dim; attention logits then scale as sqrt(base)/d_head instead of 1/sqrt(d_head). Set it when width grows by widening heads (default: 0 = unchanged)")
+    parser.add_argument("--embed-mult", type=float, help="Constant multiplier on the embedding table's output. Unlike a larger embed_std it keeps the table's init and relative Adam step, so it also raises the embedding's effective lr by the same factor (default: 1)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")

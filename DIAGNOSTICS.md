@@ -385,7 +385,7 @@ with the data.
 
 | tensor | what it is |
 |---|---|
-| embedding output | the table lookup, before dropout |
+| embedding output | the table lookup times `embed_mult` — what block 0 receives (dropout is off in the probe pass) |
 | block input | the residual stream entering the block — by definition, whatever is inside it |
 | attention input | what attention was handed: `norm1(x)` under `pre-*`, the stream itself under `post-*` and `deepnorm` |
 | attention update | what attention wrote back, **before** the residual add |
@@ -454,7 +454,7 @@ The head's mirror image, read off the embedding table's output. Measured once (`
 
 | tag | measures | at init |
 |---|---|---|
-| `embedding/embed_std` | per-token spread of the embedding across channels | ≈ the init std (`embed_std`, 0.02 by default) |
+| `embedding/embed_std` | per-token spread of the embedding across channels, after `embed_mult` — what block 0 receives | ≈ `embed_std · embed_mult` (0.02 by default) |
 | `embedding/isotropy` | share of the available directions the embedded tokens use, weighted by token frequency — the distribution block 0 actually sees | ≈ 0.9: random rows |
 | `embedding/collapse` | mean pairwise cosine between **distinct** token ids in the probe batch | ≈ 0 |
 

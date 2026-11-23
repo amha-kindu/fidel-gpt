@@ -15,11 +15,13 @@ class EmbeddingModule(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(config.dropout)
         self.embedding = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.mult: float = getattr(config, "embed_mult", 1.0)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.embedding(x))
+        x = self.embedding(x)
+        return self.dropout(x if self.mult == 1.0 else x * self.mult)
 
 
 class RoPeModule(nn.Module):
@@ -455,8 +457,9 @@ def _embedding_metrics(_module, inputs, output, ctx) -> dict[str, torch.Tensor]:
                   stream/collapse uses would read the batch's repetition, not the
                   table. This reads how far apart the table keeps its words.
 
-    Hooked on the table itself, so it reads the output before dropout -- which in
-    the eval-mode diagnostic pass is what the stack receives anyway.
+    Hooked on EmbeddingModule rather than the table, so it reads the output after
+    embed_mult -- what the stack actually receives (dropout is the identity in the
+    eval-mode diagnostic pass).
     """
     return {
         "embed_std": ctx.channel_std(output),
@@ -472,4 +475,4 @@ register("stream", lambda m: isinstance(m, DecoderModule), per_site=False)(_stre
 
 register("head", lambda m: isinstance(m, ProjectionModule), per_site=False)(_head_metrics)
 
-register("embedding", lambda m: isinstance(m, nn.Embedding), per_site=False)(_embedding_metrics)
+register("embedding", lambda m: isinstance(m, EmbeddingModule), per_site=False)(_embedding_metrics)

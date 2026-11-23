@@ -112,6 +112,7 @@ class ModelConfig(Config):
         self.seq_len: int = kwargs.get("seq_len", 50)
         self.norm_strategy: str = kwargs.get("norm_strategy", "pre-ln")
         self.embed_std: float = kwargs.get("embed_std", 0.02)
+        self.embed_mult: float = kwargs.get("embed_mult", 1.0)
         # muP (see mup.py). mup_width is the width the hyperparameters were
         # tuned at; 0 turns muP off and leaves the standard parametrisation untouched.
         # At embed_dim == mup_width the two coincide exactly.
