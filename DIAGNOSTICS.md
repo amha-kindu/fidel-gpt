@@ -268,6 +268,11 @@ A norm's output has rms ≈ this gain whatever its input, so under `pre-*` it is
 attention (`norm1`), the feed-forward (`norm2`) and the head (`norm_f`) are actually handed.
 Under `post-*` and `deepnorm` it is roughly where `stream/rms_norm` sits.
 
+With `qk_norm` on, each block also logs `q_norm` and `k_norm` (e.g.
+`param/norm/Decoder0/q_norm`): the per-head query/key gains, shared by every head. A head's
+attention logits scale with the product of the two (times √d_head under SDPA's default
+scale), independent of `norm1`'s gain.
+
 All four are single-step samples, so expect them to be noisier than the window means in
 `optim/*`.
 

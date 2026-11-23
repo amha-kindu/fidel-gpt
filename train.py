@@ -310,6 +310,7 @@ if __name__ == "__main__":
     parser.add_argument("--mup-ff", type=int, help="muP: the base model's ff_dim, when the ff ratio differs from the base's (default: 0 = ff_dim scales with embed_dim)")
     parser.add_argument("--mup-head", type=int, help="muP: the base model's head dim; attention logits then scale as sqrt(base)/d_head instead of 1/sqrt(d_head). Set it when width grows by widening heads (default: 0 = unchanged)")
     parser.add_argument("--embed-mult", type=float, help="Constant multiplier on the embedding table's output. Unlike a larger embed_std it keeps the table's init and relative Adam step, so it also raises the embedding's effective lr by the same factor (default: 1)")
+    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=None, help="Per-head RMSNorm on attention queries and keys before RoPE (default: off)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")

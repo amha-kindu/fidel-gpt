@@ -55,7 +55,11 @@ class MultiHeadAttentionModule(nn.Module):
         self.scale: float | None = mup.attention_scale(config)
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.attn_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.attn_dim, config.embed_dim, bias=False)
-    
+        # QK-norm: per-head RMSNorm on query and key, so the logits' scale is set by
+        # q_norm/k_norm's gains rather than by norm1's gain and Wqkv's size.
+        self.q_norm: nn.RMSNorm | None = nn.RMSNorm(self.d_head) if config.qk_norm else None
+        self.k_norm: nn.RMSNorm | None = nn.RMSNorm(self.d_head) if config.qk_norm else None
+
     # Input shape: x(y) -> (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM); cos/sin -> (SEQ_LEN, HEAD_DIM // 2)
     # Output shape: (N_BATCHES, HEADS, SEQ_LEN, HEAD_DIM)
     def _apply_rotary(self, x: torch.Tensor, y: torch.Tensor, cos_phase: torch.Tensor, sin_phase: torch.Tensor):        
@@ -100,7 +104,10 @@ class MultiHeadAttentionModule(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.heads, -1).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.heads, -1).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.heads, -1).transpose(1, 2)
-        
+
+        if self.q_norm is not None:
+            query, key = self.q_norm(query), self.k_norm(key)
+
         if cos_sin_phases is not None:
             query, key = self._apply_rotary(query, key, cos_sin_phases[0], cos_sin_phases[1])        
 
