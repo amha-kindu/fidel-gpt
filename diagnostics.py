@@ -667,6 +667,7 @@ class TrainingMonitor:
     One instance per run, driven from the optimiser-step loop:
 
         monitor.count_tokens(inputs, pad)         every micro-batch
+        monitor.add_aux(model.auxiliary_loss())   every micro-batch
         monitor.before_update(step)               after unscale_, before clipping
         monitor.clip(parameters)                  in place of clip_grad_norm_
         <optimiser step>
@@ -679,6 +680,8 @@ class TrainingMonitor:
 
       loss/curves {train}           mean training loss over the window; val joins
                                     it on the same chart, see validated()
+      loss/aux                      mean auxiliary loss per step over the window
+                                    (stream_penalty); only when the model has one
       optim/lr
       optim/grad_raw                window mean of the pre-clip global L2 norm
       optim/clip_frac               share of the window's steps that clipped
@@ -732,10 +735,13 @@ class TrainingMonitor:
         self.before: dict[str, torch.Tensor] | None = None
         self.train_loss: float | None = None
         self.clip_stats = ClipStats(max_norm)
+        self.batches_per_step = max(1, batches_per_step)
+        self.aux_seen = False
         self._reset_window()
 
     def _reset_window(self) -> None:
         self.loss_sum, self.steps = 0.0, 0
+        self.aux_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
         self.tokens = torch.zeros((), dtype=torch.int64, device=DEVICE)
         self.excluded = 0.0
         sync()
@@ -747,6 +753,12 @@ class TrainingMonitor:
 
     def count_tokens(self, inputs: torch.Tensor, pad: int) -> None:
         self.tokens += (inputs != pad).sum()
+
+    def add_aux(self, aux: torch.Tensor | None) -> None:
+        """Every micro-batch: the model's auxiliary loss (or None), kept on device."""
+        if aux is not None:
+            self.aux_sum += aux.detach().float() / self.batches_per_step
+            self.aux_seen = True
 
     def before_update(self, step: int) -> None:
         """On a window's last step, snapshot gradients and weights -- after
@@ -792,6 +804,8 @@ class TrainingMonitor:
             log = self.logger.log_scalar
             self.train_loss = self.loss_sum / self.steps
             self.logger.log_scalars("loss/curves", {"train": self.train_loss}, step)
+            if self.aux_seen:
+                log("loss/aux", self.aux_sum.item() / self.steps, step)
             log("optim/lr", lr, step)
             for tag, value in self.clip_stats.resolve().items():
                 log(tag, value, step)

@@ -114,6 +114,7 @@ class ModelConfig(Config):
         self.embed_std: float = kwargs.get("embed_std", 0.02)
         self.embed_mult: float = kwargs.get("embed_mult", 1.0)
         self.qk_norm: bool = kwargs.get("qk_norm", False)
+        self.stream_penalty: float = kwargs.get("stream_penalty", 0.0)
         # muP (see mup.py). mup_width is the width the hyperparameters were
         # tuned at; 0 turns muP off and leaves the standard parametrisation untouched.
         # At embed_dim == mup_width the two coincide exactly.

@@ -142,7 +142,10 @@ def train(config: TrainingConfig, model: GPTmodel, train_dataset: NLPDataset, va
             training_loss += batch_loss.detach().item() / config.grad_accum_steps
             update_weights = ((i + 1) % config.grad_accum_steps) == 0
             
-            avg_loss = batch_loss / config.grad_accum_steps
+            aux_loss = base_model.auxiliary_loss()
+            monitor.add_aux(aux_loss)
+            objective = batch_loss if aux_loss is None else batch_loss + aux_loss
+            avg_loss = objective / config.grad_accum_steps
             # Skip gradient sync on accumulation steps; only sync on the last step.
             sync_ctx = model.no_sync() if is_distributed and not update_weights else contextlib.nullcontext()
             if MIXED_PRECISION_ENABLED:
@@ -311,6 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--mup-head", type=int, help="muP: the base model's head dim; attention logits then scale as sqrt(base)/d_head instead of 1/sqrt(d_head). Set it when width grows by widening heads (default: 0 = unchanged)")
     parser.add_argument("--embed-mult", type=float, help="Constant multiplier on the embedding table's output. Unlike a larger embed_std it keeps the table's init and relative Adam step, so it also raises the embedding's effective lr by the same factor (default: 1)")
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=None, help="Per-head RMSNorm on attention queries and keys before RoPE (default: off)")
+    parser.add_argument("--stream-penalty", type=float, help="Weight of mean_blocks(rms(block output)^2) added to the training loss, to keep the residual stream bounded (default: 0 = off)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend")
     parser.add_argument("--resume", default=False, action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--max-checkpoints-to-keep", type=int, help="Maximum number of checkpoints to keep")

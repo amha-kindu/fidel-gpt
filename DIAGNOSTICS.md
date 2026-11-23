@@ -20,6 +20,7 @@ tensorboard --logdir <tb_log_dir>
   - [`loss/*` — quality](#loss--quality)
     - [`loss/curves` `{train, val}`](#losscurves-train-val)
     - [`loss/gap`](#lossgap)
+    - [`loss/aux`](#lossaux)
   - [`optim/*` — the optimiser](#optim--the-optimiser)
   - [`param/*` — where the gradient goes and what it moves](#param--where-the-gradient-goes-and-what-it-moves)
     - [`param/grad_rms/<group>`](#paramgrad_rmsgroup)
@@ -105,7 +106,7 @@ Read in forward-pass order, the probe families trace one token's path through th
 
 | what | when | measured on |
 |---|---|---|
-| `loss/curves {train}`, `optim/*`, `param/*`, `perf/*` — except the two below | once per **window** of `log_every` optimiser steps (default 100) | the training batches |
+| `loss/curves {train}`, `loss/aux`, `optim/*`, `param/*`, `perf/*` — except the two below | once per **window** of `log_every` optimiser steps (default 100) | the training batches |
 | `loss/curves {val}`, `loss/gap` | at every validation | the validation set |
 | `embedding/*` `attn/*` `ffn/*` `stream/*` `head/*` | at every validation | one **fixed probe batch**, drawn once from the validation data at the start of the run |
 | `param/gsnr/*`, `optim/noise_scale` | at every validation | a **fresh training batch** of `gsnr_samples` sequences (default 64) the model has not been updated on, split into `gsnr_chunks` chunks |
@@ -175,6 +176,17 @@ first window closes, the open one's).
 A widening gap is the model fitting the training batches faster than it is learning.
 Because `train` is a window mean taken with dropout on, the absolute value reads low and
 can be negative early in a run; watch the trend.
+
+### `loss/aux`
+
+The model's auxiliary loss, today the stream penalty:
+`stream_penalty × mean over blocks of rms(block output)²`. It's a mean per optimiser
+step over the window, like `train`, and written on the same steps. It's only written
+when `stream_penalty > 0`.
+
+It's added to the objective but **not** to `loss/curves {train}`, which stays plain
+cross-entropy, so runs with and without the penalty compare directly. Divide it by
+`stream_penalty` to read the mean squared stream RMS the penalty sees.
 
 ---
 

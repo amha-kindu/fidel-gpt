@@ -233,6 +233,16 @@ class GPTmodel(nn.Module):
         self.decoders = nn.ModuleList([DecoderModule(config) for _ in range(config.n_decoders)])
         self.norm_f = (nn.RMSNorm if "-rms" in config.norm_strategy else nn.LayerNorm)(config.embed_dim)
         self.activation_ckpt = False
+        self._stream_sq: torch.Tensor | None = None
+
+    def register_hooks(self, optimizer: torch.optim.Optimizer):
+        pass
+
+    def auxiliary_loss(self) -> torch.Tensor | None:
+        stream_sq, self._stream_sq = self._stream_sq, None
+        if stream_sq is None:
+            return None
+        return self.config.stream_penalty * stream_sq
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
@@ -266,6 +276,10 @@ class GPTmodel(nn.Module):
         
         cos_sin_phases = phase_angles.cos().to(x.dtype), phase_angles.sin().to(x.dtype)
 
+        # Taken outside any activation checkpoint, so recomputation never sees it.
+        penalize = self.training and not use_cache and self.config.stream_penalty > 0
+        stream_sq = []
+
         for i, decoder in enumerate(self.decoders):
             kv_cache = None if not use_cache else kv_caches[i].get()
             if self.training and self.activation_ckpt and not use_cache:
@@ -277,6 +291,10 @@ class GPTmodel(nn.Module):
                 x, new_kv = decoder(x, attn_mask, is_causal, use_cache, kv_cache, cos_sin_phases)
             if use_cache:
                 kv_caches[i].append(new_kv[0], new_kv[1])
+            if penalize:
+                stream_sq.append(x.float().square().mean())
+        if penalize:
+            self._stream_sq = torch.stack(stream_sq).mean()
         return self._final_norm(x)
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN), mask -> (SEQ_LEN, SEQ_LEN)
