@@ -54,6 +54,8 @@ class MultiHeadAttentionModule(nn.Module):
         parametrization = Parametrization.from_config(config)
         # None is SDPA's 1/sqrt(d_head); muP with a base head dim overrides it.
         self.scale: float | None = parametrization.attention_scale()
+        # Depth scaling's block-output multiplier
+        self.branch_mult: float = parametrization.branch_multiplier()
         self.Wqkv: nn.Linear = nn.Linear(config.embed_dim, 3*config.attn_dim, bias=False)
         self.Wo: nn.Linear = nn.Linear(config.attn_dim, config.embed_dim, bias=False)
         # QK-norm: per-head RMSNorm on query and key, so the logits' scale is set by
@@ -141,7 +143,8 @@ class MultiHeadAttentionModule(nn.Module):
         output = output.contiguous().view(*x.shape[:-1], -1)
 
         # (N_BATCHES, SEQ_LEN, ATTN_DIM) @ (ATTN_DIM, EMBED_DIM) -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
-        return self.Wo(output), new_kv
+        output = self.Wo(output)
+        return (output if self.branch_mult == 1.0 else output * self.branch_mult), new_kv
     
 
 class GatedFeedForwardModule(nn.Module):
@@ -150,17 +153,20 @@ class GatedFeedForwardModule(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.Wug = nn.Linear(config.embed_dim, 2 * config.ff_dim)
         self.Wd = nn.Linear(config.ff_dim, config.embed_dim)
+        # Depth scaling's block-output multiplier, as in MultiHeadAttentionModule.
+        self.branch_mult: float = Parametrization.from_config(config).branch_multiplier()
 
     # Input shape: x -> (N_BATCHES, SEQ_LEN, EMBED_DIM)
     # Output shape: (N_BATCHES, SEQ_LEN, EMBED_DIM)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, gate = self.Wug(x).chunk(2, dim=-1)
-        
-        return self.Wd(
+
+        output = self.Wd(
             self.dropout(
                 F.silu(gate) * up
             )
         )
+        return output if self.branch_mult == 1.0 else output * self.branch_mult
 
 class DecoderModule(nn.Module):
     def __init__(self, config: ModelConfig):

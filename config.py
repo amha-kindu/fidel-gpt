@@ -118,6 +118,8 @@ class ModelConfig(Config):
         self.mup_width: int = kwargs.get("mup_width", 0)
         self.mup_ff: int = kwargs.get("mup_ff", 0)
         self.mup_head: int = kwargs.get("mup_head", 0)
+        self.dmup_depth: int = kwargs.get("dmup_depth", 0)
+        self.dmup_alpha: float = kwargs.get("dmup_alpha", 0.5)
 
     def update(self, skip: list[str] = [], **kwargs):
         follows = self.attn_dim == self.embed_dim

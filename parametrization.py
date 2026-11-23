@@ -1,4 +1,4 @@
-"""Maximal update parametrisation (muP) for GPTmodel, with Adam.
+"""Maximal update parametrisation (muP) for GPTmodel, with Adam, plus depth scaling.
 
 Tune hyperparameters on a small base model, then scale it up: each scaling rule
 keeps activations and per-step updates the same size as at the base, so the base's
@@ -21,12 +21,29 @@ Attention logits scale as sqrt(base_head_dim) / head_dim instead of 1/sqrt(head_
 only when mup_head is set (i.e. when width grows by widening heads). Assumes attn_dim
 grows in proportion to embed_dim, and so does ff_dim unless mup_ff says otherwise.
 
+Depth (dmup_depth, dmup_alpha), independent of width; either can be on alone.
+Tune at a base depth L_base = dmup_depth, then change n_decoders = L:
+
+  block outputs         each attention and feed-forward output is multiplied by
+                        (L_base / L) ** alpha before it joins the residual stream, so
+                        the blocks' combined write stays the same size at any depth.
+  in-block parameters   everything inside model.decoders (the hidden matrices, their
+                        biases, the norm and QK-norm gains): Adam lr x
+                        (L / L_base) ** (alpha - 1). The embedding, norm_f and head are
+                        unchanged.
+  init                  unchanged.
+
+alpha = 0.5 is Depth-muP (Tensor Programs VI): branch x sqrt(L_base / L), in-block lr
+x sqrt(L_base / L). alpha = 1 is CompleteP (Dey et al. 2025): branch x L_base / L,
+in-block lr unchanged. Pre-norm only: post-norm renormalises the stream after every
+block and deepnorm has its own depth scaling (alpha, beta).
+
 Weight decay is no rule's business: decoupled decay removes lr * wd of a weight per
 step, so Parametrization divides each parameter's wd by the same factor its lr was
-multiplied by, which keeps every weight's decay timescale width-free.
+multiplied by, which keeps every weight's decay timescale width- and depth-free.
 
 Structure: a ScalingRule says how it adjusts each hyperparameter -- per parameter (lr,
-init) and per model (logits, attention scale) -- with every hook
+init) and per model (block outputs, logits, attention scale) -- with every hook
 defaulting to "unchanged". Parametrization.from_config(config) holds the rules a
 config switches on and combines them; it is the only object callers use.
 """
@@ -73,6 +90,7 @@ class ParamSpec:
     path: str | None    # "attention.Wqkv" etc. for hidden matrices, "projection" for the head
     fan_in: float
     fan_out: float
+    in_block: bool      # inside model.decoders
 
 
 def model_dims(config) -> Dims:
@@ -99,10 +117,11 @@ def classify(model: nn.Module) -> list[ParamSpec]:
     if isinstance(head, nn.Parameter):
         known[id(head)] = (Role.OUTPUT, "projection", dims.embed, float(config.vocab_size))
 
+    in_blocks = {id(p) for p in model.decoders.parameters()}
     specs = []
     for name, param in model.named_parameters():
         role, path, fan_in, fan_out = known.get(id(param), (Role.VECTOR, None, 0.0, 0.0))
-        specs.append(ParamSpec(name, param, role, path, fan_in, fan_out))
+        specs.append(ParamSpec(name, param, role, path, fan_in, fan_out, id(param) in in_blocks))
     return specs
 
 
@@ -110,9 +129,9 @@ def classify(model: nn.Module) -> list[ParamSpec]:
 class Factor:
     """A multiplier kept as num / den and applied as x * num / den.
 
-    A pair rather than one float so that a rule which divides (width: lr / w) computes
-    exactly that, not lr * (1 / w); x * 1.0 and x / 1.0 are exact, so a factor of
-    one changes nothing.
+    A pair rather than one float so that a rule which divides (width: lr / w) and one
+    which multiplies (depth: lr * d) are each exact on their own -- x * 1.0 and
+    x / 1.0 are exact -- and a run with one rule off is bit-identical to a run without it.
     """
     num: float = 1.0
     den: float = 1.0
@@ -159,6 +178,10 @@ class ScalingRule(ABC):
         return 1.0
 
     # Model-level adjustments.
+    def branch(self) -> float:
+        """Multiplier on every attention / feed-forward output."""
+        return 1.0
+
     def logits(self) -> float:
         """Multiplier on the head's logits."""
         return 1.0
@@ -222,10 +245,41 @@ class WidthRule(ScalingRule):
                 f"logits x{self.logits():g}; {attn}")
 
 
+class DepthRule(ScalingRule):
+    """Depth-muP / CompleteP: dmup_depth (base n_decoders), dmup_alpha."""
+
+    def __init__(self, config):
+        self.base_depth: int = config.dmup_depth
+        self.depth: int = config.n_decoders
+        self.alpha: float = config.dmup_alpha
+
+    @classmethod
+    def from_config(cls, config) -> "DepthRule | None":
+        if getattr(config, "dmup_depth", 0) <= 0:
+            return None
+        if not config.norm_strategy.startswith("pre"):
+            raise ValueError(f"dmup_depth needs a pre-norm strategy, got {config.norm_strategy!r}")
+        return cls(config)
+
+    def block_lr_mult(self) -> float:
+        """(L / L_base) ** (alpha - 1): the Adam lr multiplier inside the blocks."""
+        return (self.depth / self.base_depth) ** (self.alpha - 1.0)
+
+    def lr(self, spec: ParamSpec) -> Factor:
+        return Factor(num=self.block_lr_mult()) if spec.in_block else UNCHANGED
+
+    def branch(self) -> float:
+        return (self.base_depth / self.depth) ** self.alpha
+
+    def describe(self, specs: list[ParamSpec]) -> str:
+        return (f"depth base {self.base_depth} -> {self.depth} (alpha {self.alpha:g}): "
+                f"block outputs x{self.branch():.4g}, in-block lr x{self.block_lr_mult():.4g}")
+
+
 class Parametrization:
     """The scaling rules a config switches on, combined. Falsy when none are on."""
 
-    RULES: tuple[type[ScalingRule], ...] = (WidthRule,)
+    RULES: tuple[type[ScalingRule], ...] = (WidthRule, DepthRule)
 
     def __init__(self, rules: tuple[ScalingRule, ...]):
         self.rules = rules
@@ -240,6 +294,9 @@ class Parametrization:
         return bool(self.rules)
 
     # Model-level adjustments: products over the rules (1.0 * x is exact).
+    def branch_multiplier(self) -> float:
+        return math.prod((rule.branch() for rule in self.rules), start=1.0)
+
     def output_multiplier(self) -> float:
         return math.prod((rule.logits() for rule in self.rules), start=1.0)
 
@@ -255,8 +312,8 @@ class Parametrization:
 
     @staticmethod
     def scale_lr(lr: float, factors: tuple[Factor, ...]) -> float:
-        # Last rule first for the lr and first rule first for the weight decay: the
-        # inverse of a composition runs in reverse order.
+        # Last rule first for the lr and first rule first for the weight decay (its
+        # inverse): with width and depth both on that is lr * d / w and wd * w / d.
         for factor in reversed(factors):
             lr = factor.apply(lr)
         return lr
