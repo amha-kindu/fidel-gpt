@@ -41,7 +41,7 @@ beta2, grad_clip, warmup_frac and seed (init/dropout only; the data order stays
 the shared --seed's) -- so learning-rate and seed sweeps are just more arms:
 
     --variant lr1e-3:lr=0.001 --variant lr2e-3:lr=0.002
-    --variant pen-lr2e-3:model=model2.StreamPenaltyModel,stream_penalty=0.01,lr=0.002
+    --variant pen-lr2e-3:stream_penalty=0.01,lr=0.002
     --variant s1:seed=1 --variant s2:seed=2
 
 Knobs that shape the shared batch schedule or timing (steps, batch_size,
@@ -833,13 +833,24 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_scale)
 
+    auxiliary_loss = getattr(model, "auxiliary_loss", None)
+    aux_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
+    aux_seen = False
+
     def forward_backward(batch: tuple) -> torch.Tensor:
+        nonlocal aux_sum, aux_seen
         inputs = batch[0].to(DEVICE, non_blocking=True)
         labels = batch[1].to(DEVICE, non_blocking=True)
         with torch.autocast(device_type=DEVICE.type, enabled=args.amp):
             logits = step_model(inputs, build_mask(inputs, pad, causal))
             loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(), ignore_index=-100)
-        scaler.scale(loss).backward()
+            aux = auxiliary_loss() if callable(auxiliary_loss) else None
+        objective = loss
+        if aux is not None:
+            objective = loss + aux
+            aux_sum += aux.detach()
+            aux_seen = True
+        scaler.scale(objective).backward()
         return loss.detach()
 
     # Warm up kernels, the caching allocator, cuDNN autotuning and -- when
@@ -854,6 +865,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     for _ in range(min(args.warmup_steps, len(train))):
         forward_backward(train.items[0])
     model.zero_grad(set_to_none=True)
+    aux_sum.zero_()
     sync()
     warmup_sec = time.perf_counter() - warmup_started
     if args.compile:
@@ -886,6 +898,11 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
                     desc=f"\033[95m{stamp}\033[0m - \033[94mINFO\033[0m - "
                          f"\033[96m{LOGGER.name}\033[0m - \033[93m{label}")
 
+    # Optimizer-bound hooks (e.g. buffers refreshed after every step) go on the
+    # eager module, which shares parameters with the compiled wrapper.
+    register_hooks = getattr(model, "register_hooks", None)
+    if callable(register_hooks):
+        register_hooks(optimiser)
     for step in progress:
         # The clock runs per evaluation window rather than per step. A device
         # sync around every step would serialise the CPU against the GPU roughly
@@ -936,6 +953,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
 
             val_loss = validate(model, val, pad, causal, args.amp)
             train_loss = (loss_sum / max(loss_count, 1)).item()
+            window_steps = max(loss_count, 1)
             loss_sum.zero_()
             loss_count = 0
             gap = val_loss - train_loss
@@ -945,6 +963,9 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             writer.add_scalar("loss/val", val_loss, step, walltime=walltime)
             writer.add_scalar("loss/train", train_loss, step, walltime=walltime)
             writer.add_scalar("loss/gap", gap, step, walltime=walltime)
+            if aux_seen:
+                writer.add_scalar("loss/aux", (aux_sum / window_steps).item(), step, walltime=walltime)
+                aux_sum.zero_()
             writer.add_scalar("optim/lr", scheduler.get_last_lr()[0], step, walltime=walltime)
             # Accumulated on device across the window, exactly like loss_sum above.
             # grad_raw is what --grad-clip acted against and clip_frac how often it
