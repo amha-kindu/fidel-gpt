@@ -47,6 +47,14 @@ the shared --seed's) -- so learning-rate and seed sweeps are just more arms:
 Knobs that shape the shared batch schedule or timing (steps, batch_size,
 eval_every, ...) stay global flags; a variant that sets one is refused.
 
+--grad-accum-steps N splits every --batch-size batch into N micro-batches that
+are run one after another and summed into one optimiser step, so a batch that
+does not fit in memory still trains as one. --batch-size stays the batch per
+optimiser step: the data, its order, the fingerprint and every per-step number
+are the same at any N, which makes N a memory knob and nothing else. The loss is
+weighted by each micro-batch's share of the batch's labelled tokens, so the
+gradient is the full batch's, up to float summation order.
+
 `model=` is the one key that is not a ModelConfig field: it names an importable
 nn.Module subclass ('module.Class', or a bare 'Class' from model.py), and
 `--model` sets the default for variants that do not name one. So the comparison
@@ -143,8 +151,8 @@ TRAINING_KEYS = {"lr": float, "weight_decay": float, "beta1": float, "beta2": fl
 # Run knobs that look per-arm but are not: they shape the shared batch schedule,
 # the evaluation grid or the timing setup, which every arm must agree on for the
 # comparison to mean anything. Named so the error can say where to set them.
-SHARED_RUN_KEYS = ("steps", "batch_size", "eval_every", "max_samples", "val_samples",
-                   "warmup_steps", "amp", "compile", "compile_mode")
+SHARED_RUN_KEYS = ("steps", "batch_size", "grad_accum_steps", "eval_every", "max_samples",
+                   "val_samples", "warmup_steps", "amp", "compile", "compile_mode")
 
 # Substrings that identify the attention submodule of a decoder block. Matched on
 # the attribute NAME, not on the type: the whole point of comparing two models is
@@ -575,7 +583,7 @@ def diagnose(model: torch.nn.Module, data: DataPlan, pad: int, causal: torch.Ten
 
 @torch.no_grad()
 def validate(model: torch.nn.Module, batches: BatchSet, pad: int, causal: torch.Tensor,
-             amp: bool) -> float:
+             amp: bool, chunks: int = 1) -> float:
     """Token-weighted mean cross-entropy over the validation batches.
 
     Summing per-batch means and dividing by the batch count would weight every
@@ -586,18 +594,20 @@ def validate(model: torch.nn.Module, batches: BatchSet, pad: int, causal: torch.
     dividing by the true token count gives the mean the loss curves imply.
 
     The running total stays on device; one host read at the end instead of one
-    per batch.
+    per batch. Each batch runs in `chunks` pieces (--grad-accum-steps), so
+    validation never needs more memory than a training micro-batch.
     """
     was_training = model.training
     model.eval()
     total = torch.zeros((), dtype=torch.float32, device=DEVICE)
-    for inputs, labels in batches.items:
-        inputs = inputs.to(DEVICE, non_blocking=True)
-        labels = labels.to(DEVICE, non_blocking=True)
-        with torch.autocast(device_type=DEVICE.type, enabled=amp):
-            logits = model(inputs, build_mask(inputs, pad, causal))
-        total += F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(),
-                                 ignore_index=-100, reduction="sum")
+    for batch_inputs, batch_labels in batches.items:
+        for inputs, labels in zip(batch_inputs.chunk(chunks), batch_labels.chunk(chunks)):
+            inputs = inputs.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+            with torch.autocast(device_type=DEVICE.type, enabled=amp):
+                logits = model(inputs, build_mask(inputs, pad, causal))
+            total += F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(),
+                                     ignore_index=-100, reduction="sum")
     model.train(was_training)
     return total.item() / max(batches.total_labels, 1)
 
@@ -671,10 +681,21 @@ def hparams(variant, config: ModelConfig, args) -> dict:
     flat = {"variant": variant.label, "model": variant.model}
     for key, value in config.to_dict().items():
         flat[key] = value if isinstance(value, (bool, int, float, str)) else str(value)
-    for key in ("lr", "weight_decay", "grad_clip", "steps", "batch_size", "seq_len", "amp"):
+    for key in ("lr", "weight_decay", "grad_clip", "steps", "batch_size", "grad_accum_steps",
+                "seq_len", "amp"):
         if hasattr(args, key):
             flat[key] = getattr(args, key)
     return flat
+
+
+def scale_census(census: dict, micro_batches: int) -> dict:
+    """A one-micro-batch FLOP census scaled to the optimiser step, which runs
+    `micro_batches` of them. Per-position cost doesn't change."""
+    if micro_batches == 1:
+        return census
+    scaled = {key: census[key] * micro_batches for key in ("forward", "backward", "total")}
+    scaled["by_op"] = {op: value * micro_batches for op, value in census["by_op"].items()}
+    return {**census, **scaled}
 
 
 def build_optimiser(model: torch.nn.Module, args) -> torch.optim.AdamW:
@@ -778,10 +799,14 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     # Measured on the eager module and on a real training batch, so the FLOPs are
     # the ones a step actually costs at this shape. Before the compile below and
     # before the clock starts: it runs a forward and a backward of its own, which
-    # would otherwise be billed to this arm's wall-clock.
-    probe = train.items[0][0].to(DEVICE, non_blocking=True)
+    # would otherwise be billed to this arm's wall-clock. Counted on one
+    # micro-batch -- the full batch may not fit, which is why accumulation is on --
+    # and scaled to the step, which runs --grad-accum-steps of them.
+    accum = args.grad_accum_steps
+    probe = train.items[0][0].chunk(accum)[0].to(DEVICE, non_blocking=True)
     census = {"parameters": parameter_census(model),
-              "flops_per_step": flop_census(model, probe, build_mask(probe, pad, causal))}
+              "flops_per_step": scale_census(flop_census(model, probe, build_mask(probe, pad, causal)),
+                                             accum)}
     writer.add_text("ModelCensus", fenced_json(census), 0)
     flops_per_step = census["flops_per_step"]["total"]
     if not census["flops_per_step"]["attention_counted"]:
@@ -837,21 +862,43 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
     aux_sum = torch.zeros((), dtype=torch.float32, device=DEVICE)
     aux_seen = False
 
-    def forward_backward(batch: tuple) -> torch.Tensor:
+    def micro_step(inputs: torch.Tensor, labels: torch.Tensor,
+                   labelled: torch.Tensor | None) -> torch.Tensor:
+        """One forward/backward. `labelled` is the whole batch's labelled-token
+        count when the batch is split, so the micro-batches' summed CE divided by it
+        is the batch's mean CE; None means the batch runs whole, as it always did."""
         nonlocal aux_sum, aux_seen
-        inputs = batch[0].to(DEVICE, non_blocking=True)
-        labels = batch[1].to(DEVICE, non_blocking=True)
         with torch.autocast(device_type=DEVICE.type, enabled=args.amp):
             logits = step_model(inputs, build_mask(inputs, pad, causal))
-            loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(), ignore_index=-100)
+            if labelled is None:
+                loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(), ignore_index=-100)
+            else:
+                loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten(),
+                                       ignore_index=-100, reduction="sum") / labelled
             aux = auxiliary_loss() if callable(auxiliary_loss) else None
         objective = loss
         if aux is not None:
+            # The auxiliary loss is a mean over the micro-batch's positions, and the
+            # micro-batches are equal-sized, so the batch's is their average.
+            aux = aux / accum
             objective = loss + aux
             aux_sum += aux.detach()
             aux_seen = True
         scaler.scale(objective).backward()
         return loss.detach()
+
+    def forward_backward(batch: tuple) -> torch.Tensor:
+        """The batch's gradient, accumulated over --grad-accum-steps micro-batches,
+        and its mean training loss."""
+        inputs = batch[0].to(DEVICE, non_blocking=True)
+        labels = batch[1].to(DEVICE, non_blocking=True)
+        if accum == 1:
+            return micro_step(inputs, labels, None)
+        labelled = (labels != -100).sum().clamp(min=1)
+        loss = torch.zeros((), dtype=torch.float32, device=DEVICE)
+        for micro_inputs, micro_labels in zip(inputs.chunk(accum), labels.chunk(accum)):
+            loss += micro_step(micro_inputs, micro_labels, labelled)
+        return loss
 
     # Warm up kernels, the caching allocator, cuDNN autotuning and -- when
     # --compile is set -- the whole inductor compile, before the clock starts.
@@ -951,7 +998,7 @@ def run(variant: Variant, args, data: DataPlan, fingerprint: str,
             elapsed += time.perf_counter() - window_start
             window_start = None
 
-            val_loss = validate(model, val, pad, causal, args.amp)
+            val_loss = validate(model, val, pad, causal, args.amp, accum)
             train_loss = (loss_sum / max(loss_count, 1)).item()
             window_steps = max(loss_count, 1)
             loss_sum.zero_()
@@ -1207,7 +1254,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--eval-every", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Sequences per optimiser step (default: 8)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Split every --batch-size batch into this many micro-batches, run "
+                             "one at a time and accumulated into one optimiser step. Must divide "
+                             "--batch-size. Saves memory only: data, order and per-step numbers "
+                             "are unchanged (default: 1)")
     parser.add_argument("--max-samples", type=int, default=10000,
                         help="Cap on training samples drawn from the corpus (0 = all)")
     parser.add_argument("--val-samples", type=int, default=512,
@@ -1287,6 +1340,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.steps < 1:
         parser.error("--steps must be at least 1")
+    if args.grad_accum_steps < 1 or args.batch_size % args.grad_accum_steps:
+        parser.error(f"--grad-accum-steps {args.grad_accum_steps} must be at least 1 and divide "
+                     f"--batch-size {args.batch_size}")
     args.eval_every = max(1, min(args.eval_every, args.steps))
     if args.amp is None:
         args.amp = MIXED_PRECISION_ENABLED
@@ -1378,6 +1434,9 @@ def main() -> None:
                 f"tokens -- differences much below ~0.05 nats are not resolvable at this size")
     LOGGER.info(f"{args.steps} steps x batch {args.batch_size} = {args.steps * args.batch_size} "
                 f"presentations over {pool * args.batch_size} samples -> {epochs:.1f} epochs")
+    if args.grad_accum_steps > 1:
+        LOGGER.info(f"gradient accumulation: {args.grad_accum_steps} micro-batches of "
+                    f"{args.batch_size // args.grad_accum_steps} per step")
     if epochs > 3:
         LOGGER.warning(f"{epochs:.1f} passes over the same data -- every variant will "
                        "overfit, which flatters whichever has less effective capacity. "
