@@ -326,7 +326,18 @@ class GPTmodel(nn.Module):
         config: ModelConfig | ModelWithLoRAConfig,
         weights: dict | None = None,
     ):
-        model = cls(config)
+        if cls is GPTmodel:
+            model = cls(config)
+        else:
+            # Replay the standard constructor's RNG draws so a subclass gets the
+            # standard init at the same seed.
+            cpu_state = torch.get_rng_state()
+            cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            model = cls(config)
+            torch.set_rng_state(cpu_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+            GPTmodel(config)
         weights = weights or {}
 
         lora_weights = {k: v for k, v in weights.items() if isinstance(config, ModelWithLoRAConfig) and k in LoRAdapter.get_lora_param_names(config.lora_targets)}
